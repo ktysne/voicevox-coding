@@ -100,6 +100,21 @@ test('URL 直後に空白なしで ASCII の読点が続いても後続の日本
   assert.doesNotMatch(text, /example\.com/);
 });
 
+test('対応の無い閉じ括弧の後に ASCII 本文が続く URL は打ち切られない（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://example.com/search?q=a)b です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
+test('全角括弧が対応している URL は括弧ごと丸ごと置き換わる（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://example.jp/商品（赤） です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /商品/);
+  assert.doesNotMatch(text, /example\.jp/);
+});
+
 test('ファイルパスはファイル名だけ残る（語頭を食わない）', () => {
   const { text } = filterText('src/daemon/queue.js を更新しました', { ...F, inlineCode: 'read' });
   assert.match(text, /^queue\.js を更新しました$/);

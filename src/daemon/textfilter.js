@@ -8,8 +8,8 @@ const HTML_TAG = /<\/?[a-zA-Z][^>]*>/g;
 // URL の開始位置の目印。実際にどこまでが URL 本体かは scanUrlLength() が 1 文字ずつ判定する。
 const URL_START = /https?:\/\/|\bwww\./g;
 
-// URL の内部としては扱わず、見つかった時点で URL を打ち切る単独文字。
-// 日本語の句読点・全角括弧・引用符は、常に URL の外側（後続の日本語文）だと判断してよい。
+// URL の内部としては扱わず、見つかった時点で URL を打ち切る単独文字（対応関係を持たないもの）。
+// 日本語の句読点・引用符は、常に URL の外側（後続の日本語文）だと判断してよい。
 // Unicode ブロックまるごとの除外はしない。ひらがな・カタカナ・漢字そのもの、
 // 々 のような繰り返し記号、全角英数字は対象に含めない。
 // `https://ja.wikipedia.org/wiki/日本語` のようにパスへ生の日本語を含む URL や
@@ -19,15 +19,12 @@ const URL_STOP_CHAR = new Set([
   '、', '。', // 、。
   '，', '．', // ，．
   '！', '？', // ！？
-  '「', '」', '『', '』', // 「」『』
-  '【', '】', // 【】
-  '〈', '〉', '《', '》', // 〈〉《》
-  '（', '）', // （）
 ]);
 for (let c = 0x2018; c <= 0x201f; c++) URL_STOP_CHAR.add(String.fromCharCode(c)); // 引用符 “”‘’ など
 
 // ひらがな・カタカナ・漢字、および上記の日本語句読点。
-// ASCII 記号の直後にこれらが続くときだけ「日本語文へ切り替わった」とみなす判定に使う。
+// 対応の無い閉じ括弧や ASCII 記号の直後にこれらが続くときだけ
+// 「日本語文へ切り替わった」とみなす判定に使う。
 function isJapaneseText(ch) {
   if (!ch) return false;
   if (URL_STOP_CHAR.has(ch)) return true;
@@ -43,32 +40,44 @@ function isJapaneseText(ch) {
 // 例：`https://example.com,次へ進む` のように、区切りの空白を置かずに
 // ASCII の読点相当の記号越しへ日本語文を続ける表記がある。
 // `.` `/` `?` `:` `!` などクエリ文字列やパス構造に必須な記号は対象にしない。
+// 検証済みの既知の限界：クエリ値そのものに日本語を生で埋め込み、かつ区切りに
+// ASCII の `,` `;` を使う URL（`?q=英語,日本語` 等）は、この判定と区別が付かず
+// 誤って打ち切られる。この曖昧さは文字単位の判定では解消できないため許容する。
 const ASCII_SOFT_STOP = new Set([',', ';']);
 
-// 対応する開き括弧が URL 内に現れた分だけ、閉じ括弧を URL の一部として許可する。
-// `https://en.wikipedia.org/wiki/Go_(programming_language)` のような URL を保つ一方、
-// `リンク(https://example.com)を開く` のように外側の括弧を閉じるだけの `)` では打ち切る。
-const ASCII_CLOSE_TO_OPEN = { ')': '(', ']': '[', '}': '{' };
+// 開き括弧と閉じ括弧の対応表（ASCII・全角の両方）。開いた分だけ閉じを URL の一部として許可する。
+// `https://en.wikipedia.org/wiki/Go_(programming_language)` や `.../商品（赤）` のように
+// 対応が取れている括弧は URL 内に残す。
+const BRACKET_OPEN_TO_CLOSE = {
+  '(': ')', '[': ']', '{': '}',
+  '「': '」', '『': '』', '【': '】', '〈': '〉', '《': '》', '（': '）',
+};
+const BRACKET_CLOSE_TO_OPEN = {};
+for (const [open, close] of Object.entries(BRACKET_OPEN_TO_CLOSE)) BRACKET_CLOSE_TO_OPEN[close] = open;
 
 /** text の start 位置から始まる URL 本体の長さを 1 文字ずつ走査して求める。 */
 function scanUrlLength(text, start) {
-  const openDepth = { '(': 0, '[': 0, '{': 0 };
+  const openDepth = {};
   let i = start;
   for (; i < text.length; i++) {
     const ch = text[i];
     if (/\s/.test(ch) || URL_STOP_CHAR.has(ch)) break;
 
-    if (ch === '(' || ch === '[' || ch === '{') {
-      openDepth[ch]++;
+    if (BRACKET_OPEN_TO_CLOSE[ch]) {
+      openDepth[ch] = (openDepth[ch] || 0) + 1;
       continue;
     }
-    const open = ASCII_CLOSE_TO_OPEN[ch];
+    const open = BRACKET_CLOSE_TO_OPEN[ch];
     if (open) {
       if (openDepth[open] > 0) {
         openDepth[open]--;
         continue;
       }
-      break; // 対応する開き括弧が URL 内に無いので、ここで打ち切る
+      // 対応する開き括弧が URL 内に無い。外側の括弧を閉じているだけなら打ち切り、
+      // `?q=a)b` のように後ろへ普通の URL 本体が続くならそのまま含める。
+      const next = text[i + 1];
+      if (next === undefined || /\s/.test(next) || isJapaneseText(next)) break;
+      continue;
     }
     if (ASCII_SOFT_STOP.has(ch) && isJapaneseText(text[i + 1])) break;
   }
