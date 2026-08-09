@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     VOICEVOX Coding を最新化し、更新を適用する。
 
