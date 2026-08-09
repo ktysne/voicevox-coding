@@ -216,11 +216,15 @@ test('無視パターンが配列でなくても落ちない', () => {
   assert.equal(resolveStop('作業が終わりました。', [null, 3, {}]).speak, true);
 });
 
+// 照合が終わらないパターン。繰り返しを並べるほど重くなる。
+// 一度時間切れになったものは以後飛ばされるので、テストごとに違う数で作る。
+const heavy = (repeats) => `${'a*'.repeat(repeats)}X`;
+
 test('照合が終わらないパターンは時間で打ち切る', () => {
   // 素の RegExp では終わらない書き方。打ち切って読み上げに進むこと。
   // (a+)+$ は繰り返しの入れ子、a*a*X はグループ無しでも計算量が跳ねる例。
   const text = `${'a'.repeat(4000)}!`;
-  for (const pattern of ['(a+)+$', '(a|aa)+$', 'a*a*X', '^a*a*a*a*a*a*a*a*X$']) {
+  for (const pattern of ['(a+)+$', '(a|aa)+$', heavy(2), '^a*a*a*a*a*a*a*a*X$']) {
     const started = Date.now();
     const r = resolveStop(text, [pattern]);
     assert.equal(r.speak, true, pattern);
@@ -233,7 +237,7 @@ test('照合が終わらないパターンは時間で打ち切る', () => {
 
 test('打ち切りの予算はパターン全体で共有する', () => {
   // 重いパターンを並べても、1 回の判定にかかる時間は予算の範囲に収まること
-  const patterns = Array.from({ length: 5 }, () => 'a*a*X');
+  const patterns = Array.from({ length: 5 }, (_, i) => heavy(3 + i));
   const started = Date.now();
   assert.equal(resolveStop(`${'a'.repeat(4000)}!`, patterns).speak, true);
   assert.ok(Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3, `${Date.now() - started}ms かかった`);
@@ -241,7 +245,7 @@ test('打ち切りの予算はパターン全体で共有する', () => {
 
 test('空のパターンが並んでいても予算を超えない', () => {
   // 予算切れの判定を空文字より先に行っていること
-  const patterns = ['a*a*X', ...Array.from({ length: 10000 }, () => '')];
+  const patterns = [heavy(9), ...Array.from({ length: 10000 }, () => '')];
   const started = Date.now();
   assert.equal(resolveStop(`${'a'.repeat(4000)}!`, patterns).speak, true);
   assert.ok(Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3, `${Date.now() - started}ms かかった`);
@@ -251,9 +255,33 @@ test('使えなかった無視パターンは理由が残る', () => {
   // 黙って飛ばすだけだと「書いたのに効かない」が無通知になる
   const r = resolveStop('作業が終わりました。', ['[']);
   assert.equal(r.speak, true);
-  assert.equal(r.problems.length, 1);
-  assert.match(r.problems[0], /無視パターン 1/);
+  assert.deepEqual(r.problems, ['無視パターン 1（[）は正規表現として解釈できません']);
   assert.equal(resolveStop('作業が終わりました。', ['^実行ログ']).problems.length, 0);
+});
+
+test('理由の文面は長いパターンを短く切る', () => {
+  // ログに設定の全文を流し込まない
+  const long = `^${'あ'.repeat(200)}`;
+  const [problem] = resolveStop('作業が終わりました。', [`${long}(`]).problems;
+  assert.ok(problem.length < 120, problem);
+  assert.match(problem, /…/);
+});
+
+test('時間切れになったパターンは次から照合しない', () => {
+  const text = `${'a'.repeat(4000)}!`;
+  const pattern = heavy(10);
+  const first = Date.now();
+  const r1 = resolveStop(text, [pattern]);
+  const firstMs = Date.now() - first;
+  assert.match(r1.problems[0], /時間内に終わらない/);
+  assert.ok(firstMs >= IGNORE_MATCH_BUDGET_MS / 2, `${firstMs}ms しかかかっていない`);
+
+  // 2 回目は照合せずに飛ばすので、予算を使わない
+  const second = Date.now();
+  const r2 = resolveStop(text, [pattern]);
+  assert.equal(r2.speak, true);
+  assert.match(r2.problems[0], /時間内に終わらない/);
+  assert.ok(Date.now() - second < 50, `${Date.now() - second}ms かかった`);
 });
 
 test('重いパターンの後ろでも軽いパターンは判定される', () => {

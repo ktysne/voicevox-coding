@@ -35,6 +35,16 @@ export const IGNORE_MATCH_BUDGET_MS = 200;
 const MATCH_SCRIPT = new vm.Script('new RegExp(pattern).test(text)');
 const MATCH_CONTEXT = vm.createContext({ pattern: '', text: '' });
 
+// 一度時間切れになったパターンは、発話のたびに予算を使い切ってしまう。
+// 同じ書き方なら結果も同じなので、以後は照合せずに飛ばす。
+// 直せば文字列が変わって別物として扱われるので、設定の変更を待つ必要はない。
+const timedOutPatterns = new Set();
+
+/** ログに載せるための短縮。設定はいくらでも長く書けるので、そのまま出さない。 */
+function preview(pattern) {
+  return pattern.length > 40 ? `${pattern.slice(0, 40)}…` : pattern;
+}
+
 /**
  * 無視パターン。整形前の本文がどれかに部分一致したら、その発話ごと飛ばす。
  * フラグは付けないので大文字小文字は区別する（区別したくないときは [Bb] のように書く）。
@@ -56,6 +66,10 @@ function ignored(text, patterns, problems) {
         break;
       }
       if (typeof pattern !== 'string' || pattern === '') continue;
+      if (timedOutPatterns.has(pattern)) {
+        problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は、照合が時間内に終わらないため使いません`);
+        continue;
+      }
       MATCH_CONTEXT.pattern = pattern;
       try {
         if (MATCH_SCRIPT.runInContext(MATCH_CONTEXT, { timeout: Math.max(1, Math.ceil(left)) })) return true;
@@ -63,12 +77,21 @@ function ignored(text, patterns, problems) {
         // 不正な正規表現と、時間内に終わらなかったパターンは飛ばす。
         // 打ち切ったときは「一致しなかった」扱いにする（黙り込むより読み上げるほうが安全）。
         // 不正な正規表現は UI 側で検証済みのはずだが、手編集もありうる。
-        problems.push(`無視パターン ${index + 1}（${pattern}）は使えません: ${err.message}`);
+        // 理由の文面は毎回同じにする（呼び出し側の重複抑止が効くように）。
+        // vm の中で起きたエラーは別の realm のものなので、instanceof ではなくコードで見分ける
+        if (err?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+          timedOutPatterns.add(pattern);
+          problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は、照合が時間内に終わらないため使いません`);
+        } else {
+          problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は正規表現として解釈できません`);
+        }
       }
     }
     return false;
   } finally {
-    MATCH_CONTEXT.text = ''; // 本文を抱えたままにしない
+    // 本文もパターンも共有のコンテキストに残さない
+    MATCH_CONTEXT.text = '';
+    MATCH_CONTEXT.pattern = '';
   }
 }
 
