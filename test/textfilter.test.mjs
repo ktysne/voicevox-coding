@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { filterText, renderTemplate } from '../src/daemon/textfilter.js';
 import { chunkText } from '../src/daemon/queue.js';
 import { applyReplacements, validateEngineWord } from '../src/daemon/dictionary.js';
-import { resolveUtterance } from '../src/daemon/events.js';
+import { resolveUtterance, ignorePatternError } from '../src/daemon/events.js';
 import { defaultConfig } from '../src/daemon/config.js';
 import { wavDurationMs } from '../src/daemon/player.js';
 
@@ -205,6 +205,31 @@ test('不正な無視パターンは飛ばして残りで判定する', () => {
 test('無視パターンが未設定でも読み上げる', () => {
   // 既存の config.json にキーが無くても落ちないこと
   assert.equal(resolveStop('作業が終わりました。', undefined).speak, true);
+});
+
+test('無視パターンが配列でなくても落ちない', () => {
+  // 手編集で型が崩れた config.json を読み込んだ場合
+  for (const broken of [{}, 'ログ', 42, null]) {
+    assert.equal(resolveStop('作業が終わりました。', broken).speak, true);
+  }
+  // 配列の中身が文字列でない場合も同じ
+  assert.equal(resolveStop('作業が終わりました。', [null, 3, {}]).speak, true);
+});
+
+test('繰り返しが入れ子のパターンは使わない', () => {
+  // (a+)+$ のような書き方は照合が指数的に遅くなる。飛ばしてすぐ返ること
+  const started = Date.now();
+  const r = resolveStop(`${'a'.repeat(40)}!`, ['(a+)+$']);
+  assert.equal(r.speak, true);
+  assert.ok(Date.now() - started < 1000);
+});
+
+test('無視パターンの検証は理由を返す', () => {
+  assert.equal(ignorePatternError('^実行ログ'), null);
+  assert.equal(ignorePatternError(''), null);
+  assert.match(ignorePatternError('['), /解釈できません/);
+  assert.match(ignorePatternError('(a+)+'), /入れ子/);
+  assert.equal(ignorePatternError('(foo|bar)+'), null);
 });
 
 test('ターゲット全体を無効にすると読み上げない', () => {

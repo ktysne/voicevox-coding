@@ -84,6 +84,9 @@ function toast(message, isError = false) {
 
 let saveTimer;
 let savePending = false;
+// 自分の保存でも config の SSE 通知が返ってくる。これで再描画すると入力中の欄から
+// フォーカスが飛ぶので、保存の前後しばらくは通知を捨てる（デーモン側のウォッチャー抑止と同じ考え方）。
+let suppressConfigUntil = 0;
 
 function scheduleSave() {
   savePending = true;
@@ -95,8 +98,10 @@ function scheduleSave() {
 async function saveNow() {
   if (!savePending) return;
   savePending = false;
+  suppressConfigUntil = Date.now() + 1500;
   try {
     await api('/api/config', { method: 'PUT', body: JSON.stringify(state.config) });
+    suppressConfigUntil = Date.now() + 1000;
     $('#save-indicator').textContent = '保存しました';
     setTimeout(() => {
       if (!savePending) $('#save-indicator').textContent = '';
@@ -359,23 +364,32 @@ function renderToolFilterCard(targetId, base, profile) {
   );
 }
 
+// 繰り返しの入れ子（(a+)+ のような書き方）を大まかに見つける。
+// ブラウザからは daemon のモジュールを読めないので、src/daemon/events.js の同名の定数を写している。
+// 片方を直したらもう片方も直すこと。
+const NESTED_REPEAT = /\((?:[^()\\]|\\.)*(?:[*+]|\{\d+,\})(?:[^()\\]|\\.)*\)(?:[*+]|\{\d+,\})/;
+
+function ignorePatternError(pattern) {
+  if (!pattern) return null;
+  try {
+    new RegExp(pattern);
+  } catch (err) {
+    return `正規表現として解釈できません: ${err.message}`;
+  }
+  if (NESTED_REPEAT.test(pattern)) {
+    return '繰り返しの入れ子（(a+)+ のような書き方）は照合が極端に遅くなることがあるため使えません';
+  }
+  return null;
+}
+
 /**
- * 無視パターンの 1 行。入力のたびに正規表現として解釈できるか確かめ、
+ * 無視パターンの 1 行。入力のたびに使える正規表現かを確かめ、
  * 駄目なら行の下に理由を出す（保存自体は止めない。あとから直せるように）。
  */
 function ignorePatternRow(base, pattern, index) {
   const error = h('span', { class: 'hint', style: 'margin:6px 0 0;color:var(--err)' });
   const validate = (value) => {
-    if (!value) {
-      error.textContent = '';
-      return;
-    }
-    try {
-      new RegExp(value);
-      error.textContent = '';
-    } catch (err) {
-      error.textContent = `正規表現として解釈できません: ${err.message}`;
-    }
+    error.textContent = ignorePatternError(value) ?? '';
   };
   validate(pattern);
 
@@ -396,7 +410,8 @@ function ignorePatternRow(base, pattern, index) {
 }
 
 function renderIgnorePatternsCard(base, profile) {
-  const patterns = profile.ignorePatterns ?? [];
+  // 手編集で配列以外が入っていても描画は壊さない
+  const patterns = Array.isArray(profile.ignorePatterns) ? profile.ignorePatterns : [];
 
   return h(
     'section',
@@ -416,7 +431,7 @@ function renderIgnorePatternsCard(base, profile) {
     h('p', { class: 'hint' },
       '整形前の本文に対して部分一致で判定します。大文字小文字は区別するので、'
       + '区別したくないときは [Bb]ackground のように書いてください。'
-      + '解釈できない正規表現は読み上げ時に無視されます。'),
+      + '上に理由が出ているパターンは読み上げ時に使われません。'),
   );
 }
 
@@ -851,8 +866,9 @@ function connectStream() {
   });
   es.addEventListener('log', (e) => appendLog(JSON.parse(e.data)));
   es.addEventListener('config', (e) => {
-    // 外部エディタでの編集を反映する。入力中の上書きを避けるため保存待ちのときは無視する
-    if (savePending) return;
+    // 外部エディタでの編集を反映する。入力中の上書きを避けるため、保存待ちのときと
+    // 自分の保存で返ってきた通知（直前に保存したとき）は無視する
+    if (savePending || Date.now() < suppressConfigUntil) return;
     state.config = JSON.parse(e.data);
     renderActivePanel();
   });

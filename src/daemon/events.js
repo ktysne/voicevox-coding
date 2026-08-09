@@ -25,17 +25,36 @@ function toolAllowed(toolName, filter) {
 const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PermissionRequest']);
 
 /**
+ * 繰り返しの入れ子（`(a+)+` のような書き方）を大まかに見つける。
+ * この形は入力が少し伸びるだけで照合時間が指数的に増え、デーモンは 1 スレッドなので
+ * 読み上げどころか HTTP API ごと止まる。判定は控えめな見当で、取りこぼしも空振りもありうる。
+ */
+const NESTED_REPEAT = /\((?:[^()\\]|\\.)*(?:[*+]|\{\d+,\})(?:[^()\\]|\\.)*\)(?:[*+]|\{\d+,\})/;
+
+export function ignorePatternError(pattern) {
+  if (typeof pattern !== 'string' || pattern === '') return null;
+  try {
+    new RegExp(pattern);
+  } catch (err) {
+    return `正規表現として解釈できません: ${err.message}`;
+  }
+  if (NESTED_REPEAT.test(pattern)) {
+    return '繰り返しの入れ子（(a+)+ のような書き方）は照合が極端に遅くなることがあるため使えません';
+  }
+  return null;
+}
+
+/**
  * 無視パターン。整形前の本文がどれかに部分一致したら、その発話ごと飛ばす。
  * フラグは付けないので大文字小文字は区別する（区別したくないときは [Bb] のように書く）。
  */
 function ignored(text, patterns) {
-  for (const pattern of patterns ?? []) {
+  if (!Array.isArray(patterns)) return false; // 手編集で配列以外が入っていても落とさない
+  for (const pattern of patterns) {
     if (typeof pattern !== 'string' || pattern === '') continue;
-    try {
-      if (new RegExp(pattern).test(text)) return true;
-    } catch {
-      // 不正な正規表現は黙って飛ばす。UI 側で検証済みのはずだが、手編集もありうる
-    }
+    // 不正な正規表現と危険な書き方は黙って飛ばす。UI 側で検証済みのはずだが、手編集もありうる
+    if (ignorePatternError(pattern)) continue;
+    if (new RegExp(pattern).test(text)) return true;
   }
   return false;
 }
