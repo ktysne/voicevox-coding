@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { filterText, renderTemplate } from '../src/daemon/textfilter.js';
 import { chunkText } from '../src/daemon/queue.js';
 import { applyReplacements, validateEngineWord } from '../src/daemon/dictionary.js';
-import { resolveUtterance, IGNORE_MATCH_BUDGET_MS } from '../src/daemon/events.js';
+import { resolveUtterance, IGNORE_MATCH_BUDGET_MS, IGNORE_MATCH_PATTERN_MS } from '../src/daemon/events.js';
 import { defaultConfig } from '../src/daemon/config.js';
 import { wavDurationMs } from '../src/daemon/player.js';
 
@@ -217,7 +217,7 @@ test('無視パターンが配列でなくても落ちない', () => {
 });
 
 // 照合が終わらないパターン。繰り返しを並べるほど重くなる。
-// 一度時間切れになったものは以後飛ばされるので、テストごとに違う数で作る。
+// 一度時間切れになったものは次から短い枠で試されるので、テストごとに違う数で作る。
 const heavy = (repeats) => `${'a*'.repeat(repeats)}X`;
 
 test('照合が終わらないパターンは時間で打ち切る', () => {
@@ -274,27 +274,36 @@ test('時間切れになったパターンは次から短い時間で試す', ()
   const r1 = resolveStop(text, [pattern]);
   const firstMs = Date.now() - first;
   assert.match(r1.problems[0], /時間内に終わりません/);
-  assert.ok(firstMs >= IGNORE_MATCH_BUDGET_MS / 2, `${firstMs}ms しかかかっていない`);
+  assert.ok(firstMs >= IGNORE_MATCH_PATTERN_MS / 2, `${firstMs}ms しかかかっていない`);
 
-  // 2 回目は短い時間で打ち切るので、予算を使い切らない
+  // 2 回目は短い時間で打ち切る
   const second = Date.now();
   const r2 = resolveStop(text, [pattern]);
   assert.equal(r2.speak, true);
   assert.match(r2.problems[0], /時間内に終わりません/);
-  assert.ok(Date.now() - second < 50, `${Date.now() - second}ms かかった`);
+  assert.ok(Date.now() - second < IGNORE_MATCH_PATTERN_MS, `${Date.now() - second}ms かかった`);
 
-  // 本文が短ければ同じパターンでも一瞬で終わる。前の時間切れを引きずらないこと
+  // 本文が短ければ短い枠でも間に合うので、同じパターンがちゃんと効く
   const short = resolveStop('aaX', [pattern]);
   assert.equal(short.speak, false);
   assert.equal(short.reason, 'ignored-pattern');
   assert.deepEqual(short.problems, []);
+
+  // 短い本文で間に合っても枠は戻さない。長短が交互に来ても毎回止まらないこと
+  const third = Date.now();
+  assert.equal(resolveStop(text, [pattern]).speak, true);
+  assert.ok(Date.now() - third < IGNORE_MATCH_PATTERN_MS, `${Date.now() - third}ms かかった`);
 });
 
 test('重いパターンの後ろでも軽いパターンは判定される', () => {
-  // 予算が残っていれば、打ち切った次のパターンで一致を拾えること
-  const r = resolveStop('実行ログ: 完了', ['(a+)+$', '^実行ログ']);
-  assert.equal(r.speak, false);
-  assert.equal(r.reason, 'ignored-pattern');
+  // 打ち切った後も予算が残るので、後ろのパターンで一致を拾えること。
+  // 初回（重いパターンが予算を食う可能性がある）と 2 回目の両方で確かめる
+  const text = `${'a'.repeat(4000)}! 実行ログ`;
+  for (const attempt of ['初回', '2 回目']) {
+    const r = resolveStop(text, [heavy(11), '実行ログ']);
+    assert.equal(r.speak, false, attempt);
+    assert.equal(r.reason, 'ignored-pattern', attempt);
+  }
 });
 
 test('ターゲット全体を無効にすると読み上げない', () => {

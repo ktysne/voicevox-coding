@@ -27,6 +27,8 @@ const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PermissionRequest']);
 
 // 無視パターンの照合に使ってよい時間の合計。1 回の判定でこれを超えたら、残りは見ずに読み上げる。
 export const IGNORE_MATCH_BUDGET_MS = 200;
+// 1 つのパターンに使ってよい時間。重いパターンが 1 つあっても、後ろのパターンの番が回るようにする。
+export const IGNORE_MATCH_PATTERN_MS = 50;
 
 // 照合は vm の時間制限付きで走らせる。書き方によっては照合が事実上終わらない正規表現
 // （`(a+)+$` や `a*a*X` など）があり、デーモンは 1 スレッドなので、素で実行すると
@@ -35,9 +37,10 @@ export const IGNORE_MATCH_BUDGET_MS = 200;
 const MATCH_SCRIPT = new vm.Script('new RegExp(pattern).test(text)');
 const MATCH_CONTEXT = vm.createContext({ pattern: '', text: '' });
 
-// 一度時間切れになったパターンに、毎回 200 ミリ秒を使うわけにはいかない。
+// 一度時間切れになったパターンに、毎回 50 ミリ秒を使うわけにはいかない。
 // かといって以後ずっと使わないのも乱暴で、本文が短ければ同じパターンでも一瞬で終わる。
-// そこで 2 回目からは短い時間で試し、間に合えば元に戻す。
+// そこで 2 回目からはずっと短い時間で試す。一度速く終わっても元の枠には戻さない
+// （長い本文と短い本文が交互に来ると、そのたびに止まってしまうため）。
 export const IGNORE_MATCH_RETRY_MS = 5;
 const timedOutPatterns = new Set();
 // 覚えっぱなしで際限なく増やさない。数が増えたら忘れて、また測り直す
@@ -70,13 +73,11 @@ export function matchesIgnorePattern(text, patterns, problems = []) {
       }
       if (typeof pattern !== 'string' || pattern === '') continue;
       // 前に時間切れになったパターンは短い時間で試す。本文が短ければこれで足りる
-      const retrying = timedOutPatterns.has(pattern);
-      const timeout = Math.max(1, Math.ceil(retrying ? Math.min(left, IGNORE_MATCH_RETRY_MS) : left));
+      const perPattern = timedOutPatterns.has(pattern) ? IGNORE_MATCH_RETRY_MS : IGNORE_MATCH_PATTERN_MS;
+      const timeout = Math.max(1, Math.ceil(Math.min(left, perPattern)));
       MATCH_CONTEXT.pattern = pattern;
       try {
-        const hit = MATCH_SCRIPT.runInContext(MATCH_CONTEXT, { timeout });
-        if (retrying) timedOutPatterns.delete(pattern); // 間に合ったので元に戻す
-        if (hit) return true;
+        if (MATCH_SCRIPT.runInContext(MATCH_CONTEXT, { timeout })) return true;
       } catch (err) {
         // 不正な正規表現と、時間内に終わらなかったパターンは飛ばす。
         // 打ち切ったときは「一致しなかった」扱いにする（黙り込むより読み上げるほうが安全）。
