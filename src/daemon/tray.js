@@ -8,9 +8,10 @@ import { fileURLToPath } from 'node:url';
 const TRAY_PS1 = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'tray', 'tray-worker.ps1');
 
 export class Tray {
-  constructor(port, logger) {
+  constructor(port, logger, token = '') {
     this.port = port;
     this.log = logger;
+    this.token = token;
     this.child = null;
     this.stopping = false;
     this.restarts = 0;
@@ -28,6 +29,7 @@ export class Tray {
         '-File', TRAY_PS1,
         '-Port', String(this.port),
         '-ParentPid', String(process.pid),
+        '-Token', this.token,
       ],
       { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true },
     );
