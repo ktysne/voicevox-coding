@@ -10,6 +10,8 @@
     このスクリプトは次をまとめて行う。
       1. git pull --ff-only でリポジトリを最新化する
       2. 稼働中のデーモンを停止する（/api/shutdown。トークンは runtime.json から読む）
+         停止トークンを取得できない場合（初回更新時など、runtime.json を書き出さない版の
+         デーモンが稼働している場合）は、本デーモンのプロセスだと確認したうえで停止する
       3. install.ps1 を再実行し、フック定義とスタートアップ登録を作り直す
          （スタートアップは登録済みかどうかを自動判定して引き継ぐ）
       4. デーモンが稼働していた場合は起動し直す
@@ -21,8 +23,11 @@
     git pull を省略する（取得済みの状態から適用だけ行う）。
 
 .PARAMETER Force
-    停止 API で止められないとき、本デーモンのプロセスだと確認できた場合に限り強制終了して続行する。
+    停止トークンを取得できているにもかかわらず、停止 API でデーモンを止められないときに
+    限り必要になる。本デーモンのプロセスだと確認できた場合のみ強制終了して続行する。
     指定しない場合は中断し、トレイの「終了」による停止を案内する。
+    なお、停止トークンを取得できなかった場合（初回更新時など）は、本デーモンのプロセスだと
+    確認できていれば -Force を付けなくても自動的に停止して続行する。
 
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\update.ps1
@@ -138,10 +143,28 @@ if ($wasRunning) {
         if ($oldRuntime.token) { $headers['X-VoiceVox-Coding-Token'] = [string]$oldRuntime.token }
     } catch {}
 
+    # 停止 API を呼ぶ前の待受 PID を控えておく。停止に成功すると後からは取得できなくなる。
+    $ownersBefore = Get-PortOwnerPids $port
+
+    # 「トークンを持っていた（＝止まるはずだった）のに止まらない」ことだけをハングの
+    # 証拠として扱う。トークンを一度も持てていない（runtime.json が無い／token が無い／
+    # pid が実際の待受プロセスと不一致＝クラッシュ後に残った古いファイル）場合は、
+    # 止まらないことがハングを意味しないため、後続で自動停止の対象にする。
+    $tokenTrusted = $false
+    if ($oldRuntime -and $oldRuntime.token -and (Get-Member -InputObject $oldRuntime -Name 'pid' -ErrorAction SilentlyContinue)) {
+        $ownerPidsInt = @($ownersBefore | ForEach-Object { [int]$_ })
+        if ($ownerPidsInt -contains [int]$oldRuntime.pid) { $tokenTrusted = $true }
+    }
+
+    $shutdownAccepted = $false
     try {
         $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/shutdown" -Method Post -Headers $headers -TimeoutSec 5
+        $shutdownAccepted = $true
     } catch {
         Write-Warn2 "停止 API の呼び出しに失敗しました: $($_.Exception.Message)"
+        if (-not $tokenTrusted) {
+            Write-Warn2 'runtime.json から停止トークンを取得できませんでした（runtime.json を書き出さない版のデーモン、または古い runtime.json の可能性があります）。'
+        }
     }
 
     if (-not (Wait-PortReleased $port)) {
@@ -154,11 +177,33 @@ if ($wasRunning) {
             Write-Error "ポート $port の待受プロセス (PID: $($unconfirmed -join ', ')) を本デーモンと確認できません。別のサービスがこのポートを使っている可能性があります。デーモンの停止と設定 (daemon.port) を確認してから再実行してください。"
             exit 1
         }
-        if (-not $Force) {
+
+        # トークンを持っていた、または停止 API が受理されたのに止まらない場合は、
+        # 正常終了処理が遅いだけ（＝ハングの疑い）である可能性があるため、
+        # 自動停止の対象にはしない。この 2 つのどちらにも当てはまらない場合だけ、
+        # トークンを一度も持てていない＝止まらないことがハングの証拠にならないと言えるため、
+        # 本デーモンだと確認できたプロセスに限り自動的に停止してよい。
+        $canAutoStop = (-not $tokenTrusted) -and (-not $shutdownAccepted)
+
+        if (-not $canAutoStop -and -not $Force) {
             Write-Error '停止 API でデーモンを止められませんでした。タスクトレイの「終了」で停止してから再実行してください。強制終了して続行する場合は -Force を付けます（エンジンなどの後始末は次回起動時に行われます）。'
             exit 1
         }
 
+        if ($canAutoStop) {
+            Write-Warn2 '停止トークンを取得できなかったため停止 API を使えませんでした。本デーモンのプロセスだと確認できたため終了させます。'
+            Write-Warn2 'エンジンの停止などの後始末は行われません。次回のデーモン起動時に引き継がれます。'
+        }
+
+        # 子プロセス（再生ワーカー、Codex app-server、トレイ）は個別に終了させる必要はない。
+        # 再生ワーカーと Codex app-server は node との標準入出力パイプで繋がっており、
+        # node が終了して stdin が EOF になれば自力で後始末をして終了する。
+        # とりわけ再生ワーカーはこの EOF 経路のほうが再生とストリームの解放を正しく通るため、
+        # Stop-Process で個別に殺すとかえって後始末を飛ばしてしまう。
+        # トレイも -ParentPid の監視により node の消滅を検知して自力で畳む。
+        # VOICEVOX ENGINE は detached で起動しており残り続けるが、次回のデーモン起動時に
+        # reclaimStale() が引き継ぐ。以上の理由から、taskkill /T のようなプロセスツリーの
+        # 一括終了はしてはならない。落とすのは node 本体だけでよい。
         foreach ($ownerPid in $owners) {
             Write-Warn2 "デーモンのプロセス $ownerPid を強制終了します"
             Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
