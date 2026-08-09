@@ -150,16 +150,30 @@ const PATH_CHAR = `[^${PATH_EXCLUDE}]`;
 const PATH_SPACE = String.raw` (?=[^\s]*[A-Za-z\\/])`;
 const PATH_SEG = `${PATH_CHAR}+(?:${PATH_SPACE}${PATH_CHAR}+)*`;
 
-// ドライブレター起点の Windows パス。空白を含むセグメントを許すぶん寛容に扱う。
-// 区切りは `\` と `/` の混在も認める（Node.js も Windows も混在パスを解決できる）。
-const WIN_ABS_PATH = new RegExp(String.raw`[A-Za-z]:[\\/](?:${PATH_SEG}[\\/])*${PATH_SEG}[\\/]?`, 'gu');
-
-// 相対パス。ドライブレターという目印が無いぶん保守的に扱う。
-// 空白を許すと日本語の文全体を巻き込むため含めず、日本語の文字も要素に含めない。
-// 日本語は語間に空白を置かないので、`詳細は2024/08/09の記録` のように地の文が
-// 直結したとき、どこからがパスかを文字種以外では判別できないため。
-// 先頭のセグメントも含めないと src/daemon/queue.js が「src」と「queue.js」に割れる。
+// 相対パスの要素。ドライブレターという目印が無いぶん保守的に扱い、
+// 空白も日本語の文字も含めない。日本語は語間に空白を置かないため、
+// `詳細は2024/08/09の記録` のように地の文が直結すると、どこからがパスかを
+// 文字種以外では判別できない。
 const REL_CHAR = `[^${PATH_EXCLUDE}${JP_EXCLUDE}]`;
+
+// 絶対パスの最終セグメント。次の順に試す。
+//   1. 空白を含んでよいが `.ext` で終わるもの（`release notes.txt`）
+//   2. 空白も日本語も含まないもの（`app.logを確認` の「を確認」を残す）
+//   3. 日本語だけのディレクトリ名（`C:\Users\山田`）
+// 1 の後方参照で `C:\logs\app.log is missing` の後続本文を飲み込まずに済む。
+const LAST_SEG = `(?:${PATH_SEG}(?<=\\.[A-Za-z0-9]{1,10})|${REL_CHAR}+|${PATH_CHAR}+)`;
+
+// ドライブレター起点の Windows パスと UNC パス（\\server\share）。
+// 途中のセグメントには空白を許すぶん寛容に扱う。
+// 区切りは `\` と `/` の混在も認める（Node.js も Windows も混在パスを解決できる）。
+// 既知の限界：`C:\temp and see src\a.js` のように英単語だけで文を続けると
+// 途中のセグメントとして飲み込む。空白を含むディレクトリ名との区別が付かないため許容する。
+const ABS_PATH = new RegExp(
+  String.raw`(?:[A-Za-z]:[\\/](?:${PATH_SEG}[\\/])*|\\\\(?:${PATH_SEG}[\\/])+)${LAST_SEG}[\\/]?`,
+  'gu',
+);
+
+// 相対パス。先頭のセグメントも含めないと src/daemon/queue.js が「src」と「queue.js」に割れる。
 const REL_PATH = new RegExp(String.raw`${REL_CHAR}+(?:[\\/]${REL_CHAR}+)+[\\/]?`, 'gu');
 
 const NUMERIC_SEG = /^\d+(?:\.\d+)?$/;
@@ -175,12 +189,68 @@ function pathSegments(m) {
  */
 function isLikelyRelativePath(m) {
   const parts = pathSegments(m);
-  if (!parts.length) return false;
+  if (parts.length < 2) return false;
   if (parts.every((p) => NUMERIC_SEG.test(p))) return false; // 日付や分数
-  if (EXTENSION.test(parts[parts.length - 1])) return true; // 拡張子付きなら 1 段でもパス
+  if (EXTENSION.test(parts[parts.length - 1])) return true; // 拡張子付きならパス
   const seps = (m.match(/[\\/]/g) || []).length;
-  // 区切りが 2 つ以上あり、かつ ASCII 英数字を含むもの（`入力/出力/変換` は除く）
-  return seps >= 2 && /[A-Za-z0-9]/.test(m);
+  if (seps >= 2 && /[A-Za-z0-9]/.test(m)) return true; // src/daemon/ など
+  // 区切りが 1 つだけのときは `CI/CD` `A/B` `and/or` のような略語や併記と区別が付かない。
+  // 各要素が 2 文字以上で、かつ `.` `_` `-` を含むもの（node_modules/pkg など）だけ通す。
+  return parts.every((p) => p.length >= 2) && /[._-]/.test(m);
+}
+
+// パスの外側にある括弧。`(src/daemon/app.js)` の括弧はパスの一部ではないので、
+// 短縮の対象から外して元のまま残す。`Program Files (x86)` のような内側の括弧は残す。
+const BRACKET_OPEN_TO_CLOSE_PATH = { '(': ')', '[': ']', '{': '}', '（': '）', '「': '」', '【': '】' };
+const BRACKET_CLOSE_TO_OPEN_PATH = {};
+for (const [o, c] of Object.entries(BRACKET_OPEN_TO_CLOSE_PATH)) BRACKET_CLOSE_TO_OPEN_PATH[c] = o;
+
+function countChar(s, ch) {
+  let n = 0;
+  for (const c of s) if (c === ch) n++;
+  return n;
+}
+
+/** s 全体が先頭の開き括弧とその対応する閉じ括弧で囲まれているか。 */
+function isBracketWrapped(s) {
+  const open = s[0];
+  const close = BRACKET_OPEN_TO_CLOSE_PATH[open];
+  if (!close || s[s.length - 1] !== close) return false;
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === open) depth++;
+    else if (s[i] === close && --depth === 0) return i === s.length - 1;
+  }
+  return false;
+}
+
+/** マッチ文字列を「外側の括弧」「パス本体」「外側の括弧」へ分ける。 */
+function splitOuterBrackets(m) {
+  let start = 0;
+  let end = m.length;
+  for (;;) {
+    const core = m.slice(start, end);
+    if (core.length < 2) break;
+    const last = core[core.length - 1];
+    const openOfLast = BRACKET_CLOSE_TO_OPEN_PATH[last];
+    if (openOfLast && countChar(core, openOfLast) < countChar(core, last)) {
+      end--; // 対応する開き括弧を持たない閉じ括弧
+      continue;
+    }
+    const first = core[0];
+    const closeOfFirst = BRACKET_OPEN_TO_CLOSE_PATH[first];
+    if (closeOfFirst && countChar(core, closeOfFirst) < countChar(core, first)) {
+      start++; // 対応する閉じ括弧を持たない開き括弧
+      continue;
+    }
+    if (isBracketWrapped(core)) {
+      start++;
+      end--;
+      continue;
+    }
+    break;
+  }
+  return { lead: m.slice(0, start), core: m.slice(start, end), trail: m.slice(end) };
 }
 
 // URL を一時退避するときの目印。区切り文字も \w も含まないので、
@@ -223,18 +293,21 @@ function applyFilePaths(text, mode) {
     return PARK_OPEN + (parked.length - 1) + PARK_CLOSE;
   });
 
-  const shorten = (m) => {
-    if (mode === 'omit') return ' ';
-    const parts = pathSegments(m);
-    return parts.length ? parts[parts.length - 1] : ' ';
+  const shorten = (m, requireLikely) => {
+    const { lead, core, trail } = splitOuterBrackets(m);
+    if (!core || (requireLikely && !isLikelyRelativePath(core))) return m;
+    if (mode === 'omit') return `${lead} ${trail}`;
+    const parts = pathSegments(core);
+    if (!parts.length) return m;
+    return lead + parts[parts.length - 1] + trail;
   };
 
-  // ドライブレター起点を先に処理する。先に相対パスを当てると `C:\a\b` の
-  // 途中（`a\b`）だけを拾ってしまう。ドライブレター側で拾い切れなかった残りは
-  // 相対パスとして処理される。
+  // 絶対パス（ドライブレターと UNC）を先に処理する。先に相対パスを当てると
+  // `C:\a\b` の途中（`a\b`）だけを拾ってしまう。
+  // 絶対パス側で拾い切れなかった残りは相対パスとして処理される。
   const replaced = guarded
-    .replace(WIN_ABS_PATH, (m) => shorten(m))
-    .replace(REL_PATH, (m) => (isLikelyRelativePath(m) ? shorten(m) : m));
+    .replace(ABS_PATH, (m) => shorten(m, false))
+    .replace(REL_PATH, (m) => shorten(m, true));
 
   return replaced.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
 }

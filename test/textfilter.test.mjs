@@ -177,6 +177,49 @@ test('区切り文字が混在する Windows パスも従来どおり短縮で�
   assert.equal(omitted.text, 'を確認');
 });
 
+test('絶対パス直後に日本語が直結しても後続本文は残る（AUD-08）', () => {
+  const { text } = filterText('C:\\logs\\app.logを確認', F);
+  assert.equal(text, 'app.logを確認');
+  const omitted = filterText('C:\\logs\\app.logを確認', { ...F, filePath: 'omit' });
+  assert.equal(omitted.text, 'を確認');
+});
+
+test('絶対パス直後に英文が続いても後続本文は残る（AUD-08）', () => {
+  const { text } = filterText('C:\\logs\\app.log is missing', F);
+  assert.equal(text, 'app.log is missing');
+  const omitted = filterText('C:\\logs\\app.log is missing', { ...F, filePath: 'omit' });
+  assert.equal(omitted.text, 'is missing');
+});
+
+test('UNC パスもファイル名だけになる（AUD-08）', () => {
+  const { text } = filterText('\\\\server\\share\\docs\\a.txt を開く', F);
+  assert.match(text, /^a\.txt を開く$/);
+  const share = filterText('\\\\server\\share を開く', F);
+  assert.match(share.text, /^share を開く$/);
+});
+
+test('パスの外側の括弧は短縮対象に含めない（AUD-08）', () => {
+  const rel = filterText('参照 (src/daemon/app.js) を確認', F);
+  assert.match(rel.text, /^参照 \(app\.js\) を確認$/);
+  const abs = filterText('(C:\\logs\\app.log) を確認', F);
+  assert.match(abs.text, /^\(app\.log\) を確認$/);
+  const omitted = filterText('参照 (src/daemon/app.js) を確認', { ...F, filePath: 'omit' });
+  assert.match(omitted.text, /参照/);
+  assert.match(omitted.text, /を確認/);
+});
+
+test('拡張子の無い 2 要素の相対パスも記号を含めば短縮される（AUD-08）', () => {
+  const { text } = filterText('node_modules/pkg を削除', { ...F, markdownSymbols: false });
+  assert.match(text, /^pkg を削除$/);
+  const dash = filterText('my-app/dist を削除', F);
+  assert.match(dash.text, /^dist を削除$/);
+});
+
+test('CI/CD のような略語はパスとして短縮しない（AUD-08）', () => {
+  const { text } = filterText('CI/CD の設定と TCP/IP の確認', F);
+  assert.equal(text, 'CI/CD の設定と TCP/IP の確認');
+});
+
 test('日付はパスとして短縮しない（AUD-08）', () => {
   const { text } = filterText('詳細は 2024/08/09 の記録', F);
   assert.equal(text, '詳細は 2024/08/09 の記録');
