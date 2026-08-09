@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EVENTS, VOICE_PARAMS, TARGETS, eventsForTarget } from './catalog.js';
-import { resolveUtterance } from './events.js';
+import { resolveUtterance, matchesIgnorePattern, resetIgnoreMatchState } from './events.js';
 import { filterText } from './textfilter.js';
 import { applyReplacements, syncEngineDictionary, validateEngineWord } from './dictionary.js';
 import { CONFIG_PATH } from './config.js';
@@ -127,6 +127,34 @@ export function checkMutationRequest({ pathname, headers = {}, port, token }) {
 export function createServer({ store, engine, queue, log, engineProcess, runtime, commentaryMonitor, onShutdown, port, token }) {
   const sseClients = new Set();
 
+  // 同じ警告を発話のたびに出すとログが埋まるので、一度出したものは覚えておく。
+  // 設定を変えたら出し直したいので、config の変更で忘れる。
+  const warnedOnce = new Set();
+  const ignorePatternsOf = (cfg) => JSON.stringify(
+    Object.values(cfg.targets ?? {}).map((p) => p?.ignorePatterns ?? []),
+  );
+  let lastIgnorePatterns = ignorePatternsOf(store.config);
+  store.on('change', (cfg) => {
+    warnedOnce.clear();
+    // 無視パターンを直したときだけ、時間切れの記録を捨てて測り直す。
+    // 設定はどの欄をいじっても保存されるので、変わっていないなら測り直さない。
+    const next = ignorePatternsOf(cfg);
+    if (next !== lastIgnorePatterns) {
+      lastIgnorePatterns = next;
+      resetIgnoreMatchState();
+    }
+  });
+
+  /** 使えなかった無視パターンをログに残す。黙って飛ばすと直しようがない。 */
+  const warnProblems = (target, problems) => {
+    for (const problem of problems ?? []) {
+      const key = `${target}: ${problem}`;
+      if (warnedOnce.has(key)) continue;
+      warnedOnce.add(key);
+      log.warn(`[${target}] ${problem}`);
+    }
+  };
+
   /** 整形して発話キューに積む。ターゲットの設定に従う。 */
   const speak = (target, eventName, payload) => {
     const profile = store.profile(target);
@@ -136,6 +164,8 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       profile,
       dictionary: store.config.dictionary,
     });
+
+    warnProblems(target, decision.problems);
 
     if (runtime?.muted) {
       log.debug(`[${target}] ${eventName}: 一時停止中のため読み上げなし`);
@@ -350,9 +380,17 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           json(res, 400, { error: 'unknown target' });
           return;
         }
+        // 無視パターンも本番と同じ順序で見る。ここで確かめられないと書いたパターンを試せない
+        const previewProblems = [];
+        const skipped = matchesIgnorePattern(text ?? '', profile.ignorePatterns, previewProblems);
+        warnProblems(target, previewProblems);
+        if (skipped) {
+          json(res, 200, { text: '', truncated: false, chars: 0, ignored: true });
+          return;
+        }
         const filtered = filterText(text ?? '', profile.textFilter);
         const spoken = applyReplacements(filtered.text, store.config.dictionary?.replacements ?? []);
-        json(res, 200, { text: spoken, truncated: filtered.truncated, chars: spoken.length });
+        json(res, 200, { text: spoken, truncated: filtered.truncated, chars: spoken.length, ignored: false });
         return;
       }
 
@@ -366,6 +404,14 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
         }
         let spoken = text ?? '';
         if (!raw) {
+          // raw は声の調整用の試聴なので、無視パターンは本文を読ませるときだけ見る
+          const previewProblems = [];
+          const skipped = matchesIgnorePattern(spoken, profile.ignorePatterns, previewProblems);
+          warnProblems(target, previewProblems);
+          if (skipped) {
+            json(res, 200, { spoken: false, reason: 'ignored-pattern' });
+            return;
+          }
           const filtered = filterText(spoken, profile.textFilter);
           spoken = applyReplacements(filtered.text, store.config.dictionary?.replacements ?? []);
         }

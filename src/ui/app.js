@@ -229,6 +229,9 @@ function renderTargetPanel(targetId) {
   // --- ツールフィルタ ---
   panel.append(renderToolFilterCard(targetId, base, profile));
 
+  // --- 無視パターン ---
+  panel.append(renderIgnorePatternsCard(base, profile));
+
   // --- 読み上げ要素フィルタ ---
   panel.append(renderTextFilterCard(base));
 
@@ -356,6 +359,87 @@ function renderToolFilterCard(targetId, base, profile) {
   );
 }
 
+function ignorePatternError(pattern) {
+  if (!pattern) return null;
+  try {
+    new RegExp(pattern);
+  } catch {
+    // ブラウザの例外メッセージは英語なので、そのまま出さずに日本語で言い換える
+    return '正規表現として解釈できません。書き方を確認してください';
+  }
+  return null;
+}
+
+/**
+ * 無視パターンの 1 行。欄から離れたときに使える正規表現かを確かめ、
+ * 駄目なら行の下に理由を出す（保存自体は止めない。あとから直せるように）。
+ * 入力の途中は必ず不完全なので、打っている間は理由を消しておく。
+ */
+function ignorePatternRow(base, pattern, index) {
+  const errorId = `${base.replace(/\./g, '-')}-ignore-error-${index}`;
+  const error = h('span', {
+    class: 'hint',
+    style: 'display:block;margin:6px 0 0;color:var(--err)',
+    id: errorId,
+    // 入力欄から aria-describedby で参照する。role="status" と併用すると二重に読まれる
+    'aria-live': 'polite',
+  });
+  const input = h('input', {
+    type: 'text',
+    'data-path': `${base}.ignorePatterns.${index}`,
+    value: pattern ?? '',
+    placeholder: '例: ^バックグラウンドタスクの実行ログ',
+    // 見出しが 1 列しかない表なので、行を見分けられる名前を付ける
+    'aria-label': `無視パターン ${index + 1}`,
+    'aria-describedby': errorId,
+  });
+  const show = (message) => {
+    error.textContent = message ?? '';
+    if (message) input.setAttribute('aria-invalid', 'true');
+    else input.removeAttribute('aria-invalid');
+  };
+  input.addEventListener('input', () => show(null));
+  input.addEventListener('blur', () => show(ignorePatternError(input.value)));
+  show(ignorePatternError(pattern));
+
+  return h(
+    'tr',
+    {},
+    h('td', {}, input, error),
+    h('td', {}, h('button', {
+      class: 'btn btn-sm btn-ghost btn-danger',
+      'aria-label': `無視パターン ${index + 1} を削除`,
+      onclick: () => removeArrayItem(`${base}.ignorePatterns`, index),
+    }, '削除')),
+  );
+}
+
+function renderIgnorePatternsCard(base, profile) {
+  // 手編集で配列以外が入っていても描画は壊さない
+  const patterns = Array.isArray(profile.ignorePatterns) ? profile.ignorePatterns : [];
+
+  return h(
+    'section',
+    { class: 'card' },
+    h('h2', {}, '無視パターン'),
+    h('p', { class: 'card-desc' },
+      'ここに書いた正規表現のどれかに本文が一致したら、その発話ごと読み上げません。'
+      + 'バックグラウンドタスクの実行ログのような、決まった文面を外すのに使います。'),
+    patterns.length
+      ? h('table', {},
+          h('thead', {}, h('tr', {},
+            h('th', {}, '正規表現（部分一致）'),
+            h('th', { class: 'col-narrow' }, ''))),
+          h('tbody', {}, patterns.map((p, i) => ignorePatternRow(base, p, i))))
+      : h('p', { class: 'hint' }, 'パターンはまだありません。すべての本文が読み上げの対象です。'),
+    h('button', { class: 'btn btn-sm', style: 'margin-top:10px', onclick: () => pushArrayItem(`${base}.ignorePatterns`, '') }, '+ パターンを追加'),
+    h('p', { class: 'hint' },
+      '整形前の本文に対して部分一致で判定します。大文字小文字は区別するので、'
+      + '区別したくないときは [Bb]ackground のように書いてください。'
+      + '解釈できないパターンと、照合に時間がかかりすぎるパターンは読み上げ時に飛ばします。'),
+  );
+}
+
 function renderTextFilterCard(base) {
   const f = `${base}.textFilter`;
   return h(
@@ -417,11 +501,16 @@ function renderPreviewCard(targetId) {
   const output = h('div', { class: 'preview-out' }, '「整形を確認」を押すと、実際に読み上げるテキストが表示されます。');
 
   const runFilter = async () => {
+    await saveNow(); // 直前に書いた無視パターンや整形設定で判定させる
     try {
       const r = await api('/api/filter-preview', {
         method: 'POST',
         body: JSON.stringify({ target: targetId, text: textarea.value }),
       });
+      if (r.ignored) {
+        output.textContent = '（無視パターンに一致するため読み上げません）';
+        return;
+      }
       output.textContent = r.text || '（読み上げるテキストが残りませんでした）';
       output.append(h('div', { class: 'hint', style: 'margin-top:8px' }, `${r.chars} 文字${r.truncated ? '・省略あり' : ''}`));
     } catch (err) {
@@ -635,11 +724,19 @@ function resetVoice(targetId) {
   renderActivePanel();
 }
 
+// 試聴で読み上げなかった理由。デーモンが返す識別子をそのまま出さない
+const SKIP_REASONS = {
+  'ignored-pattern': '無視パターンに一致しました',
+  empty: '読み上げるテキストが残りませんでした',
+  duplicate: '直前と同じ内容のため見送りました',
+  busy: '読み上げ中のため見送りました',
+};
+
 async function preview(targetId, text, raw) {
   await saveNow();
   try {
     const r = await api('/api/preview', { method: 'POST', body: JSON.stringify({ target: targetId, text, raw }) });
-    if (!r.spoken) toast(`読み上げませんでした（${r.reason ?? '不明'}）`, true);
+    if (!r.spoken) toast(`読み上げませんでした（${SKIP_REASONS[r.reason] ?? r.reason ?? '理由不明'}）`, true);
   } catch (err) {
     toast(err.message, true);
   }
@@ -790,6 +887,9 @@ function connectStream() {
   es.addEventListener('config', (e) => {
     // 外部エディタでの編集を反映する。入力中の上書きを避けるため保存待ちのときは無視する
     if (savePending) return;
+    // 自分の保存でも通知は返ってくる。中身が手元と同じなら描き直さない
+    // （描き直すと入力中の欄からフォーカスが飛ぶ）。外部の変更なら中身が違うので通る。
+    if (e.data === JSON.stringify(state.config)) return;
     state.config = JSON.parse(e.data);
     renderActivePanel();
   });

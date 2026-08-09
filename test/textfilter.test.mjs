@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { filterText, renderTemplate } from '../src/daemon/textfilter.js';
 import { chunkText } from '../src/daemon/queue.js';
 import { applyReplacements, validateEngineWord } from '../src/daemon/dictionary.js';
-import { resolveUtterance } from '../src/daemon/events.js';
+import { resolveUtterance, resetIgnoreMatchState, IGNORE_MATCH_BUDGET_MS, IGNORE_MATCH_PATTERN_MS } from '../src/daemon/events.js';
 import { defaultConfig } from '../src/daemon/config.js';
 import { wavDurationMs } from '../src/daemon/player.js';
 
@@ -409,6 +409,157 @@ test('Stop は本文を読み上げる', () => {
   });
   assert.equal(r.speak, true);
   assert.match(r.text, /作業が終わりました/);
+});
+
+/** Stop イベントの本文を渡して判定させる（無視パターンのテスト用）。 */
+function resolveStop(text, ignorePatterns) {
+  const profile = { ...defaultConfig().targets.claudeCode, ignorePatterns };
+  return resolveUtterance({
+    eventName: 'Stop',
+    payload: { hook_event_name: 'Stop', last_assistant_message: text },
+    profile,
+    dictionary: { replacements: [] },
+  });
+}
+
+test('無視パターンに一致した本文は読み上げない', () => {
+  const r = resolveStop('バックグラウンドタスクの実行ログ\n終了コード 0', ['^バックグラウンドタスクの実行ログ']);
+  assert.equal(r.speak, false);
+  assert.equal(r.reason, 'ignored-pattern');
+});
+
+test('無視パターンに一致しない本文は読み上げる', () => {
+  const r = resolveStop('作業が終わりました。', ['^バックグラウンドタスクの実行ログ']);
+  assert.equal(r.speak, true);
+  assert.match(r.text, /作業が終わりました/);
+});
+
+test('無視パターンは大文字小文字を区別する', () => {
+  assert.equal(resolveStop('BACKGROUND task done', ['background']).speak, true);
+  assert.equal(resolveStop('background task done', ['background']).speak, false);
+});
+
+test('不正な無視パターンは飛ばして残りで判定する', () => {
+  assert.equal(resolveStop('作業が終わりました。', ['[', '(?']).speak, true);
+  assert.equal(resolveStop('実行ログ: 完了', ['[', '実行ログ']).reason, 'ignored-pattern');
+});
+
+test('無視パターンが未設定でも読み上げる', () => {
+  // 既存の config.json にキーが無くても落ちないこと
+  assert.equal(resolveStop('作業が終わりました。', undefined).speak, true);
+});
+
+test('無視パターンが配列でなくても落ちない', () => {
+  // 手編集で型が崩れた config.json を読み込んだ場合
+  for (const broken of [{}, 'ログ', 42, null]) {
+    assert.equal(resolveStop('作業が終わりました。', broken).speak, true);
+  }
+  // 配列の中身が文字列でない場合も同じ
+  assert.equal(resolveStop('作業が終わりました。', [null, 3, {}]).speak, true);
+});
+
+// 照合が終わらないパターン。繰り返しを並べるほど重くなる。
+const heavy = (repeats) => `${'a*'.repeat(repeats)}X`;
+// 時間切れの記録はモジュールに溜まるので、時間を測るテストは毎回まっさらから始める。
+const LONG_TEXT = `${'a'.repeat(4000)}!`;
+
+/** 経過時間をミリ秒で測る。数ミリ秒を見るので performance.now を使う。 */
+function measure(fn) {
+  const started = performance.now();
+  const value = fn();
+  return { value, ms: performance.now() - started };
+}
+
+test('照合が終わらないパターンは時間で打ち切る', () => {
+  // 素の RegExp では終わらない書き方。打ち切って読み上げに進むこと。
+  // (a+)+$ は繰り返しの入れ子、a*a*X はグループ無しでも計算量が跳ねる例。
+  resetIgnoreMatchState();
+  for (const pattern of ['(a+)+$', '(a|aa)+$', heavy(2), '^a*a*a*a*a*a*a*a*X$']) {
+    const { value, ms } = measure(() => resolveStop(LONG_TEXT, [pattern]));
+    assert.equal(value.speak, true, pattern);
+    assert.ok(ms < IGNORE_MATCH_BUDGET_MS * 3, `${pattern} の打ち切りに ${ms}ms かかった`);
+  }
+});
+
+test('打ち切りの予算はパターン全体で共有する', () => {
+  // 重いパターンを並べても、1 回の判定にかかる時間は予算の範囲に収まること
+  resetIgnoreMatchState();
+  const patterns = Array.from({ length: 5 }, (_, i) => heavy(3 + i));
+  const { value, ms } = measure(() => resolveStop(LONG_TEXT, patterns));
+  assert.equal(value.speak, true);
+  assert.ok(ms < IGNORE_MATCH_BUDGET_MS * 3, `${ms}ms かかった`);
+});
+
+test('空のパターンが並んでいても予算を超えない', () => {
+  // 予算切れの判定を空文字より先に行っていること
+  resetIgnoreMatchState();
+  const patterns = [heavy(9), ...Array.from({ length: 10000 }, () => '')];
+  const { value, ms } = measure(() => resolveStop(LONG_TEXT, patterns));
+  assert.equal(value.speak, true);
+  assert.ok(ms < IGNORE_MATCH_BUDGET_MS * 3, `${ms}ms かかった`);
+});
+
+test('使えなかった無視パターンは理由が残る', () => {
+  // 黙って飛ばすだけだと「書いたのに効かない」が無通知になる
+  const r = resolveStop('作業が終わりました。', ['[']);
+  assert.equal(r.speak, true);
+  assert.deepEqual(r.problems, ['無視パターン 1（[）は正規表現として解釈できません']);
+  assert.equal(resolveStop('作業が終わりました。', ['^実行ログ']).problems.length, 0);
+});
+
+test('理由の文面は長いパターンを短く切る', () => {
+  // ログに設定の全文を流し込まない
+  const long = `^${'あ'.repeat(200)}`;
+  const [problem] = resolveStop('作業が終わりました。', [`${long}(`]).problems;
+  assert.ok(problem.length < 120, problem);
+  assert.match(problem, /…/);
+});
+
+test('時間切れになったパターンは次から短い時間で試す', () => {
+  resetIgnoreMatchState();
+  const pattern = heavy(10);
+  const first = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  assert.match(first.value.problems[0], /時間内に終わりません/);
+  assert.ok(first.ms >= IGNORE_MATCH_PATTERN_MS / 2, `${first.ms}ms しかかかっていない`);
+
+  // 2 回目は短い時間で打ち切る。絶対値ではなく初回との比で見る（実行環境の速さに左右されないように）
+  const second = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  assert.equal(second.value.speak, true);
+  assert.match(second.value.problems[0], /時間内に終わりません/);
+  assert.ok(second.ms < first.ms / 2, `初回 ${first.ms}ms に対して 2 回目が ${second.ms}ms`);
+
+  // 本文が短ければ短い枠でも間に合うので、同じパターンがちゃんと効く
+  const short = resolveStop('aaX', [pattern]);
+  assert.equal(short.speak, false);
+  assert.equal(short.reason, 'ignored-pattern');
+  assert.deepEqual(short.problems, []);
+
+  // 短い本文で間に合っても枠は戻さない。長短が交互に来ても毎回止まらないこと
+  const third = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  assert.equal(third.value.speak, true);
+  assert.ok(third.ms < first.ms / 2, `${third.ms}ms かかった`);
+});
+
+test('記録を捨てると時間切れのパターンをまた測り直す', () => {
+  resetIgnoreMatchState();
+  const pattern = heavy(12);
+  assert.match(resolveStop(LONG_TEXT, [pattern]).problems[0], /時間内に終わりません/);
+  const shortLeash = measure(() => resolveStop(LONG_TEXT, [pattern]));
+
+  resetIgnoreMatchState();
+  const again = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  assert.ok(again.ms > shortLeash.ms * 2, `捨てる前 ${shortLeash.ms}ms、捨てた後 ${again.ms}ms`);
+});
+
+test('重いパターンの後ろでも軽いパターンは判定される', () => {
+  // 打ち切った後も予算が残るので、後ろのパターンで一致を拾えること。
+  // 初回（重いパターンが予算を食う可能性がある）と 2 回目の両方で確かめる
+  const text = `${'a'.repeat(4000)}! 実行ログ`;
+  for (const attempt of ['初回', '2 回目']) {
+    const r = resolveStop(text, [heavy(11), '実行ログ']);
+    assert.equal(r.speak, false, attempt);
+    assert.equal(r.reason, 'ignored-pattern', attempt);
+  }
 });
 
 test('ターゲット全体を無効にすると読み上げない', () => {

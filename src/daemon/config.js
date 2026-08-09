@@ -69,6 +69,9 @@ function defaultProfile(target) {
       deny: [],
     },
     textFilter: defaultTextFilter(),
+    // 読み上げない本文の正規表現。整形前の本文がどれかに部分一致したら発話ごと飛ばす。
+    // 既定は空（今までどおり全部読む）。
+    ignorePatterns: [],
     queue: {
       // 新しい発話が来たときの挙動: enqueue（並べる） / replace（現在の発話を止めて差し替え） / drop（無視）
       // 途中経過を読み上げる場合、replace だと次の説明文が来るたびに前が切れるので enqueue が既定。
@@ -142,10 +145,12 @@ function deepMerge(base, override) {
 }
 
 /**
- * カタログに存在しないイベント名を落とし、新設イベントには既定値を補う。
- * カタログを更新しても既存の config.json が壊れないようにするための正規化。
+ * ターゲットごとの設定を正規化する。
+ * カタログに存在しないイベント名を落として新設イベントには既定値を補い、
+ * 手編集で型が崩れうる項目を直す。カタログの更新や手編集で既存の config.json が
+ * 壊れないようにするための処理。
  */
-function reconcileEvents(config) {
+function reconcileProfiles(config) {
   for (const target of Object.keys(config.targets ?? {})) {
     const profile = config.targets[target];
     if (!profile || typeof profile !== 'object') continue;
@@ -155,6 +160,10 @@ function reconcileEvents(config) {
       next[e.name] = { ...e.defaults, ...(profile.events?.[e.name] ?? {}) };
     }
     profile.events = next;
+    // 無視パターンは文字列の配列。手編集でオブジェクトや数値が入っても読み上げ側を壊さない
+    profile.ignorePatterns = Array.isArray(profile.ignorePatterns)
+      ? profile.ignorePatterns.filter((p) => typeof p === 'string')
+      : [];
   }
   return config;
 }
@@ -184,13 +193,13 @@ export class ConfigStore extends EventEmitter {
         stored = {};
       }
     }
-    this.config = reconcileEvents(deepMerge(defaultConfig(), stored));
+    this.config = reconcileProfiles(deepMerge(defaultConfig(), stored));
     if (!fs.existsSync(CONFIG_PATH)) this.save();
     return this.config;
   }
 
   save(next = this.config) {
-    this.config = reconcileEvents(deepMerge(defaultConfig(), next));
+    this.config = reconcileProfiles(deepMerge(defaultConfig(), next));
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     // 自分の書き込みでウォッチャーが発火してループしないよう短時間抑止する
     this.suppressWatchUntil = Date.now() + 500;
@@ -217,7 +226,7 @@ export class ConfigStore extends EventEmitter {
         this._reloadTimer = setTimeout(() => {
           try {
             const stored = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-            this.config = reconcileEvents(deepMerge(defaultConfig(), stored));
+            this.config = reconcileProfiles(deepMerge(defaultConfig(), stored));
             this.emit('change', this.config);
             this.emit('externalChange', this.config);
           } catch {
