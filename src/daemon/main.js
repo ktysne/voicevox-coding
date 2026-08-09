@@ -3,7 +3,9 @@
 
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
-import { ConfigStore, CONFIG_PATH } from './config.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { ConfigStore, CONFIG_PATH, CONFIG_DIR } from './config.js';
 import { Logger } from './logger.js';
 import { VoicevoxEngine } from './voicevox.js';
 import { EngineProcess } from './engine-process.js';
@@ -76,6 +78,26 @@ const port = store.config.daemon?.port ?? 7591;
 // 状態変更 API 用のトークン。起動ごとに変わり、トレイなどローカルクライアントにだけ渡す
 const apiToken = crypto.randomBytes(32).toString('hex');
 
+// 更新スクリプトなど同一ユーザーのローカルツールが /api/shutdown を呼べるよう、
+// トークンをファイルにも書き出す（AUD-01 の脅威モデルはブラウザ経由の攻撃であり、
+// 同一ユーザーのローカルプロセスは対象外）。
+const RUNTIME_PATH = path.join(CONFIG_DIR, 'runtime.json');
+
+function writeRuntimeFile(port) {
+  try {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(RUNTIME_PATH, JSON.stringify({ pid: process.pid, port, token: apiToken }, null, 2), 'utf8');
+  } catch (err) {
+    log.warn(`runtime.json を書き込めません: ${err.message}`);
+  }
+}
+
+function removeRuntimeFile() {
+  try {
+    fs.unlinkSync(RUNTIME_PATH);
+  } catch {}
+}
+
 const server = createServer({
   store,
   engine,
@@ -109,6 +131,7 @@ server.listen(port, '127.0.0.1', async () => {
   // 前回実行の一時 WAV の掃除は、ポート取得に成功した後で行う。
   // 二重起動した後発プロセスが、稼働中デーモンの再生待ちファイルを消してしまわないため。
   queue.cleanupEphemeral();
+  writeRuntimeFile(port);
   commentaryMonitor.start();
 
   if (store.config.daemon?.tray !== false && !noTray) {
@@ -146,6 +169,7 @@ async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   log.info('デーモンを終了します');
+  removeRuntimeFile();
   clearInterval(healthTimer);
   store.close();
   tray?.stop();
