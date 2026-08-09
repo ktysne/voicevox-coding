@@ -96,3 +96,20 @@ test('charset 付き application/json は許容する', () => {
   const r = check('/hook', { 'content-type': 'application/json; charset=utf-8' });
   assert.equal(r.ok, true);
 });
+
+test('application/jsonp など JSON 風 MIME は拒否する', () => {
+  const r = check('/hook', { 'content-type': 'application/jsonp' });
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 415);
+});
+
+test('/hook は Content-Type の省略を認めない', () => {
+  const r = check('/hook', {});
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 415);
+});
+
+test('/api/* はトークンがあれば Content-Type 省略の POST (トレイの skip 等) を認める', () => {
+  const r = check('/api/skip', { 'x-voicevox-coding-token': TOKEN });
+  assert.equal(r.ok, true);
+});

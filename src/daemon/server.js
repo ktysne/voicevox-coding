@@ -80,6 +80,10 @@ function parseHostname(value) {
  *     /hook だけはフック定義を変えずに済ませるためトークン不要（JSON の Content-Type は必須）。
  *   - クロスオリジンの application/json はプリフライトが必要になり、CORS 応答を返さないため
  *     ブラウザ側で遮断される。text/plain などの単純リクエストは Content-Type 検証で拒否する。
+ *
+ * 脅威モデルは「外部 Web ページからの CSRF / DNS リバインディング」。同一ユーザーの
+ * ローカルプロセスは対象外とする（トークンも設定ファイルも同じ権限で読めるため、
+ * ここで防いでも境界にならない）。
  */
 export function checkMutationRequest({ pathname, headers = {}, port, token }) {
   const hostname = parseHostname(headers.host);
@@ -87,9 +91,15 @@ export function checkMutationRequest({ pathname, headers = {}, port, token }) {
     return { ok: false, status: 403, error: 'ローカル以外の Host からの要求は受け付けません' };
   }
 
+  // media type は厳密に比較する（application/jsonp などの JSON 風 MIME を通さない）
   const contentType = headers['content-type'];
-  if (contentType && !contentType.trim().toLowerCase().startsWith('application/json')) {
+  const mediaType = contentType?.split(';')[0].trim().toLowerCase();
+  if (contentType !== undefined && mediaType !== 'application/json') {
     return { ok: false, status: 415, error: 'Content-Type は application/json のみ受け付けます' };
+  }
+  // 本文を読む /hook は Content-Type の省略も認めない（トークン免除の代わりの必須条件）
+  if (pathname === '/hook' && contentType === undefined) {
+    return { ok: false, status: 415, error: '/hook は Content-Type: application/json が必要です' };
   }
 
   const origin = headers.origin;
