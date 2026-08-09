@@ -20,6 +20,10 @@
 .PARAMETER SkipPull
     git pull を省略する（取得済みの状態から適用だけ行う）。
 
+.PARAMETER Force
+    停止 API で止められないとき、本デーモンのプロセスだと確認できた場合に限り強制終了して続行する。
+    指定しない場合は中断し、トレイの「終了」による停止を案内する。
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts\update.ps1
     powershell -ExecutionPolicy Bypass -File scripts\update.ps1 -IncludeToolEvents
@@ -30,7 +34,8 @@ param(
     [switch]$IncludeToolEvents,
     [switch]$SkipClaude,
     [switch]$SkipCodex,
-    [switch]$SkipPull
+    [switch]$SkipPull,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,12 +75,40 @@ function Get-DaemonPort {
 }
 
 function Test-DaemonRunning([int]$port) {
+    # /api/state は ENGINE の状態取得を待つため、ENGINE が無応答だとデーモンが生きていても
+    # タイムアウトしうる。外部プロセスに依存しない /api/config で確認する。
     try {
-        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/state" -TimeoutSec 3
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/config" -TimeoutSec 3
         return $true
     } catch {
         return $false
     }
+}
+
+function Get-PortOwnerPids([int]$port) {
+    @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
+        Select-Object -ExpandProperty OwningProcess -Unique)
+}
+
+function Wait-PortReleased([int]$port, [int]$attempts = 20) {
+    for ($i = 0; $i -lt $attempts; $i++) {
+        if ((Get-PortOwnerPids $port).Count -eq 0) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return (Get-PortOwnerPids $port).Count -eq 0
+}
+
+function Confirm-DaemonProcess([int]$ownerPid, $runtime) {
+    # 強制終了は、本デーモンのプロセスだと確認できた場合に限る。
+    # runtime.json の PID 一致、または「node が src\daemon\main.js を実行している」ことで判定する。
+    if ($runtime -and [int]$runtime.pid -eq $ownerPid) { return $true }
+    try {
+        $proc = Get-CimInstance Win32_Process -Filter "ProcessId = $ownerPid"
+        if ($proc -and $proc.Name -match '^node(\.exe)?$' -and $proc.CommandLine -match 'daemon[\\/]main\.js') {
+            return $true
+        }
+    } catch {}
+    return $false
 }
 
 # --- 1. リポジトリの最新化 ---
@@ -93,15 +126,16 @@ if (-not $SkipPull) {
 $port = Get-DaemonPort
 $wasRunning = Test-DaemonRunning $port
 
+$oldRuntime = $null
 if ($wasRunning) {
     Write-Step "稼働中のデーモンを停止します (port=$port)"
 
     # 停止 API はトークン必須。デーモンが起動時に書き出す runtime.json から読む。
-    # 旧バージョンのデーモン（runtime.json を書かない）はトークンなしで受け付ける。
+    # runtime.json を書かない版のデーモンに対しては、トークンなしで試みる。
     $headers = @{}
     try {
-        $rt = Get-Content $RuntimeJson -Raw | ConvertFrom-Json
-        if ($rt.token) { $headers['X-VoiceVox-Coding-Token'] = [string]$rt.token }
+        $oldRuntime = Get-Content $RuntimeJson -Raw | ConvertFrom-Json
+        if ($oldRuntime.token) { $headers['X-VoiceVox-Coding-Token'] = [string]$oldRuntime.token }
     } catch {}
 
     try {
@@ -110,22 +144,29 @@ if ($wasRunning) {
         Write-Warn2 "停止 API の呼び出しに失敗しました: $($_.Exception.Message)"
     }
 
-    # ポートが空くまで待つ
-    $stopped = $false
-    for ($i = 0; $i -lt 20; $i++) {
-        Start-Sleep -Milliseconds 500
-        if (-not (Test-DaemonRunning $port)) { $stopped = $true; break }
-    }
+    if (-not (Wait-PortReleased $port)) {
+        # 停止 API で止まらなかった。強制終了は後始末（エンジン停止など）を飛ばすため、
+        # 既定では中断してトレイからの停止を案内する。
+        $owners = Get-PortOwnerPids $port
+        $unconfirmed = @($owners | Where-Object { -not (Confirm-DaemonProcess $_ $oldRuntime) })
 
-    if (-not $stopped) {
-        # 最後の手段としてポートの所有プロセスを直接止める
-        $owners = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue |
-            Select-Object -ExpandProperty OwningProcess -Unique
+        if ($unconfirmed.Count -gt 0) {
+            Write-Error "ポート $port の待受プロセス (PID: $($unconfirmed -join ', ')) を本デーモンと確認できません。別のサービスがこのポートを使っている可能性があります。デーモンの停止と設定 (daemon.port) を確認してから再実行してください。"
+            exit 1
+        }
+        if (-not $Force) {
+            Write-Error '停止 API でデーモンを止められませんでした。タスクトレイの「終了」で停止してから再実行してください。強制終了して続行する場合は -Force を付けます（エンジンなどの後始末は次回起動時に行われます）。'
+            exit 1
+        }
+
         foreach ($ownerPid in $owners) {
-            Write-Warn2 "停止 API が効かないため、プロセス $ownerPid を強制終了します"
+            Write-Warn2 "デーモンのプロセス $ownerPid を強制終了します"
             Stop-Process -Id $ownerPid -Force -ErrorAction SilentlyContinue
         }
-        Start-Sleep -Seconds 1
+        if (-not (Wait-PortReleased $port 10)) {
+            Write-Error "強制終了後もポート $port が解放されません。手動でプロセスを確認してください。"
+            exit 1
+        }
     }
     Write-Ok 'デーモンを停止しました'
 } else {
@@ -160,12 +201,20 @@ if ($wasRunning) {
         Start-Process node -ArgumentList "`"$mainJs`"" -WindowStyle Hidden
     }
 
+    # 停止時にポートの解放を確認済みなので、ここで応答するのは新しいデーモンに限られる。
+    # 念のため runtime.json の PID が世代交代していることも確認する。
     $started = $false
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Milliseconds 500
         if (Test-DaemonRunning $port) { $started = $true; break }
     }
     if ($started) {
+        try {
+            $newRuntime = Get-Content $RuntimeJson -Raw | ConvertFrom-Json
+            if ($oldRuntime -and [int]$newRuntime.pid -eq [int]$oldRuntime.pid) {
+                Write-Warn2 '起動後の runtime.json の PID が更新前と同じです。npm run doctor で点検してください。'
+            }
+        } catch {}
         Write-Ok "デーモンが起動しました: http://127.0.0.1:$port/"
     } else {
         Write-Warn2 'デーモンの起動を確認できませんでした。npm run doctor で点検してください。'
