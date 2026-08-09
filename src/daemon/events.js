@@ -35,10 +35,13 @@ export const IGNORE_MATCH_BUDGET_MS = 200;
 const MATCH_SCRIPT = new vm.Script('new RegExp(pattern).test(text)');
 const MATCH_CONTEXT = vm.createContext({ pattern: '', text: '' });
 
-// 一度時間切れになったパターンは、発話のたびに予算を使い切ってしまう。
-// 同じ書き方なら結果も同じなので、以後は照合せずに飛ばす。
-// 直せば文字列が変わって別物として扱われるので、設定の変更を待つ必要はない。
+// 一度時間切れになったパターンに、毎回 200 ミリ秒を使うわけにはいかない。
+// かといって以後ずっと使わないのも乱暴で、本文が短ければ同じパターンでも一瞬で終わる。
+// そこで 2 回目からは短い時間で試し、間に合えば元に戻す。
+export const IGNORE_MATCH_RETRY_MS = 5;
 const timedOutPatterns = new Set();
+// 覚えっぱなしで際限なく増やさない。数が増えたら忘れて、また測り直す
+const TIMED_OUT_LIMIT = 50;
 
 /** ログに載せるための短縮。設定はいくらでも長く書けるので、そのまま出さない。 */
 function preview(pattern) {
@@ -53,7 +56,7 @@ function preview(pattern) {
  * 「書いたのに効かない」が無通知になるので、呼び出し側でログに出す。
  * @param {string[]} problems 使えなかったパターンの説明を受け取る配列
  */
-function ignored(text, patterns, problems) {
+export function matchesIgnorePattern(text, patterns, problems = []) {
   if (!Array.isArray(patterns)) return false; // 手編集で配列以外が入っていても落とさない
   // 単調時計で期限を決め、要素ごとに必ず確認する（空文字が並んでいても予算を超えない）
   const deadline = performance.now() + IGNORE_MATCH_BUDGET_MS;
@@ -66,13 +69,14 @@ function ignored(text, patterns, problems) {
         break;
       }
       if (typeof pattern !== 'string' || pattern === '') continue;
-      if (timedOutPatterns.has(pattern)) {
-        problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は、照合が時間内に終わらないため使いません`);
-        continue;
-      }
+      // 前に時間切れになったパターンは短い時間で試す。本文が短ければこれで足りる
+      const retrying = timedOutPatterns.has(pattern);
+      const timeout = Math.max(1, Math.ceil(retrying ? Math.min(left, IGNORE_MATCH_RETRY_MS) : left));
       MATCH_CONTEXT.pattern = pattern;
       try {
-        if (MATCH_SCRIPT.runInContext(MATCH_CONTEXT, { timeout: Math.max(1, Math.ceil(left)) })) return true;
+        const hit = MATCH_SCRIPT.runInContext(MATCH_CONTEXT, { timeout });
+        if (retrying) timedOutPatterns.delete(pattern); // 間に合ったので元に戻す
+        if (hit) return true;
       } catch (err) {
         // 不正な正規表現と、時間内に終わらなかったパターンは飛ばす。
         // 打ち切ったときは「一致しなかった」扱いにする（黙り込むより読み上げるほうが安全）。
@@ -80,8 +84,9 @@ function ignored(text, patterns, problems) {
         // 理由の文面は毎回同じにする（呼び出し側の重複抑止が効くように）。
         // vm の中で起きたエラーは別の realm のものなので、instanceof ではなくコードで見分ける
         if (err?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
+          if (timedOutPatterns.size >= TIMED_OUT_LIMIT) timedOutPatterns.clear();
           timedOutPatterns.add(pattern);
-          problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は、照合が時間内に終わらないため使いません`);
+          problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は、照合が時間内に終わりません`);
         } else {
           problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は正規表現として解釈できません`);
         }
@@ -137,8 +142,9 @@ export function resolveUtterance({ eventName, payload, profile, dictionary }) {
   // 整形前の生テキストで判定する。整形後だと記号やコードブロックが消えて、
   // 設定した書き出しと一致しなくなるため。
   const problems = [];
-  const hit = ignored(raw, profile.ignorePatterns, problems);
-  if (hit) return { speak: false, reason: 'ignored-pattern', problems };
+  if (matchesIgnorePattern(raw, profile.ignorePatterns, problems)) {
+    return { speak: false, reason: 'ignored-pattern', problems };
+  }
 
   const filtered = filterText(raw, profile.textFilter);
   if (!filtered.text) return { speak: false, reason: 'filtered-out', problems };

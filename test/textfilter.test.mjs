@@ -267,21 +267,27 @@ test('理由の文面は長いパターンを短く切る', () => {
   assert.match(problem, /…/);
 });
 
-test('時間切れになったパターンは次から照合しない', () => {
+test('時間切れになったパターンは次から短い時間で試す', () => {
   const text = `${'a'.repeat(4000)}!`;
   const pattern = heavy(10);
   const first = Date.now();
   const r1 = resolveStop(text, [pattern]);
   const firstMs = Date.now() - first;
-  assert.match(r1.problems[0], /時間内に終わらない/);
+  assert.match(r1.problems[0], /時間内に終わりません/);
   assert.ok(firstMs >= IGNORE_MATCH_BUDGET_MS / 2, `${firstMs}ms しかかかっていない`);
 
-  // 2 回目は照合せずに飛ばすので、予算を使わない
+  // 2 回目は短い時間で打ち切るので、予算を使い切らない
   const second = Date.now();
   const r2 = resolveStop(text, [pattern]);
   assert.equal(r2.speak, true);
-  assert.match(r2.problems[0], /時間内に終わらない/);
+  assert.match(r2.problems[0], /時間内に終わりません/);
   assert.ok(Date.now() - second < 50, `${Date.now() - second}ms かかった`);
+
+  // 本文が短ければ同じパターンでも一瞬で終わる。前の時間切れを引きずらないこと
+  const short = resolveStop('aaX', [pattern]);
+  assert.equal(short.speak, false);
+  assert.equal(short.reason, 'ignored-pattern');
+  assert.deepEqual(short.problems, []);
 });
 
 test('重いパターンの後ろでも軽いパターンは判定される', () => {

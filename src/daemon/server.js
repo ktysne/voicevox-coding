@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EVENTS, VOICE_PARAMS, TARGETS, eventsForTarget } from './catalog.js';
-import { resolveUtterance } from './events.js';
+import { resolveUtterance, matchesIgnorePattern } from './events.js';
 import { filterText } from './textfilter.js';
 import { applyReplacements, syncEngineDictionary, validateEngineWord } from './dictionary.js';
 import { CONFIG_PATH } from './config.js';
@@ -287,9 +287,14 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           json(res, 400, { error: 'unknown target' });
           return;
         }
+        // 無視パターンも本番と同じ順序で見る。ここで確かめられないと書いたパターンを試せない
+        if (matchesIgnorePattern(text ?? '', profile.ignorePatterns)) {
+          json(res, 200, { text: '', truncated: false, chars: 0, ignored: true });
+          return;
+        }
         const filtered = filterText(text ?? '', profile.textFilter);
         const spoken = applyReplacements(filtered.text, store.config.dictionary?.replacements ?? []);
-        json(res, 200, { text: spoken, truncated: filtered.truncated, chars: spoken.length });
+        json(res, 200, { text: spoken, truncated: filtered.truncated, chars: spoken.length, ignored: false });
         return;
       }
 
@@ -303,6 +308,11 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
         }
         let spoken = text ?? '';
         if (!raw) {
+          // raw は声の調整用の試聴なので、無視パターンは本文を読ませるときだけ見る
+          if (matchesIgnorePattern(spoken, profile.ignorePatterns)) {
+            json(res, 200, { spoken: false, reason: 'ignored-pattern' });
+            return;
+          }
           const filtered = filterText(spoken, profile.textFilter);
           spoken = applyReplacements(filtered.text, store.config.dictionary?.replacements ?? []);
         }

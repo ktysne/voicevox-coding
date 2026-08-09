@@ -388,6 +388,8 @@ function ignorePatternRow(base, pattern, index) {
     'data-path': `${base}.ignorePatterns.${index}`,
     value: pattern ?? '',
     placeholder: '例: ^バックグラウンドタスクの実行ログ',
+    // 見出しが 1 列しかない表なので、行を見分けられる名前を付ける
+    'aria-label': `無視パターン ${index + 1}`,
     'aria-describedby': errorId,
   });
   const show = (message) => {
@@ -403,7 +405,11 @@ function ignorePatternRow(base, pattern, index) {
     'tr',
     {},
     h('td', {}, input, error),
-    h('td', {}, h('button', { class: 'btn btn-sm btn-ghost btn-danger', onclick: () => removeArrayItem(`${base}.ignorePatterns`, index) }, '削除')),
+    h('td', {}, h('button', {
+      class: 'btn btn-sm btn-ghost btn-danger',
+      'aria-label': `無視パターン ${index + 1} を削除`,
+      onclick: () => removeArrayItem(`${base}.ignorePatterns`, index),
+    }, '削除')),
   );
 }
 
@@ -499,6 +505,10 @@ function renderPreviewCard(targetId) {
         method: 'POST',
         body: JSON.stringify({ target: targetId, text: textarea.value }),
       });
+      if (r.ignored) {
+        output.textContent = '（無視パターンに一致するため読み上げません）';
+        return;
+      }
       output.textContent = r.text || '（読み上げるテキストが残りませんでした）';
       output.append(h('div', { class: 'hint', style: 'margin-top:8px' }, `${r.chars} 文字${r.truncated ? '・省略あり' : ''}`));
     } catch (err) {
