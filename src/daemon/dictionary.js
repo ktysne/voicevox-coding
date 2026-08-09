@@ -61,24 +61,40 @@ export function validateEngineWord(w) {
   return errors;
 }
 
+/** ENGINE 側は表記を全角へ寄せることがあるため、照合前に正規化する。 */
+function normalizeSurface(s) {
+  return String(s ?? '').normalize('NFKC');
+}
+
+/**
+ * ENGINE 側の未所有語から、指定の表記と読みで登録した語を 1 件だけ特定する。
+ * 手動登録の語を誤って奪わないよう、表記と読みが一致し、候補が 1 件のときだけ返す。
+ * @returns {string|null} 特定できた uuid
+ */
+function matchUnownedWord(dict, target, ownedUuids) {
+  const surface = normalizeSurface(target?.surface);
+  const pronunciation = target?.pronunciation ?? '';
+  const hits = Object.entries(dict ?? {}).filter(([uuid, word]) => (
+    !ownedUuids.has(uuid)
+    && normalizeSurface(word?.surface) === surface
+    && (word?.pronunciation ?? '') === pronunciation
+  ));
+  return hits.length === 1 ? hits[0][0] : null;
+}
+
 /**
  * 追加 API が失敗したあと、ENGINE 側には登録されていないか確かめる。
- * 応答の遅延や切断で reject しても登録自体は成立していることがあり、
- * uuid を拾えないと次の同期で同じ語を二重登録してしまう。
+ * 応答の遅延や切断で reject しても登録自体は成立していることがある。
  * @returns {Promise<string|null>} 拾えた uuid。確認できなければ null
  */
-async function findOrphanUuid(engine, surface, knownUuids) {
+async function findOrphanUuid(engine, payload, ownedUuids) {
   let current;
   try {
     current = await engine.userDict();
   } catch {
-    return null; // 確認手段がない。ここは諦めて次回の同期に任せる
+    return null; // 確認手段がない。pending を残したまま次回の同期で拾い直す
   }
-  const added = Object.entries(current ?? {}).filter(([uuid]) => !knownUuids.has(uuid));
-  const matched = added.find(([, word]) => word?.surface === surface);
-  if (matched) return matched[0];
-  // ENGINE 側で表記が正規化される場合があるので、増えた uuid が 1 件だけならそれとみなす
-  return added.length === 1 ? added[0][0] : null;
+  return matchUnownedWord(current, payload, ownedUuids);
 }
 
 /**
@@ -90,6 +106,9 @@ async function runSync(engine, engineWords) {
   const state = readState();
   // 作業用のコピー。外部 API が成功するたびにここを更新し、その都度 state へ書き戻す
   const owned = { ...(state.words ?? {}) };
+  // 追加を試みている語。応答を受け取れないまま落ちても次回の同期で実体を拾えるようにする
+  let pending = state.pending ?? null;
+  const save = () => writeState({ ...state, words: { ...owned }, pending });
   // skipped は入力エラー、failed は ENGINE 側の処理に失敗した語（呼び出し元が警告する）
   const result = { added: 0, updated: 0, removed: 0, skipped: [], failed: [] };
 
@@ -120,8 +139,22 @@ async function runSync(engine, engineWords) {
     throw new Error(`ユーザー辞書の一覧を取得できないため同期を中止しました: ${err.message}`);
   }
 
-  // 追加で発行された uuid を追う。孤立 uuid の判定に使う
-  const knownUuids = new Set(Object.keys(existing));
+  // 所有済みの uuid を追う。孤立 uuid の照合で手動登録の語を奪わないために使う
+  const ownedUuids = new Set(Object.values(owned));
+
+  // 前回の同期が追加の応答を受け取れずに終わっていたら、ENGINE 側の実体を所有へ戻す。
+  // 一覧を取得できた時点で判定は確定するので、拾えなくても pending は落とす
+  if (pending) {
+    if (!owned[pending.surface]) {
+      const recovered = matchUnownedWord(existing, pending, ownedUuids);
+      if (recovered) {
+        owned[pending.surface] = recovered;
+        ownedUuids.add(recovered);
+      }
+    }
+    pending = null;
+    save();
+  }
 
   for (const w of valid) {
     const payload = {
@@ -137,22 +170,27 @@ async function runSync(engine, engineWords) {
       await engine.updateUserDictWord(uuid, payload);
       result.updated += 1;
     } else {
+      // 追加前に印を残す。応答も再確認も失敗した場合、次回の同期がこの印で実体を拾う
+      pending = { surface: payload.surface, pronunciation: payload.pronunciation };
+      save();
       let newUuid;
       try {
         newUuid = await engine.addUserDictWord(payload);
       } catch (err) {
         // 応答だけ失敗して登録は通っている場合があるので、孤立 uuid を拾ってから中止する
-        const orphan = await findOrphanUuid(engine, w.surface, knownUuids);
+        const orphan = await findOrphanUuid(engine, payload, ownedUuids);
         if (orphan) {
           owned[w.surface] = orphan;
-          writeState({ ...state, words: { ...owned } });
+          pending = null;
+          save();
         }
         throw err;
       }
-      knownUuids.add(newUuid);
+      ownedUuids.add(newUuid);
       owned[w.surface] = newUuid;
+      pending = null;
       // 追加のたびに保存する。以降の語で失敗しても、この uuid を後から更新、削除できる
-      writeState({ ...state, words: { ...owned } });
+      save();
       result.added += 1;
     }
   }
@@ -176,7 +214,7 @@ async function runSync(engine, engineWords) {
 
   // 削除結果をまとめて反映する。owned は既存の所有をコピーしたものなので、
   // 途中で例外が出ても未処理分の uuid が state から消えることはない
-  writeState({ ...state, words: owned });
+  save();
   return result;
 }
 

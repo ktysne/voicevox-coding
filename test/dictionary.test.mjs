@@ -163,7 +163,7 @@ test('追加が失敗しても ENGINE に登録されていれば uuid を拾っ
   // 登録は通ったが応答だけ失敗した状況を再現する
   const engine = new FakeEngine({
     onAdd: (payload, _index, self) => {
-      self.dict['uuid-orphan'] = { surface: payload.surface };
+      self.dict['uuid-orphan'] = { ...payload };
       throw new Error('応答が途切れました');
     },
   });
@@ -174,6 +174,62 @@ test('追加が失敗しても ENGINE に登録されていれば uuid を拾っ
   );
 
   assert.deepEqual(writes.at(-1).words, { 孤立語: 'uuid-orphan' });
+  assert.equal(writes.at(-1).pending, null);
+});
+
+test('追加の確認まで失敗しても、次回の同期が pending から実体を拾って二重登録しない', async () => {
+  const writes = stubState();
+  const engine = new FakeEngine({
+    onAdd: (payload, _index, self) => {
+      // 登録は通ったが、応答も直後の一覧取得も失敗した
+      self.dict['uuid-registered'] = { ...payload };
+      self.userDictError = new Error('接続が切れました');
+      throw new Error('応答が途切れました');
+    },
+  });
+
+  await assert.rejects(
+    () => syncEngineDictionary(engine, [word('切断語', 'セツダンゴ')]),
+    /応答が途切れました/,
+  );
+
+  assert.deepEqual(writes.at(-1).words, {});
+  assert.deepEqual(writes.at(-1).pending, { surface: '切断語', pronunciation: 'セツダンゴ' });
+
+  // 復旧後の同期では追加をやり直さず、登録済みの uuid を所有し直す
+  engine.userDictError = null;
+  engine.onAdd = null;
+  const result = await syncEngineDictionary(engine, [word('切断語', 'セツダンゴ')]);
+
+  assert.equal(result.added, 0);
+  assert.equal(result.updated, 1);
+  assert.deepEqual(writes.at(-1).words, { 切断語: 'uuid-registered' });
+});
+
+test('無関係な未知 UUID は回収せず、手動登録の語を奪わない', async () => {
+  const manual = { 'uuid-manual': { surface: '手動語', pronunciation: 'シュドウゴ' } };
+  const writes = stubState();
+  const engine = new FakeEngine({
+    onAdd: (_payload, _index, self) => {
+      // 追加は成立せず、その間に別クライアントが無関係な語を 1 件登録した
+      self.dict['uuid-manual'] = manual['uuid-manual'];
+      throw new Error('追加に失敗しました');
+    },
+  });
+
+  await assert.rejects(
+    () => syncEngineDictionary(engine, [word('未登録語', 'ミトウロクゴ')]),
+    /追加に失敗しました/,
+  );
+
+  assert.deepEqual(writes.at(-1).words, {});
+
+  // 次の同期でも手動登録の語は所有せず、改めて追加する
+  const retryEngine = new FakeEngine({ dict: { ...manual } });
+  const result = await syncEngineDictionary(retryEngine, [word('未登録語', 'ミトウロクゴ')]);
+
+  assert.equal(result.added, 1);
+  assert.deepEqual(writes.at(-1).words, { 未登録語: 'uuid-未登録語' });
 });
 
 test('削除に失敗した語は failed に積み、所有を残して次回に持ち越す', async () => {
