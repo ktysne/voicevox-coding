@@ -359,39 +359,12 @@ function renderToolFilterCard(targetId, base, profile) {
   );
 }
 
-// グループ全体を繰り返す書き方を見つける。この形だけが照合時間を指数的に伸ばせる。
-// ブラウザからは daemon のモジュールを読めないので、src/daemon/events.js の同名の関数を写している。
-// 片方を直したらもう片方も直すこと（読み上げ側の判定はあくまで events.js が持つ）。
-function hasRepeatedGroup(pattern) {
-  let inClass = false;
-  for (let i = 0; i < pattern.length; i += 1) {
-    const c = pattern[i];
-    if (c === '\\') {
-      i += 1;
-      continue;
-    }
-    if (inClass) {
-      if (c === ']') inClass = false;
-      continue;
-    }
-    if (c === '[') {
-      inClass = true;
-      continue;
-    }
-    if (c === ')' && '*+{'.includes(pattern[i + 1] ?? '')) return true;
-  }
-  return false;
-}
-
 function ignorePatternError(pattern) {
   if (!pattern) return null;
   try {
     new RegExp(pattern);
   } catch (err) {
     return `正規表現として解釈できません: ${err.message}`;
-  }
-  if (hasRepeatedGroup(pattern)) {
-    return 'グループ全体を繰り返す書き方（(a+)+ や (a|aa)+ など）は照合が極端に遅くなることがあるため使えません';
   }
   return null;
 }
@@ -453,7 +426,7 @@ function renderIgnorePatternsCard(base, profile) {
     h('p', { class: 'hint' },
       '整形前の本文に対して部分一致で判定します。大文字小文字は区別するので、'
       + '区別したくないときは [Bb]ackground のように書いてください。'
-      + '上に理由が出ているパターンは読み上げ時に使われません。'),
+      + '解釈できないパターンと、照合に時間がかかりすぎるパターンは読み上げ時に飛ばします。'),
   );
 }
 

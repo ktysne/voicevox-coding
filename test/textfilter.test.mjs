@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { filterText, renderTemplate } from '../src/daemon/textfilter.js';
 import { chunkText } from '../src/daemon/queue.js';
 import { applyReplacements, validateEngineWord } from '../src/daemon/dictionary.js';
-import { resolveUtterance, ignorePatternError } from '../src/daemon/events.js';
+import { resolveUtterance, IGNORE_MATCH_BUDGET_MS } from '../src/daemon/events.js';
 import { defaultConfig } from '../src/daemon/config.js';
 import { wavDurationMs } from '../src/daemon/player.js';
 
@@ -216,26 +216,34 @@ test('無視パターンが配列でなくても落ちない', () => {
   assert.equal(resolveStop('作業が終わりました。', [null, 3, {}]).speak, true);
 });
 
-test('グループを繰り返すパターンは使わない', () => {
-  // (a+)+$ や (a|aa)+$ は照合が指数的に遅くなる。飛ばしてすぐ返ること
-  for (const pattern of ['(a+)+$', '(a|aa)+$', '(a*)*$', '(a|aa){2,}$']) {
+test('照合が終わらないパターンは時間で打ち切る', () => {
+  // 素の RegExp では終わらない書き方。打ち切って読み上げに進むこと。
+  // (a+)+$ は繰り返しの入れ子、a*a*X はグループ無しでも計算量が跳ねる例。
+  const text = `${'a'.repeat(4000)}!`;
+  for (const pattern of ['(a+)+$', '(a|aa)+$', 'a*a*X', '^a*a*a*a*a*a*a*a*X$']) {
     const started = Date.now();
-    const r = resolveStop(`${'a'.repeat(40)}!`, [pattern]);
+    const r = resolveStop(text, [pattern]);
     assert.equal(r.speak, true, pattern);
-    assert.ok(Date.now() - started < 1000, `${pattern} で時間がかかりすぎ`);
+    assert.ok(
+      Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3,
+      `${pattern} の打ち切りに ${Date.now() - started}ms かかった`,
+    );
   }
 });
 
-test('無視パターンの検証は理由を返す', () => {
-  assert.equal(ignorePatternError('^実行ログ'), null);
-  assert.equal(ignorePatternError(''), null);
-  assert.equal(ignorePatternError('^(実行ログ|ログ)?完了'), null); // 繰り返さないグループは使える
-  assert.equal(ignorePatternError('^[(){}*+]+'), null); // 文字クラスの中の記号は量指定子ではない
-  assert.equal(ignorePatternError('^\\(a\\)+'), null); // エスケープした括弧も同様
-  assert.match(ignorePatternError('['), /解釈できません/);
-  for (const pattern of ['(a+)+', '(a|aa)+', '(?:ab)*', '(x){2,}']) {
-    assert.match(ignorePatternError(pattern), /グループ全体を繰り返す/, pattern);
-  }
+test('打ち切りの予算はパターン全体で共有する', () => {
+  // 重いパターンを並べても、1 回の判定にかかる時間は予算の範囲に収まること
+  const patterns = Array.from({ length: 5 }, () => 'a*a*X');
+  const started = Date.now();
+  assert.equal(resolveStop(`${'a'.repeat(4000)}!`, patterns).speak, true);
+  assert.ok(Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3, `${Date.now() - started}ms かかった`);
+});
+
+test('重いパターンの後ろでも軽いパターンは判定される', () => {
+  // 予算が残っていれば、打ち切った次のパターンで一致を拾えること
+  const r = resolveStop('実行ログ: 完了', ['(a+)+$', '^実行ログ']);
+  assert.equal(r.speak, false);
+  assert.equal(r.reason, 'ignored-pattern');
 });
 
 test('ターゲット全体を無効にすると読み上げない', () => {

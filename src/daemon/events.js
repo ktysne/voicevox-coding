@@ -1,6 +1,7 @@
 // フックのペイロードを「読み上げるテキスト」に変換する。
 // ここが「何を読む / 読まない」の判断の中心。
 
+import vm from 'node:vm';
 import { EVENT_BY_NAME } from './catalog.js';
 import { filterText, renderTemplate } from './textfilter.js';
 import { applyReplacements } from './dictionary.js';
@@ -24,47 +25,15 @@ function toolAllowed(toolName, filter) {
 
 const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PermissionRequest']);
 
-/**
- * グループ全体を繰り返す書き方（`(a+)+`、`(a|aa)+`、`(\s*x){2,}` など）を見つける。
- * 照合時間が入力の長さに対して指数的に伸びるのは、繰り返しが入れ子になったときで、
- * それには必ずグループへの繰り返しが要る。デーモンは 1 スレッドなので、これを踏むと
- * 読み上げどころか HTTP API ごと固まる。個別の危なさを見分けるのは難しいので、
- * グループの繰り返しは一律で断る（`(abc)?` のように繰り返さないものは通す）。
- */
-export function hasRepeatedGroup(pattern) {
-  let inClass = false;
-  for (let i = 0; i < pattern.length; i += 1) {
-    const c = pattern[i];
-    if (c === '\\') {
-      i += 1; // エスケープされた 1 文字は読み飛ばす
-      continue;
-    }
-    if (inClass) {
-      if (c === ']') inClass = false;
-      continue;
-    }
-    if (c === '[') {
-      inClass = true;
-      continue;
-    }
-    if (c === ')' && '*+{'.includes(pattern[i + 1] ?? '')) return true;
-  }
-  return false;
-}
+// 無視パターンの照合に使ってよい時間の合計。1 回の判定でこれを超えたら、残りは見ずに読み上げる。
+export const IGNORE_MATCH_BUDGET_MS = 200;
 
-/** 無視パターンとして使えるか。使えないときは理由を返す。 */
-export function ignorePatternError(pattern) {
-  if (typeof pattern !== 'string' || pattern === '') return null;
-  try {
-    new RegExp(pattern);
-  } catch (err) {
-    return `正規表現として解釈できません: ${err.message}`;
-  }
-  if (hasRepeatedGroup(pattern)) {
-    return 'グループ全体を繰り返す書き方（(a+)+ や (a|aa)+ など）は照合が極端に遅くなることがあるため使えません';
-  }
-  return null;
-}
+// 照合は vm の時間制限付きで走らせる。書き方によっては照合が事実上終わらない正規表現
+// （`(a+)+$` や `a*a*X` など）があり、デーモンは 1 スレッドなので、素で実行すると
+// 読み上げどころか HTTP API ごと固まる。vm なら時間切れで打ち切れる。
+// スクリプトとコンテキストは使い回す（1 回あたり 0.2 ミリ秒ほど）。
+const MATCH_SCRIPT = new vm.Script('new RegExp(pattern).test(text)');
+const MATCH_CONTEXT = vm.createContext({ pattern: '', text: '' });
 
 /**
  * 無視パターン。整形前の本文がどれかに部分一致したら、その発話ごと飛ばす。
@@ -72,13 +41,27 @@ export function ignorePatternError(pattern) {
  */
 function ignored(text, patterns) {
   if (!Array.isArray(patterns)) return false; // 手編集で配列以外が入っていても落とさない
-  for (const pattern of patterns) {
-    if (typeof pattern !== 'string' || pattern === '') continue;
-    // 不正な正規表現と危険な書き方は黙って飛ばす。UI 側で検証済みのはずだが、手編集もありうる
-    if (ignorePatternError(pattern)) continue;
-    if (new RegExp(pattern).test(text)) return true;
+  let budget = IGNORE_MATCH_BUDGET_MS;
+  MATCH_CONTEXT.text = text;
+  try {
+    for (const pattern of patterns) {
+      if (typeof pattern !== 'string' || pattern === '') continue;
+      if (budget <= 0) break;
+      MATCH_CONTEXT.pattern = pattern;
+      const started = Date.now();
+      try {
+        if (MATCH_SCRIPT.runInContext(MATCH_CONTEXT, { timeout: Math.ceil(budget) })) return true;
+      } catch {
+        // 不正な正規表現と、時間内に終わらなかったパターンは黙って飛ばす。
+        // 打ち切ったときは「一致しなかった」扱いにする（黙り込むより読み上げるほうが安全）。
+        // 不正な正規表現は UI 側で検証済みのはずだが、手編集もありうる。
+      }
+      budget -= Date.now() - started;
+    }
+    return false;
+  } finally {
+    MATCH_CONTEXT.text = ''; // 本文を抱えたままにしない
   }
-  return false;
 }
 
 /**
