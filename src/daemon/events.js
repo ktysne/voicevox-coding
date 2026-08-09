@@ -25,6 +25,22 @@ function toolAllowed(toolName, filter) {
 const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PermissionRequest']);
 
 /**
+ * 無視パターン。整形前の本文がどれかに部分一致したら、その発話ごと飛ばす。
+ * フラグは付けないので大文字小文字は区別する（区別したくないときは [Bb] のように書く）。
+ */
+function ignored(text, patterns) {
+  for (const pattern of patterns ?? []) {
+    if (typeof pattern !== 'string' || pattern === '') continue;
+    try {
+      if (new RegExp(pattern).test(text)) return true;
+    } catch {
+      // 不正な正規表現は黙って飛ばす。UI 側で検証済みのはずだが、手編集もありうる
+    }
+  }
+  return false;
+}
+
+/**
  * @returns {{ speak:false, reason:string } | { speak:true, text:string, event:string }}
  */
 export function resolveUtterance({ eventName, payload, profile, dictionary }) {
@@ -60,6 +76,10 @@ export function resolveUtterance({ eventName, payload, profile, dictionary }) {
   }
 
   if (!raw || !raw.trim()) return { speak: false, reason: 'empty-source' };
+
+  // 整形前の生テキストで判定する。整形後だと記号やコードブロックが消えて、
+  // 設定した書き出しと一致しなくなるため。
+  if (ignored(raw, profile.ignorePatterns)) return { speak: false, reason: 'ignored-pattern' };
 
   const filtered = filterText(raw, profile.textFilter);
   if (!filtered.text) return { speak: false, reason: 'filtered-out' };

@@ -69,6 +69,9 @@ function defaultProfile(target) {
       deny: [],
     },
     textFilter: defaultTextFilter(),
+    // 読み上げない本文の正規表現。整形前の本文がどれかに部分一致したら発話ごと飛ばす。
+    // 既定は空（今までどおり全部読む）。
+    ignorePatterns: [],
     queue: {
       // 新しい発話が来たときの挙動: enqueue（並べる） / replace（現在の発話を止めて差し替え） / drop（無視）
       // 途中経過を読み上げる場合、replace だと次の説明文が来るたびに前が切れるので enqueue が既定。

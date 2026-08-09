@@ -169,6 +169,44 @@ test('Stop は本文を読み上げる', () => {
   assert.match(r.text, /作業が終わりました/);
 });
 
+/** Stop イベントの本文を渡して判定させる（無視パターンのテスト用）。 */
+function resolveStop(text, ignorePatterns) {
+  const profile = { ...defaultConfig().targets.claudeCode, ignorePatterns };
+  return resolveUtterance({
+    eventName: 'Stop',
+    payload: { hook_event_name: 'Stop', last_assistant_message: text },
+    profile,
+    dictionary: { replacements: [] },
+  });
+}
+
+test('無視パターンに一致した本文は読み上げない', () => {
+  const r = resolveStop('バックグラウンドタスクの実行ログ\n終了コード 0', ['^バックグラウンドタスクの実行ログ']);
+  assert.equal(r.speak, false);
+  assert.equal(r.reason, 'ignored-pattern');
+});
+
+test('無視パターンに一致しない本文は読み上げる', () => {
+  const r = resolveStop('作業が終わりました。', ['^バックグラウンドタスクの実行ログ']);
+  assert.equal(r.speak, true);
+  assert.match(r.text, /作業が終わりました/);
+});
+
+test('無視パターンは大文字小文字を区別する', () => {
+  assert.equal(resolveStop('BACKGROUND task done', ['background']).speak, true);
+  assert.equal(resolveStop('background task done', ['background']).speak, false);
+});
+
+test('不正な無視パターンは飛ばして残りで判定する', () => {
+  assert.equal(resolveStop('作業が終わりました。', ['[', '(?']).speak, true);
+  assert.equal(resolveStop('実行ログ: 完了', ['[', '実行ログ']).reason, 'ignored-pattern');
+});
+
+test('無視パターンが未設定でも読み上げる', () => {
+  // 既存の config.json にキーが無くても落ちないこと
+  assert.equal(resolveStop('作業が終わりました。', undefined).speak, true);
+});
+
 test('ターゲット全体を無効にすると読み上げない', () => {
   const profile = { ...defaultConfig().targets.claudeCode, enabled: false };
   const r = resolveUtterance({

@@ -229,6 +229,9 @@ function renderTargetPanel(targetId) {
   // --- ツールフィルタ ---
   panel.append(renderToolFilterCard(targetId, base, profile));
 
+  // --- 無視パターン ---
+  panel.append(renderIgnorePatternsCard(base, profile));
+
   // --- 読み上げ要素フィルタ ---
   panel.append(renderTextFilterCard(base));
 
@@ -353,6 +356,67 @@ function renderToolFilterCard(targetId, base, profile) {
       { value: 'denylist', label: '指定したツールを読まない' },
     ], { rerender: true }),
     listEditor,
+  );
+}
+
+/**
+ * 無視パターンの 1 行。入力のたびに正規表現として解釈できるか確かめ、
+ * 駄目なら行の下に理由を出す（保存自体は止めない。あとから直せるように）。
+ */
+function ignorePatternRow(base, pattern, index) {
+  const error = h('span', { class: 'hint', style: 'margin:6px 0 0;color:var(--err)' });
+  const validate = (value) => {
+    if (!value) {
+      error.textContent = '';
+      return;
+    }
+    try {
+      new RegExp(value);
+      error.textContent = '';
+    } catch (err) {
+      error.textContent = `正規表現として解釈できません: ${err.message}`;
+    }
+  };
+  validate(pattern);
+
+  return h(
+    'tr',
+    {},
+    h('td', {},
+      h('input', {
+        type: 'text',
+        'data-path': `${base}.ignorePatterns.${index}`,
+        value: pattern ?? '',
+        placeholder: '例: ^バックグラウンドタスクの実行ログ',
+        oninput: (e) => validate(e.target.value),
+      }),
+      error),
+    h('td', {}, h('button', { class: 'btn btn-sm btn-ghost btn-danger', onclick: () => removeArrayItem(`${base}.ignorePatterns`, index) }, '削除')),
+  );
+}
+
+function renderIgnorePatternsCard(base, profile) {
+  const patterns = profile.ignorePatterns ?? [];
+
+  return h(
+    'section',
+    { class: 'card' },
+    h('h2', {}, '無視パターン'),
+    h('p', { class: 'card-desc' },
+      'ここに書いた正規表現のどれかに本文が一致したら、その発話ごと読み上げません。'
+      + 'バックグラウンドタスクの実行ログのような、決まった文面を外すのに使います。'),
+    patterns.length
+      ? h('table', {},
+          h('thead', {}, h('tr', {},
+            h('th', {}, '正規表現（部分一致）'),
+            h('th', { class: 'col-narrow' }, ''))),
+          h('tbody', {}, patterns.map((p, i) => ignorePatternRow(base, p, i))))
+      : h('p', { class: 'hint' }, 'パターンはまだありません。すべての本文が読み上げの対象です。'),
+    h('button', { class: 'btn btn-sm', style: 'margin-top:10px', onclick: () => pushArrayItem(`${base}.ignorePatterns`, '') }, '+ パターンを追加'),
+    h('p', { class: 'hint' },
+      '整形前の本文に対して部分一致で判定します。大文字小文字は区別するので、'
+      + '区別したくないときは [Bb]ackground のように書いてください。'
+      + '解釈できない正規表現は読み上げ時に無視されます。'),
   );
 }
 
