@@ -27,6 +27,94 @@ test('URL は定型語に置き換わる', () => {
   assert.doesNotMatch(text, /example\.com/);
 });
 
+test('URL 直後に空白なしで句点と本文が続いても後続文は残る（AUD-07）', () => {
+  const { text } = filterText('詳細は https://example.com。次の文です。', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /次の文です/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
+test('URL 直後に読点や閉じ括弧が続いても巻き込まない', () => {
+  const { text } = filterText('参照先は https://example.com、後で確認してください', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /後で確認してください/);
+
+  const { text: text2 } = filterText('リンク「https://example.com」を開く', F);
+  assert.match(text2, /リンク/);
+  assert.match(text2, /を開く/);
+});
+
+test('括弧内の URL も括弧の外側の本文を巻き込まない', () => {
+  const { text } = filterText('（https://example.com/path）を参照', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /を参照/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
+test('空白区切りやクエリ付き URL は従来どおり丸ごと消える', () => {
+  const { text } = filterText('参照 https://example.com/path?a=1&b=2 です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
+test('パスに生の日本語を含む URL は丸ごと置き換わる（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://ja.wikipedia.org/wiki/日本語 を確認', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /を確認/);
+  assert.doesNotMatch(text, /日本語/);
+  assert.doesNotMatch(text, /wikipedia/);
+});
+
+test('国際化ドメイン名の URL も丸ごと置き換わる', () => {
+  const { text } = filterText('参照 https://例え.テスト/ です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /例え/);
+});
+
+test('繰り返し記号や全角英数字を含むパスも丸ごと置き換わる（クロスレビューで検出した回帰）', () => {
+  const { text: text1 } = filterText('参照 https://example.com/佐々木 です', F);
+  assert.match(text1, /リンク/);
+  assert.doesNotMatch(text1, /佐々木/);
+
+  const { text: text2 } = filterText('参照 https://example.com/商品Ａ です', F);
+  assert.match(text2, /リンク/);
+  assert.doesNotMatch(text2, /商品Ａ/);
+});
+
+test('対応する括弧を含む URL は括弧ごと置き換わり、外側の括弧は残る（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://en.wikipedia.org/wiki/Go_(programming_language) です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /wikipedia/);
+
+  const { text: text2 } = filterText('リンク(https://example.com)を開く', F);
+  assert.match(text2, /リンク\(リンク\)を開く/);
+});
+
+test('URL 直後に空白なしで ASCII の読点が続いても後続の日本語文は残る（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://example.com,次へ進む', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /次へ進む/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
+test('対応の無い閉じ括弧の後に ASCII 本文が続く URL は打ち切られない（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://example.com/search?q=a)b です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
+test('全角括弧が対応している URL は括弧ごと丸ごと置き換わる（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://example.jp/商品（赤） です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /商品/);
+  assert.doesNotMatch(text, /example\.jp/);
+});
+
 test('ファイルパスはファイル名だけ残る（語頭を食わない）', () => {
   const { text } = filterText('src/daemon/queue.js を更新しました', { ...F, inlineCode: 'read' });
   assert.match(text, /^queue\.js を更新しました$/);

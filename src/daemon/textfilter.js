@@ -5,7 +5,116 @@ const FENCED_CODE = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
 const INDENTED_CODE = /^(?: {4}|\t).+$/gm;
 const THINKING = /<(thinking|antml:thinking)>[\s\S]*?<\/\1>/gi;
 const HTML_TAG = /<\/?[a-zA-Z][^>]*>/g;
-const URL = /https?:\/\/\S+|\bwww\.\S+/g;
+// URL の開始位置の目印。実際にどこまでが URL 本体かは scanUrlLength() が 1 文字ずつ判定する。
+const URL_START = /https?:\/\/|\bwww\./g;
+
+// URL の内部としては扱わず、見つかった時点で URL を打ち切る単独文字（対応関係を持たないもの）。
+// 日本語の句読点・引用符は、常に URL の外側（後続の日本語文）だと判断してよい。
+// Unicode ブロックまるごとの除外はしない。ひらがな・カタカナ・漢字そのもの、
+// 々 のような繰り返し記号、全角英数字は対象に含めない。
+// `https://ja.wikipedia.org/wiki/日本語` のようにパスへ生の日本語を含む URL や
+// 国際化ドメイン名、全角英数字を含むパスが実在するため、ブロック単位で除外すると
+// URL の一部が欠けたり後続本文が読み上げから消えたりする（クロスレビューで検出した回帰）。
+const URL_STOP_CHAR = new Set([
+  '、', '。', // 、。
+  '，', '．', // ，．
+  '！', '？', // ！？
+]);
+for (let c = 0x2018; c <= 0x201f; c++) URL_STOP_CHAR.add(String.fromCharCode(c)); // 引用符 “”‘’ など
+
+// ひらがな・カタカナ・漢字、および上記の日本語句読点。
+// 対応の無い閉じ括弧や ASCII 記号の直後にこれらが続くときだけ
+// 「日本語文へ切り替わった」とみなす判定に使う。
+function isJapaneseText(ch) {
+  if (!ch) return false;
+  if (URL_STOP_CHAR.has(ch)) return true;
+  const c = ch.codePointAt(0);
+  return (
+    (c >= 0x3040 && c <= 0x30ff) || // ひらがな・カタカナ
+    (c >= 0x3400 && c <= 0x4dbf) || // CJK 統合漢字拡張 A
+    (c >= 0x4e00 && c <= 0x9fff) // CJK 統合漢字
+  );
+}
+
+// 直後に日本語文が続くときだけ URL の終端とみなす ASCII 記号。
+// 例：`https://example.com,次へ進む` のように、区切りの空白を置かずに
+// ASCII の読点相当の記号越しへ日本語文を続ける表記がある。
+// `.` `/` `?` `:` `!` などクエリ文字列やパス構造に必須な記号は対象にしない。
+// 検証済みの既知の限界：クエリ値そのものに日本語を生で埋め込み、かつ区切りに
+// ASCII の `,` `;` を使う URL（`?q=英語,日本語` 等）は、この判定と区別が付かず
+// 誤って打ち切られる。この曖昧さは文字単位の判定では解消できないため許容する。
+const ASCII_SOFT_STOP = new Set([',', ';']);
+
+// 開き括弧と閉じ括弧の対応表（ASCII・全角の両方）。開いた分だけ閉じを URL の一部として許可する。
+// `https://en.wikipedia.org/wiki/Go_(programming_language)` や `.../商品（赤）` のように
+// 対応が取れている括弧は URL 内に残す。
+const BRACKET_OPEN_TO_CLOSE = {
+  '(': ')', '[': ']', '{': '}',
+  '「': '」', '『': '』', '【': '】', '〈': '〉', '《': '》', '（': '）',
+};
+const BRACKET_CLOSE_TO_OPEN = {};
+for (const [open, close] of Object.entries(BRACKET_OPEN_TO_CLOSE)) BRACKET_CLOSE_TO_OPEN[close] = open;
+
+/** text の start 位置から始まる URL 本体の長さを 1 文字ずつ走査して求める。 */
+function scanUrlLength(text, start) {
+  const openDepth = {};
+  let i = start;
+  for (; i < text.length; i++) {
+    const ch = text[i];
+    if (/\s/.test(ch) || URL_STOP_CHAR.has(ch)) break;
+
+    if (BRACKET_OPEN_TO_CLOSE[ch]) {
+      openDepth[ch] = (openDepth[ch] || 0) + 1;
+      continue;
+    }
+    const open = BRACKET_CLOSE_TO_OPEN[ch];
+    if (open) {
+      if (openDepth[open] > 0) {
+        openDepth[open]--;
+        continue;
+      }
+      // 対応する開き括弧が URL 内に無い。外側の括弧を閉じているだけなら打ち切り、
+      // `?q=a)b` のように後ろへ普通の URL 本体が続くならそのまま含める。
+      const next = text[i + 1];
+      if (next === undefined || /\s/.test(next) || isJapaneseText(next)) break;
+      continue;
+    }
+    if (ASCII_SOFT_STOP.has(ch) && isJapaneseText(text[i + 1])) break;
+  }
+  return i - start;
+}
+
+/** text 中の URL 区間 ({ start, end, text }) をすべて洗い出す。 */
+function findUrls(text) {
+  const matches = [];
+  URL_START.lastIndex = 0;
+  let m;
+  while ((m = URL_START.exec(text))) {
+    const start = m.index;
+    const len = scanUrlLength(text, start);
+    if (len <= 0) {
+      URL_START.lastIndex = start + m[0].length;
+      continue;
+    }
+    const end = start + len;
+    matches.push({ start, end, text: text.slice(start, end) });
+    URL_START.lastIndex = end;
+  }
+  return matches;
+}
+
+/** text 中の URL 区間を replacer(url) の返り値で置き換える。 */
+function replaceUrls(text, replacer) {
+  const matches = findUrls(text);
+  if (!matches.length) return text;
+  let out = '';
+  let last = 0;
+  for (const m of matches) {
+    out += text.slice(last, m.start) + replacer(m.text);
+    last = m.end;
+  }
+  return out + text.slice(last);
+}
 const MD_LINK = /\[([^\]]*)\]\(([^)]*)\)/g;
 const MD_IMAGE = /!\[([^\]]*)\]\(([^)]*)\)/g;
 const TABLE_ROW = /^\s*\|.*\|\s*$/gm;
@@ -48,7 +157,7 @@ function applyUrls(text, mode, placeholder) {
   // Markdown リンクはラベルを残し、URL 部分だけを対象にする
   const out = text.replace(MD_IMAGE, ' ').replace(MD_LINK, '$1 ');
   if (mode === 'read') return out;
-  return out.replace(URL, mode === 'placeholder' ? placeholder : ' ');
+  return replaceUrls(out, () => (mode === 'placeholder' ? placeholder : ' '));
 }
 
 /**
@@ -59,7 +168,7 @@ function applyFilePaths(text, mode) {
   if (mode === 'read') return text;
 
   const parked = [];
-  const guarded = text.replace(URL, (m) => {
+  const guarded = replaceUrls(text, (m) => {
     parked.push(m);
     return PARK_OPEN + (parked.length - 1) + PARK_CLOSE;
   });
