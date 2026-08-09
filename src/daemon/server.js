@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EVENTS, VOICE_PARAMS, TARGETS, eventsForTarget } from './catalog.js';
-import { resolveUtterance, matchesIgnorePattern } from './events.js';
+import { resolveUtterance, matchesIgnorePattern, resetIgnoreMatchState } from './events.js';
 import { filterText } from './textfilter.js';
 import { applyReplacements, syncEngineDictionary, validateEngineWord } from './dictionary.js';
 import { CONFIG_PATH } from './config.js';
@@ -63,7 +63,11 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   // 同じ警告を発話のたびに出すとログが埋まるので、一度出したものは覚えておく。
   // 設定を変えたら出し直したいので、config の変更で忘れる。
   const warnedOnce = new Set();
-  store.on('change', () => warnedOnce.clear());
+  store.on('change', () => {
+    warnedOnce.clear();
+    // 設定を直したら、時間切れの記録も測り直す
+    resetIgnoreMatchState();
+  });
 
   /** 使えなかった無視パターンをログに残す。黙って飛ばすと直しようがない。 */
   const warnProblems = (target, problems) => {

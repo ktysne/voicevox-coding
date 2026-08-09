@@ -43,8 +43,13 @@ const MATCH_CONTEXT = vm.createContext({ pattern: '', text: '' });
 // （長い本文と短い本文が交互に来ると、そのたびに止まってしまうため）。
 export const IGNORE_MATCH_RETRY_MS = 5;
 const timedOutPatterns = new Set();
-// 覚えっぱなしで際限なく増やさない。数が増えたら忘れて、また測り直す
+// 覚えっぱなしで際限なく増やさない。あふれたら古いものから 1 つずつ忘れる
 const TIMED_OUT_LIMIT = 50;
+
+/** 時間切れの記録を捨てる。設定を編集したときに測り直すため。 */
+export function resetIgnoreMatchState() {
+  timedOutPatterns.clear();
+}
 
 /** ログに載せるための短縮。設定はいくらでも長く書けるので、そのまま出さない。 */
 function preview(pattern) {
@@ -68,7 +73,9 @@ export function matchesIgnorePattern(text, patterns, problems = []) {
     for (const [index, pattern] of patterns.entries()) {
       const left = deadline - performance.now();
       if (left <= 0) {
-        problems.push(`無視パターン ${index + 1} 以降は、照合の時間切れで見ていません`);
+        // 残りが空欄だけなら、見ていないと言われても直しようがないので黙る
+        const rest = patterns.slice(index).filter((p) => typeof p === 'string' && p !== '');
+        if (rest.length) problems.push(`無視パターン ${index + 1} 以降の ${rest.length} 件は、照合の時間切れで見ていません`);
         break;
       }
       if (typeof pattern !== 'string' || pattern === '') continue;
@@ -85,7 +92,12 @@ export function matchesIgnorePattern(text, patterns, problems = []) {
         // 理由の文面は毎回同じにする（呼び出し側の重複抑止が効くように）。
         // vm の中で起きたエラーは別の realm のものなので、instanceof ではなくコードで見分ける
         if (err?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
-          if (timedOutPatterns.size >= TIMED_OUT_LIMIT) timedOutPatterns.clear();
+          if (timedOutPatterns.size >= TIMED_OUT_LIMIT) {
+            for (const oldest of timedOutPatterns) {
+              timedOutPatterns.delete(oldest);
+              break;
+            }
+          }
           timedOutPatterns.add(pattern);
           problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は、照合が時間内に終わりません`);
         } else {

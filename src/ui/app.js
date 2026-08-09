@@ -381,7 +381,7 @@ function ignorePatternRow(base, pattern, index) {
     class: 'hint',
     style: 'margin:6px 0 0;color:var(--err)',
     id: errorId,
-    role: 'status', // 入力欄と結び付けて、読み上げソフトにも伝わるようにする
+    // 入力欄から aria-describedby で参照する。role="status" と併用すると二重に読まれる
     'aria-live': 'polite',
   });
   const input = h('input', {
@@ -724,11 +724,19 @@ function resetVoice(targetId) {
   renderActivePanel();
 }
 
+// 試聴で読み上げなかった理由。デーモンが返す識別子をそのまま出さない
+const SKIP_REASONS = {
+  'ignored-pattern': '無視パターンに一致しました',
+  empty: '読み上げるテキストが残りませんでした',
+  duplicate: '直前と同じ内容のため見送りました',
+  busy: '読み上げ中のため見送りました',
+};
+
 async function preview(targetId, text, raw) {
   await saveNow();
   try {
     const r = await api('/api/preview', { method: 'POST', body: JSON.stringify({ target: targetId, text, raw }) });
-    if (!r.spoken) toast(`読み上げませんでした（${r.reason ?? '不明'}）`, true);
+    if (!r.spoken) toast(`読み上げませんでした（${SKIP_REASONS[r.reason] ?? r.reason ?? '理由不明'}）`, true);
   } catch (err) {
     toast(err.message, true);
   }

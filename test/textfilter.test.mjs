@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { filterText, renderTemplate } from '../src/daemon/textfilter.js';
 import { chunkText } from '../src/daemon/queue.js';
 import { applyReplacements, validateEngineWord } from '../src/daemon/dictionary.js';
-import { resolveUtterance, IGNORE_MATCH_BUDGET_MS, IGNORE_MATCH_PATTERN_MS } from '../src/daemon/events.js';
+import { resolveUtterance, resetIgnoreMatchState, IGNORE_MATCH_BUDGET_MS, IGNORE_MATCH_PATTERN_MS } from '../src/daemon/events.js';
 import { defaultConfig } from '../src/daemon/config.js';
 import { wavDurationMs } from '../src/daemon/player.js';
 
@@ -268,6 +268,7 @@ test('理由の文面は長いパターンを短く切る', () => {
 });
 
 test('時間切れになったパターンは次から短い時間で試す', () => {
+  resetIgnoreMatchState();
   const text = `${'a'.repeat(4000)}!`;
   const pattern = heavy(10);
   const first = Date.now();
@@ -276,12 +277,13 @@ test('時間切れになったパターンは次から短い時間で試す', ()
   assert.match(r1.problems[0], /時間内に終わりません/);
   assert.ok(firstMs >= IGNORE_MATCH_PATTERN_MS / 2, `${firstMs}ms しかかかっていない`);
 
-  // 2 回目は短い時間で打ち切る
+  // 2 回目は短い時間で打ち切る。絶対値ではなく初回との比で見る（実行環境の速さに左右されないように）
   const second = Date.now();
   const r2 = resolveStop(text, [pattern]);
+  const secondMs = Date.now() - second;
   assert.equal(r2.speak, true);
   assert.match(r2.problems[0], /時間内に終わりません/);
-  assert.ok(Date.now() - second < IGNORE_MATCH_PATTERN_MS, `${Date.now() - second}ms かかった`);
+  assert.ok(secondMs < firstMs / 2, `初回 ${firstMs}ms に対して 2 回目が ${secondMs}ms`);
 
   // 本文が短ければ短い枠でも間に合うので、同じパターンがちゃんと効く
   const short = resolveStop('aaX', [pattern]);
@@ -292,7 +294,22 @@ test('時間切れになったパターンは次から短い時間で試す', ()
   // 短い本文で間に合っても枠は戻さない。長短が交互に来ても毎回止まらないこと
   const third = Date.now();
   assert.equal(resolveStop(text, [pattern]).speak, true);
-  assert.ok(Date.now() - third < IGNORE_MATCH_PATTERN_MS, `${Date.now() - third}ms かかった`);
+  assert.ok(Date.now() - third < firstMs / 2, `${Date.now() - third}ms かかった`);
+});
+
+test('設定を直したら時間切れの記録は測り直す', () => {
+  const text = `${'a'.repeat(4000)}!`;
+  const pattern = heavy(12);
+  assert.match(resolveStop(text, [pattern]).problems[0], /時間内に終わりません/);
+
+  const shortLeash = Date.now();
+  resolveStop(text, [pattern]);
+  const shortLeashMs = Date.now() - shortLeash;
+
+  resetIgnoreMatchState();
+  const again = Date.now();
+  resolveStop(text, [pattern]);
+  assert.ok(Date.now() - again > shortLeashMs, '記録を捨てたのに短い枠のままだった');
 });
 
 test('重いパターンの後ろでも軽いパターンは判定される', () => {
