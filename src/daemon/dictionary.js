@@ -69,9 +69,24 @@ export function validateEngineWord(w) {
 // この猶予のあいだは同じ語を追加し直さず、後から二重登録になるのを避ける
 const PENDING_GRACE_MS = 30_000;
 
-/** ENGINE 側は表記を全角へ寄せることがあるため、照合前に正規化する。 */
+// 半角、全角の差だけを吸収する。文字列全体に NFKC をかけると
+// ① と 1、㍍ と メートル のような別表記まで同一視してしまう。
+// 濁点付きの半角カタカナをまとめて畳めるよう、連続部分ごとに正規化する
+const WIDTH_VARIANTS = /[　！-～｡-ﾟ]+/g;
+
+/** ENGINE 側は表記を全角へ寄せることがあるため、照合前に幅の違いをならす。 */
 function normalizeSurface(s) {
-  return String(s ?? '').normalize('NFKC');
+  return String(s ?? '').replace(WIDTH_VARIANTS, (run) => run.normalize('NFKC'));
+}
+
+/**
+ * 所有マップから、この表記に対応する実キーを引く。
+ * 所有は表記ごとに 1 件なので、幅違いの表記は同じ語として同じキーに寄せる。
+ */
+function ownedKeyFor(owned, surface) {
+  const key = normalizeSurface(surface);
+  if (Object.hasOwn(owned, key)) return key;
+  return Object.keys(owned).find((k) => normalizeSurface(k) === key) ?? key;
 }
 
 /** 表記と読みが pending と一致する uuid を列挙する。 */
@@ -159,11 +174,12 @@ async function runSync(engine, engineWords) {
   // 前回の同期が追加の応答を受け取れずに終わっていたら、ENGINE 側の実体を所有へ戻す
   let unsettled = null; // 追加が確定せず、今回は手を出せない表記
   if (pending) {
-    const recovered = owned[pending.surface] ? null : recoverPendingUuid(existing, pending);
+    const pendingKey = ownedKeyFor(owned, pending.surface);
+    const recovered = owned[pendingKey] ? null : recoverPendingUuid(existing, pending);
     if (recovered) {
-      owned[pending.surface] = recovered;
+      owned[pendingKey] = recovered;
       pending = null;
-    } else if (!owned[pending.surface] && Date.now() - (pending.at ?? 0) < PENDING_GRACE_MS) {
+    } else if (!owned[pendingKey] && Date.now() - (pending.at ?? 0) < PENDING_GRACE_MS) {
       // 一覧に無くても、ENGINE 側でまだ処理中かもしれない（クライアント側のタイムアウトは
       // ENGINE の処理を止めない）。猶予のあいだは追加し直さず、二重登録を避ける
       unsettled = normalizeSurface(pending.surface);
@@ -173,7 +189,12 @@ async function runSync(engine, engineWords) {
     save();
   }
 
+  // 今回の同期で扱った所有キー。ここに無い所有語は設定から消えたとみなして削除する
+  const keep = new Set();
+
   for (const w of valid) {
+    const key = ownedKeyFor(owned, w.surface);
+    keep.add(key);
     if (unsettled !== null && normalizeSurface(w.surface) === unsettled) {
       result.failed.push({ surface: w.surface, errors: ['前回の追加が確定していないため見送りました。しばらくしてから再実行してください'] });
       continue;
@@ -185,7 +206,7 @@ async function runSync(engine, engineWords) {
       wordType: w.wordType || 'PROPER_NOUN',
       priority: Number.isInteger(w.priority) ? w.priority : 8,
     };
-    const uuid = owned[w.surface];
+    const uuid = owned[key];
     if (uuid && existing[uuid]) {
       // uuid は変わらないので、途中で失敗しても所有は保たれる
       await engine.updateUserDictWord(uuid, payload);
@@ -207,13 +228,13 @@ async function runSync(engine, engineWords) {
         // 応答だけ失敗して登録は通っている場合があるので、孤立 uuid を拾ってから中止する
         const orphan = await findOrphanUuid(engine, pending);
         if (orphan) {
-          owned[w.surface] = orphan;
+          owned[key] = orphan;
           pending = null;
           save();
         }
         throw err;
       }
-      owned[w.surface] = newUuid;
+      owned[key] = newUuid;
       pending = null;
       // 追加のたびに保存する。以降の語で失敗しても、この uuid を後から更新、削除できる
       save();
@@ -223,7 +244,7 @@ async function runSync(engine, engineWords) {
 
   // 設定から消えた単語を ENGINE 側からも消す
   for (const [surface, uuid] of Object.entries({ ...owned })) {
-    if (seen.has(normalizeSurface(surface))) continue;
+    if (keep.has(surface)) continue;
     if (existing[uuid]) {
       try {
         await engine.deleteUserDictWord(uuid);

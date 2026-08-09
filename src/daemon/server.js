@@ -412,6 +412,8 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           for (const f of result.failed) log.warn(`ユーザー辞書「${f.surface}」: ${f.errors.join(' / ')}`);
           json(res, 200, result);
         } catch (err) {
+          // トーストは消えてしまうので、後から原因を追えるようログにも残す
+          log.warn(`ユーザー辞書の同期に失敗しました: ${err.message}`);
           json(res, 503, { error: err.message });
         }
         return;

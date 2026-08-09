@@ -295,6 +295,35 @@ test('半角と全角の違いだけの表記も重複として弾く', async ()
   assert.deepEqual(result.skipped, [{ surface: 'ＶＯＩＣＥＶＯＸ', errors: ['表記が重複しています'] }]);
 });
 
+test('幅の違い以外の互換文字は別の表記として扱う', async () => {
+  stubState();
+  const engine = new FakeEngine();
+
+  // NFKC は ① と 1、㍍ と メートル まで同一視するが、これらは別の表記として登録する
+  const result = await syncEngineDictionary(engine, [
+    word('①', 'イチ'),
+    word('1', 'イチ'),
+    word('㍍', 'メートル'),
+    word('メートル', 'メートル'),
+  ]);
+
+  assert.equal(result.added, 4);
+  assert.deepEqual(result.skipped, []);
+});
+
+test('所有済みの表記を半角から全角へ変えても追加し直さない', async () => {
+  const { writes } = stubState({ words: { VOICEVOX: 'uuid-keep' } });
+  const engine = new FakeEngine({ dict: { 'uuid-keep': { surface: 'ＶＯＩＣＥＶＯＸ', pronunciation: 'ボイスボックス' } } });
+
+  const result = await syncEngineDictionary(engine, [word('ＶＯＩＣＥＶＯＸ', 'ボイスボックス')]);
+
+  assert.deepEqual(result, { added: 0, updated: 1, removed: 0, skipped: [], failed: [] });
+  assert.deepEqual(engine.calls.filter(([kind]) => kind !== 'userDict'), [
+    ['update', 'uuid-keep', 'ＶＯＩＣＥＶＯＸ'],
+  ]);
+  assert.deepEqual(writes.at(-1).words, { VOICEVOX: 'uuid-keep' });
+});
+
 test('削除に失敗した語は failed に積み、所有を残して次回に持ち越す', async () => {
   const { writes } = stubState({ words: { 消す語: 'uuid-drop' } });
   const engine = new FakeEngine({
