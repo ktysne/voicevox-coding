@@ -57,6 +57,19 @@ async function readJson(req) {
   return JSON.parse(text);
 }
 
+/**
+ * UI が保存要求ごとに払い出す識別子（X-Mutation-Id ヘッダー）を取り出す。
+ * ConfigStore への保存呼び出しへそのまま渡し、SSE の change イベントへ
+ * エコーさせることで、UI 側が「自分がいま送った保存の自己通知」を
+ * PUT 応答と SSE の到着順に依存せず確実に識別できるようにする
+ * （ヘッダー名は AUD-01 のガード対象外。同一オリジンの管理 UI からの
+ * 要求はカスタムヘッダーを付けてもプリフライトが増えるだけで拒否されない）。
+ */
+function readMutationId(req) {
+  const header = req.headers['x-mutation-id'];
+  return typeof header === 'string' && header.length > 0 && header.length <= 200 ? header : null;
+}
+
 const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
 function parseHostname(value) {
@@ -209,7 +222,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   };
 
   queue.on('update', (state) => broadcast('queue', state));
-  store.on('change', (cfg) => broadcast('config', cfg));
+  store.on('change', (cfg, revision, bootId, mutationId) => broadcast('config', { revision, config: cfg, bootId, mutationId }));
   log.subscribe((entry) => broadcast('log', entry));
   commentaryMonitor?.on('commentary', (payload) => speak('codex', 'Commentary', payload));
 
@@ -316,8 +329,13 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       }
 
       if (req.method === 'POST' && pathname === '/api/engine/detect') {
+        // mutationId を通しておくことで、この保存に伴う SSE の config
+        // 自己通知を要求元 UI 自身が「自己通知」と確定判定できる
+        // （渡さないと、検出を実行した本人にも「外部で変更されました」と
+        // 誤解を招くトーストが出ることがある）。
+        const mutationId = readMutationId(req);
         const detected = await detectEnginePath();
-        if (detected) store.patch({ engine: { enginePath: detected } });
+        if (detected) store.patch({ engine: { enginePath: detected } }, mutationId);
         json(res, 200, { enginePath: detected });
         return;
       }
@@ -349,16 +367,21 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       }
 
       // --- 設定 ---
+      // revision は ConfigStore がメモリ上だけで持つ単調増加カウンタ（AUD-06）。
+      // bootId はプロセス起動ごとに変わる ID で、デーモン再起動をまたいだ
+      // revision の巻き戻りを UI 側が検出できるようにする。
+      // config 本体のスキーマを汚さないよう、応答は封筒に包む。
       if (req.method === 'GET' && pathname === '/api/config') {
-        json(res, 200, store.config);
+        json(res, 200, { config: store.config, revision: store.revision, bootId: store.bootId });
         return;
       }
 
       if ((req.method === 'PUT' || req.method === 'POST') && pathname === '/api/config') {
+        const mutationId = readMutationId(req);
         const body = await readJson(req);
-        const next = req.method === 'PUT' ? store.save(body) : store.patch(body);
+        const next = req.method === 'PUT' ? store.save(body, mutationId) : store.patch(body, mutationId);
         log.info('設定を更新しました');
-        json(res, 200, next);
+        json(res, 200, { config: next, revision: store.revision, bootId: store.bootId, mutationId });
         return;
       }
 

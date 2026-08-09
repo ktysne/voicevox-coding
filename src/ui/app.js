@@ -5,6 +5,13 @@
 
 const state = {
   config: null,
+  // サーバー (ConfigStore) がメモリ上だけで持つ単調増加リビジョン。
+  // 自分が送った保存の自己通知と、他所からの更新を区別するために使う。
+  configRevision: 0,
+  // デーモンのプロセス起動ごとに変わる ID。revision はデーモン再起動で
+  // 0 から数え直されるため、この値が変わったら revision の大小に関わらず
+  // 「別プロセスの状態」として扱う（詳細は resyncConfig() のコメント参照）。
+  configBootId: null,
   catalog: null,
   speakers: [],
   engine: null,
@@ -61,13 +68,20 @@ function setPath(obj, path, value) {
 }
 
 async function api(path, options = {}) {
+  const { headers, ...rest } = options;
   const res = await fetch(path, {
-    ...options,
-    headers: options.body ? { 'Content-Type': 'application/json' } : undefined,
+    ...rest,
+    headers: options.body ? { 'Content-Type': 'application/json', ...headers } : headers,
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
   return data;
+}
+
+/** PUT ごとに払い出す一意な識別子。自己通知の判定に使う（保存節を参照）。 */
+function randomId() {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 let toastTimer;
@@ -81,30 +95,204 @@ function toast(message, isError = false) {
 }
 
 // ---------------------------------------------------------------- 保存
+//
+// 自己通知（自分が送った保存が SSE で返ってくるだけのもの）と、他所からの
+// 更新（他クライアントの保存・外部エディタでの直接編集・デーモン再起動）を
+// 確実に区別するため、3 つの識別子を使い分ける。
+//   - revision   : ConfigStore がメモリ上だけで持つ単調増加カウンタ。
+//   - bootId     : デーモンのプロセス起動ごとに変わる ID。revision は
+//                  再起動で 0 から数え直されるため、bootId が変わったら
+//                  revision の大小に関わらず「別プロセスの状態」として扱う。
+//   - mutationId : PUT ごとにクライアントが払い出す ID。SSE の自己通知に
+//                  そのままエコーされるので、到着順（PUT 応答と SSE の
+//                  どちらが先に届くか）に依存せず自己通知だと確定できる。
 
 let saveTimer;
+// 「ローカルの state.config がサーバーの直近確認済み状態と異なるかもしれない
+// (dirty)」ことを表す。編集で true になり、PUT が成功して初めて false に戻す。
+// PUT に失敗した場合は true のまま残す（保存できていない編集を、後続の
+// resyncConfig() や外部更新の適用でサーバー側の古い内容に置き換えて
+// 消してしまわないため）。
 let savePending = false;
+// 編集のたびに増える世代カウンタ。PUT 送信時点の世代を覚えておき、応答が
+// 返った時点でも世代が変わっていなければ dirty (savePending) を解除する。
+// PUT の応答待ち中にさらに編集された場合は世代が進んでいるので解除しない
+// （そうしないと、送信後に加えた編集が「保存済み」扱いのまま次の自動保存の
+// 対象から外れて失われてしまう）。
+let editGeneration = 0;
+// PUT が重なると、SSE と PUT 応答は別接続で届くため到着順が入れ替わり得て
+// 自己通知の判定が壊れる。それを避けるため保存は 1 件ずつ直列に実行する。
+// saveChain がその直列化キュー（末尾に .then(saveNow) をつなげていく）。
+let saveChain = Promise.resolve();
+// PUT 送信中フラグ。保存を直列化しているので、真になり得るのは常に高々 1 件。
+let saveInFlight = false;
+// 送信中の PUT の mutationId（無ければ null）。SSE 側で「これは自分が
+// いま送った保存の自己通知だ」と id で確定判定するために使う。
+let inFlightMutationId = null;
+// 直接は適用できなかった最新の外部更新（他クライアント・外部エディタでの
+// 変更）。編集中や PUT 応答待ち中に届いた分をここへ退避し、安全になった
+// タイミングで tryApplyPendingExternalConfig() が改めて判定する。
+// { config, revision, bootId } の形。mutationId による識別のおかげで、
+// ここへ退避される時点で「自己通知ではない」と確定しているので、
+// 従来のような未確定フラグは不要になった。
+let pendingExternalConfig = null;
 
 function scheduleSave() {
   savePending = true;
+  editGeneration += 1;
   $('#save-indicator').textContent = '編集中…';
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveNow, 500);
+  saveTimer = setTimeout(flushSave, 500);
+}
+
+/**
+ * 保存を直列化キューにつないで実行する。直前の保存がまだ進行中でも、
+ * それが終わるのを待ってから実行されるので PUT が重ならない。
+ * 「試聴」「エンジンに反映」など保存を待ってから API を呼ぶ箇所は、
+ * saveNow() を直接呼ぶとこの直列化を素通りしてしまうため、必ずこちらを使う。
+ */
+function flushSave() {
+  saveChain = saveChain.then(saveNow);
+  return saveChain;
+}
+
+/**
+ * saveChain（保存の直列化キュー）に、保存以外の排他操作も差し込めるように
+ * する。「エンジンを自動検出する」のようにサーバー側で設定を書き換える
+ * 操作は、その最中に無関係な編集の自動保存が割り込んで検出結果を
+ * 上書きしてしまわないよう、保存と同じキューで直列化する必要がある。
+ * task の中で例外が起きてもキュー自体は詰まらせない。
+ */
+function runExclusive(task) {
+  const result = saveChain.then(task);
+  saveChain = result.catch(() => {});
+  return result;
 }
 
 async function saveNow() {
-  if (!savePending) return;
-  savePending = false;
-  try {
-    await api('/api/config', { method: 'PUT', body: JSON.stringify(state.config) });
-    $('#save-indicator').textContent = '保存しました';
-    setTimeout(() => {
-      if (!savePending) $('#save-indicator').textContent = '';
-    }, 1800);
-  } catch (err) {
-    $('#save-indicator').textContent = '';
-    toast(`保存に失敗しました: ${err.message}`, true);
+  if (savePending) {
+    saveInFlight = true;
+    const mutationId = randomId();
+    inFlightMutationId = mutationId;
+    // この PUT が送る内容（state.config のスナップショット＝JSON.stringify
+    // した時点の世代）を覚えておく。応答が返るまでの間にさらに編集される
+    // と世代が進み、その分はこの PUT に含まれていない。
+    const generationAtSend = editGeneration;
+    try {
+      const { revision, bootId } = await api('/api/config', {
+        method: 'PUT',
+        body: JSON.stringify(state.config),
+        headers: { 'X-Mutation-Id': mutationId },
+      });
+      // 送信後に加えた編集がなければ（世代が変わっていなければ）dirty
+      // (savePending) を解除する。編集されていた場合は、その分がまだ
+      // 送れていないので savePending を true のまま残し、次の
+      // flushSave() 呼び出しで改めて送信されるようにする。
+      const stillDirty = editGeneration !== generationAtSend;
+      if (!stillDirty) savePending = false;
+      state.configRevision = revision;
+      noteConfirmedBootId(bootId);
+      if (!stillDirty) {
+        // 送信後にさらに編集されていた場合は「編集中…」の表示のままにする
+        // （実際まだ保存できていない内容が残っているため）。
+        $('#save-indicator').textContent = '保存しました';
+        setTimeout(() => {
+          if (!savePending) $('#save-indicator').textContent = '';
+        }, 1800);
+      }
+    } catch (err) {
+      // savePending をあえて true のままにしておく。これにより
+      // tryApplyPendingExternalConfig() と resyncConfig() が「編集中」と
+      // 同様にブロックされ続け、保存できていないローカルの変更をサーバー側の
+      // 古い内容で上書きしてしまう事故を防げる。次に何か編集する、または
+      // 「試聴」等が flushSave() を呼んだタイミングで自動的に再試行される。
+      $('#save-indicator').textContent = '保存に失敗しました（再度編集すると再試行します）';
+      toast(`保存に失敗しました。値を編集し直すか、しばらくしてから他の操作をすると再試行されます: ${err.message}`, true);
+    } finally {
+      saveInFlight = false;
+      inFlightMutationId = null;
+    }
   }
+  // 編集や送信が片付いたところで、退避しておいた外部更新を改めて判定する。
+  // ここで例外を外へ漏らすと saveChain が reject 状態のまま固定され、
+  // 以後 .then(saveNow) が呼ばれず自動保存全体が止まってしまうため、
+  // 想定外の内容（外部エディタでの型崩れなど）が来ても握りつぶす。
+  try {
+    tryApplyPendingExternalConfig();
+  } catch (err) {
+    toast(`設定ファイルの読み込みに失敗しました: ${err.message}`, true);
+  }
+}
+
+/**
+ * 受け取った revision/bootId の組が、現在 state が知っている内容と
+ * 同じか古い（＝新しい情報を何も持っていない）かを判定する。
+ * bootId が異なる場合はデーモンが再起動しているので、revision の大小は
+ * 意味を持たず、常に「新しい」として扱う（false を返す）。
+ */
+function isKnownOrStale(revision, bootId) {
+  return bootId === state.configBootId && revision <= state.configRevision;
+}
+
+/**
+ * PUT 応答・GET・SSE の直接適用など「今まさに確定した」ライブな経路から
+ * bootId を記録する。bootId が変わった（＝デーモンが再起動して別プロセスに
+ * なった）場合、退避中の外部更新 (pendingExternalConfig) がその「今確定した
+ * 新しい bootId」と異なる bootId のものであれば、もう存在しない旧プロセス
+ * の情報なので古いとみなして破棄する。
+ *
+ * これをしないと、isKnownOrStale() の「bootId が違えば常に新しい」という
+ * 判定（届いたばかりの情報を古いものとして握りつぶさないための判定）が
+ * 逆に仇となり、退避済みの「旧プロセスの外部更新」を後から
+ * tryApplyPendingExternalConfig() が「新しい」と誤判定して、今しがた確定
+ * させたばかりの状態を巻き戻してしまう（Codex レビューで発見された不具合）。
+ * 旧プロセスの情報はどのみち再起動によって失われているので、その旨を
+ * 通知する。
+ */
+function noteConfirmedBootId(bootId) {
+  if (bootId === state.configBootId) return;
+  if (pendingExternalConfig && pendingExternalConfig.bootId !== bootId) {
+    pendingExternalConfig = null;
+    // ここで破棄する原因は常に「bootId が変わった＝デーモンが再起動した」
+    // ことなので、呼び出し元（保存の成功応答／resync／SSE の直接適用など）
+    // に関わらずこの文言で正確に説明できる。
+    toast('編集中に外部で変更された設定がありましたが、デーモンの再起動により反映されませんでした', true);
+  }
+  state.configBootId = bootId;
+}
+
+/**
+ * 退避していた外部更新を、安全なら反映する。
+ * 「安全」とは、編集中でも PUT 応答待ちでもなく (savePending / saveInFlight
+ * でない) こと。pendingExternalConfig は mutationId 判定によって「自己通知
+ * ではない」と確定済みのものだけがここに入るため、追い越されていた
+ * （＝自分の保存で結果的に上書きしてしまった）場合は必ずその旨を知らせる
+ * （＝黙って捨てない）。
+ */
+function tryApplyPendingExternalConfig() {
+  if (!pendingExternalConfig || savePending || saveInFlight) return;
+  const { config, revision, bootId } = pendingExternalConfig;
+  pendingExternalConfig = null;
+  if (isKnownOrStale(revision, bootId)) {
+    toast('編集中に外部で変更された設定がありましたが、保存によって上書きされました', true);
+    return;
+  }
+  applyIncomingConfig(config, revision, bootId);
+  toast('外部で変更された設定を画面に反映しました');
+}
+
+/**
+ * SSE の config イベントや GET /api/config の内容を state に反映し、再描画する。
+ * renderActivePanel() の replaceChildren() で入力欄のフォーカスやカーソル
+ * 位置、スライダーのドラッグ操作が失われるため、この関数は「本当に画面を
+ * 作り直す必要があるとき」だけ呼ぶ（自己通知は isKnownOrStale() 判定で
+ * 弾かれ、ここまで到達しない）。
+ */
+function applyIncomingConfig(config, revision, bootId) {
+  state.config = config;
+  state.configRevision = revision;
+  noteConfirmedBootId(bootId);
+  renderActivePanel();
 }
 
 /**
@@ -501,7 +689,7 @@ function renderPreviewCard(targetId) {
   const output = h('div', { class: 'preview-out' }, '「整形を確認」を押すと、実際に読み上げるテキストが表示されます。');
 
   const runFilter = async () => {
-    await saveNow(); // 直前に書いた無視パターンや整形設定で判定させる
+    await flushSave(); // 直前に書いた無視パターンや整形設定で判定させる
     try {
       const r = await api('/api/filter-preview', {
         method: 'POST',
@@ -733,7 +921,7 @@ const SKIP_REASONS = {
 };
 
 async function preview(targetId, text, raw) {
-  await saveNow();
+  await flushSave();
   try {
     const r = await api('/api/preview', { method: 'POST', body: JSON.stringify({ target: targetId, text, raw }) });
     if (!r.spoken) toast(`読み上げませんでした（${SKIP_REASONS[r.reason] ?? r.reason ?? '理由不明'}）`, true);
@@ -743,7 +931,7 @@ async function preview(targetId, text, raw) {
 }
 
 async function syncDictionary() {
-  await saveNow();
+  await flushSave();
   try {
     const r = await api('/api/dictionary/sync', { method: 'POST' });
     let msg = `辞書を反映しました（追加 ${r.added} / 更新 ${r.updated} / 削除 ${r.removed}）`;
@@ -777,14 +965,47 @@ async function engineAction(action) {
 async function detectEngine() {
   toast('エンジンを探しています…');
   try {
-    const r = await api('/api/engine/detect', { method: 'POST' });
-    if (!r.enginePath) {
-      toast('エンジンの実行ファイルが見つかりませんでした。パスを手入力してください。', true);
-      return;
-    }
-    state.config = await api('/api/config');
-    renderActivePanel();
-    toast(`検出しました: ${r.enginePath}`);
+    // /api/engine/detect はサーバー側で enginePath を設定へ保存する
+    // （検出には時間がかかることがある）。この一連の処理を保存と同じ
+    // saveChain で直列化することで、検出の最中に無関係な編集の自動保存が
+    // 割り込んで検出結果を上書きしてしまう事故を防ぐ（Codex レビューで
+    // 発見された不具合）。
+    await runExclusive(async () => {
+      // 直列化キューの中で確実に保存を確定させてから検出する。
+      await saveNow();
+      if (savePending) {
+        // 直前の保存が失敗して未保存の編集が残っている（失敗の toast は
+        // saveNow() 内で既に出ている）。この状態のまま検出を進めると、
+        // 検出結果と未保存分の関係が分からなくなるため、ここで打ち切る。
+        toast('未保存の変更が残っているため検出を中断しました。保存できてから再度お試しください', true);
+        return;
+      }
+      // /api/engine/detect もサーバー側で store.patch() を呼ぶ（見つかれば）。
+      // mutationId を付けておかないと、この保存に伴う SSE の自己通知を
+      // 「自分の操作」だと確定判定できず、savePending 中に他の編集をして
+      // いた場合などに「設定ファイルが外部で変更されました」という、
+      // 実際には自分自身の操作に対する紛らわしい通知が出ることがある。
+      const mutationId = randomId();
+      inFlightMutationId = mutationId;
+      let r;
+      try {
+        r = await api('/api/engine/detect', { method: 'POST', headers: { 'X-Mutation-Id': mutationId } });
+      } finally {
+        inFlightMutationId = null;
+      }
+      if (!r.enginePath) {
+        toast('エンジンの実行ファイルが見つかりませんでした。パスを手入力してください。', true);
+        return;
+      }
+      // /api/engine/detect はサーバー側で既に enginePath を保存済みなので、
+      // 改めて GET/SSE の到着を待たず、検出結果をそのままローカルの作業
+      // コピーへ書き込む。こうしておけば、この後どのタイミングで PUT が
+      // 送られても（他の編集の自動保存を含め）必ずこの値を含んだ状態で
+      // 送られるので、サーバー側の保存済み値と食い違うことがない。
+      setPath(state.config, 'engine.enginePath', r.enginePath);
+      renderActivePanel();
+      toast(`検出しました: ${r.enginePath}`);
+    });
   } catch (err) {
     toast(err.message, true);
   }
@@ -816,6 +1037,9 @@ async function refreshState() {
     state.engine = { available: false, error: 'デーモンに接続できません', baseUrl: '' };
     updateEngineBadge();
   }
+  // SSE 再接続時の resyncConfig() が GET の失敗や「編集中だから見送り」で
+  // 取りこぼした場合の保険として、定期的にも取り直しを試みる。
+  resyncConfig();
 }
 
 function updateEngineBadge() {
@@ -875,8 +1099,62 @@ function switchTab(tab) {
   renderActivePanel();
 }
 
+// SSE 再接続時・15 秒ごとの定期呼び出し・detectEngine() など、複数の経路
+// から resyncConfig() が呼ばれ得る。同時に複数の GET が飛ぶと、要求した順と
+// 応答が返る順が入れ替わることがある（例: デーモン再起動をまたいで、旧
+// プロセスへの要求が新プロセスへの要求より遅れて返ってくる late-arrival）。
+// PUT と同じく直列化キューでつなぎ、常に 1 件ずつ実行することで、この
+// 順序の入れ替わりが実害を持たないようにする。
+let resyncChain = Promise.resolve();
+
+/**
+ * resyncConfigNow() を直列化キューにつないで呼び出す。GET を直接叩く
+ * 代わりに、必ずこの関数経由で呼ぶこと。
+ */
+function resyncConfig() {
+  resyncChain = resyncChain.then(resyncConfigNow).catch(() => {});
+  return resyncChain;
+}
+
+/**
+ * config の基準を GET で取り直す実体。SSE の再接続時と、15 秒ごとの
+ * refreshState() の定期呼び出しの両方から呼ぶ（後者は前者の取りこぼしに
+ * 対する保険。1 回の GET 失敗や「今は編集中／dirty だから見送る」判断が
+ * あっても、次の定期呼び出しでいずれ再同期できるようにするため）。
+ *
+ * GET の応答は非同期に届くため、要求してから応答が返るまでの間に SSE で
+ * さらに新しい状態が先に適用されていることがある（応答が古い情報のまま
+ * 遅れて届く late-arrival）。ここで応答を無条件に採用すると、その新しい
+ * 状態を取りこぼした古い内容で巻き戻してしまう。そのため応答が返った
+ * 「今」の state を基準に isKnownOrStale() で判定し、既知以下（＝待って
+ * いる間に他の経路で追いついた分）なら何もしない。
+ *
+ * GET には打ち切りタイムアウトを付ける。デーモン再起動などで要求が
+ * ハングしたまま応答が返らないと、直列化キューが塞がって以後の
+ * resyncConfig() が永久に実行されなくなってしまうため。
+ */
+async function resyncConfigNow() {
+  if (savePending || saveInFlight || pendingExternalConfig) return;
+  const controller = new AbortController();
+  const timeoutTimer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const { config, revision, bootId } = await api('/api/config', { signal: controller.signal });
+    // GET 応答を待つ間に編集が始まった、外部更新が届いた場合はここで
+    // 諦める（ローカルの編集や退避済みの更新を上書きしないため）。
+    if (savePending || saveInFlight || pendingExternalConfig) return;
+    if (isKnownOrStale(revision, bootId)) return;
+    applyIncomingConfig(config, revision, bootId);
+  } catch {
+    // GET が失敗・タイムアウトしても例外は投げない。次の再接続や
+    // refreshState() の定期呼び出しで再試行される。
+  } finally {
+    clearTimeout(timeoutTimer);
+  }
+}
+
 function connectStream() {
   const es = new EventSource('/api/stream');
+  es.addEventListener('open', resyncConfig);
   es.addEventListener('queue', (e) => updateQueueBadge(JSON.parse(e.data)));
   es.addEventListener('runtime', (e) => {
     state.muted = JSON.parse(e.data).muted;
@@ -885,13 +1163,34 @@ function connectStream() {
   });
   es.addEventListener('log', (e) => appendLog(JSON.parse(e.data)));
   es.addEventListener('config', (e) => {
-    // 外部エディタでの編集を反映する。入力中の上書きを避けるため保存待ちのときは無視する
-    if (savePending) return;
-    // 自分の保存でも通知は返ってくる。中身が手元と同じなら描き直さない
-    // （描き直すと入力中の欄からフォーカスが飛ぶ）。外部の変更なら中身が違うので通る。
-    if (e.data === JSON.stringify(state.config)) return;
-    state.config = JSON.parse(e.data);
-    renderActivePanel();
+    // 外部エディタでの編集・他クライアントの保存を反映する。
+    const { revision, config, bootId, mutationId } = JSON.parse(e.data);
+    // 既知以下（bootId が同じで revision もこちらが知っている範囲）なら、
+    // 自分の保存の自己通知か、既に見た（またはより新しい情報で追い越し
+    // 済みの）更新なので無視する。
+    if (isKnownOrStale(revision, bootId)) return;
+    if (mutationId && mutationId === inFlightMutationId) {
+      // 自分がいま送った PUT の自己通知だと id で確定できる。内容は
+      // 自分が送ったものと同じはずなので、再描画せず基準だけ進めておく
+      // （PUT の応答がまだ返っていなくても、この時点で revision が
+      // わかるので先に更新してよい）。
+      state.configRevision = revision;
+      noteConfirmedBootId(bootId);
+      return;
+    }
+    // ここまで来た時点で、自己通知ではない（他所からの更新）と確定して
+    // いる。mutationId が無ければ外部エディタでの編集、あれば自分以外の
+    // 保存要求（他クライアント）によるもの。
+    if (savePending || saveInFlight) {
+      // 編集中、または自分の PUT の応答待ち中で今すぐ上書きはできない。
+      // 退避しておき、安全になったタイミング
+      // (tryApplyPendingExternalConfig) で改めて反映する。
+      const first = !pendingExternalConfig;
+      pendingExternalConfig = { config, revision, bootId };
+      if (first) toast('設定ファイルが外部で変更されました。編集が完了すると反映されます');
+      return;
+    }
+    applyIncomingConfig(config, revision, bootId);
   });
   es.onerror = () => {
     $('#engine-status').textContent = 'デーモン切断';
@@ -923,7 +1222,11 @@ async function init() {
   });
 
   try {
-    [state.config, state.catalog] = await Promise.all([api('/api/config'), api('/api/catalog')]);
+    const [configResult, catalog] = await Promise.all([api('/api/config'), api('/api/catalog')]);
+    state.config = configResult.config;
+    state.configRevision = configResult.revision;
+    state.configBootId = configResult.bootId;
+    state.catalog = catalog;
   } catch (err) {
     document.body.append(h('div', { class: 'banner banner-warn', style: 'margin:20px' }, `デーモンに接続できません: ${err.message}`));
     return;
