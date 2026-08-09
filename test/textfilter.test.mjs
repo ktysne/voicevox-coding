@@ -239,6 +239,23 @@ test('打ち切りの予算はパターン全体で共有する', () => {
   assert.ok(Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3, `${Date.now() - started}ms かかった`);
 });
 
+test('空のパターンが並んでいても予算を超えない', () => {
+  // 予算切れの判定を空文字より先に行っていること
+  const patterns = ['a*a*X', ...Array.from({ length: 10000 }, () => '')];
+  const started = Date.now();
+  assert.equal(resolveStop(`${'a'.repeat(4000)}!`, patterns).speak, true);
+  assert.ok(Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3, `${Date.now() - started}ms かかった`);
+});
+
+test('使えなかった無視パターンは理由が残る', () => {
+  // 黙って飛ばすだけだと「書いたのに効かない」が無通知になる
+  const r = resolveStop('作業が終わりました。', ['[']);
+  assert.equal(r.speak, true);
+  assert.equal(r.problems.length, 1);
+  assert.match(r.problems[0], /無視パターン 1/);
+  assert.equal(resolveStop('作業が終わりました。', ['^実行ログ']).problems.length, 0);
+});
+
 test('重いパターンの後ろでも軽いパターンは判定される', () => {
   // 予算が残っていれば、打ち切った次のパターンで一致を拾えること
   const r = resolveStop('実行ログ: 完了', ['(a+)+$', '^実行ログ']);

@@ -60,6 +60,11 @@ async function readJson(req) {
 export function createServer({ store, engine, queue, log, engineProcess, runtime, commentaryMonitor, onShutdown }) {
   const sseClients = new Set();
 
+  // 同じ警告を発話のたびに出すとログが埋まるので、一度出したものは覚えておく。
+  // 設定を変えたら出し直したいので、config の変更で忘れる。
+  const warnedOnce = new Set();
+  store.on('change', () => warnedOnce.clear());
+
   /** 整形して発話キューに積む。ターゲットの設定に従う。 */
   const speak = (target, eventName, payload) => {
     const profile = store.profile(target);
@@ -69,6 +74,14 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       profile,
       dictionary: store.config.dictionary,
     });
+
+    // 使えなかった無視パターンは黙って飛ばしている。理由が分からないと直せないので残す
+    for (const problem of decision.problems ?? []) {
+      const key = `${target}: ${problem}`;
+      if (warnedOnce.has(key)) continue;
+      warnedOnce.add(key);
+      log.warn(`[${target}] ${problem}`);
+    }
 
     if (runtime?.muted) {
       log.debug(`[${target}] ${eventName}: 一時停止中のため読み上げなし`);

@@ -38,25 +38,33 @@ const MATCH_CONTEXT = vm.createContext({ pattern: '', text: '' });
 /**
  * 無視パターン。整形前の本文がどれかに部分一致したら、その発話ごと飛ばす。
  * フラグは付けないので大文字小文字は区別する（区別したくないときは [Bb] のように書く）。
+ *
+ * 使えなかったパターンは problems に理由を積む。飛ばしたことを黙っていると
+ * 「書いたのに効かない」が無通知になるので、呼び出し側でログに出す。
+ * @param {string[]} problems 使えなかったパターンの説明を受け取る配列
  */
-function ignored(text, patterns) {
+function ignored(text, patterns, problems) {
   if (!Array.isArray(patterns)) return false; // 手編集で配列以外が入っていても落とさない
-  let budget = IGNORE_MATCH_BUDGET_MS;
+  // 単調時計で期限を決め、要素ごとに必ず確認する（空文字が並んでいても予算を超えない）
+  const deadline = performance.now() + IGNORE_MATCH_BUDGET_MS;
   MATCH_CONTEXT.text = text;
   try {
-    for (const pattern of patterns) {
+    for (const [index, pattern] of patterns.entries()) {
+      const left = deadline - performance.now();
+      if (left <= 0) {
+        problems.push(`無視パターン ${index + 1} 以降は、照合の時間切れで見ていません`);
+        break;
+      }
       if (typeof pattern !== 'string' || pattern === '') continue;
-      if (budget <= 0) break;
       MATCH_CONTEXT.pattern = pattern;
-      const started = Date.now();
       try {
-        if (MATCH_SCRIPT.runInContext(MATCH_CONTEXT, { timeout: Math.ceil(budget) })) return true;
-      } catch {
-        // 不正な正規表現と、時間内に終わらなかったパターンは黙って飛ばす。
+        if (MATCH_SCRIPT.runInContext(MATCH_CONTEXT, { timeout: Math.max(1, Math.ceil(left)) })) return true;
+      } catch (err) {
+        // 不正な正規表現と、時間内に終わらなかったパターンは飛ばす。
         // 打ち切ったときは「一致しなかった」扱いにする（黙り込むより読み上げるほうが安全）。
         // 不正な正規表現は UI 側で検証済みのはずだが、手編集もありうる。
+        problems.push(`無視パターン ${index + 1}（${pattern}）は使えません: ${err.message}`);
       }
-      budget -= Date.now() - started;
     }
     return false;
   } finally {
@@ -65,7 +73,9 @@ function ignored(text, patterns) {
 }
 
 /**
- * @returns {{ speak:false, reason:string } | { speak:true, text:string, event:string }}
+ * problems には無視パターンのうち使えなかったものの説明が入る。呼び出し側でログに出す。
+ * @returns {{ speak:false, reason:string, problems?:string[] }
+ *   | { speak:true, text:string, event:string, problems:string[] }}
  */
 export function resolveUtterance({ eventName, payload, profile, dictionary }) {
   if (!profile) return { speak: false, reason: 'unknown-target' };
@@ -103,13 +113,15 @@ export function resolveUtterance({ eventName, payload, profile, dictionary }) {
 
   // 整形前の生テキストで判定する。整形後だと記号やコードブロックが消えて、
   // 設定した書き出しと一致しなくなるため。
-  if (ignored(raw, profile.ignorePatterns)) return { speak: false, reason: 'ignored-pattern' };
+  const problems = [];
+  const hit = ignored(raw, profile.ignorePatterns, problems);
+  if (hit) return { speak: false, reason: 'ignored-pattern', problems };
 
   const filtered = filterText(raw, profile.textFilter);
-  if (!filtered.text) return { speak: false, reason: 'filtered-out' };
+  if (!filtered.text) return { speak: false, reason: 'filtered-out', problems };
 
   const spoken = applyReplacements(filtered.text, dictionary?.replacements ?? []);
-  if (!spoken.trim()) return { speak: false, reason: 'filtered-out' };
+  if (!spoken.trim()) return { speak: false, reason: 'filtered-out', problems };
 
-  return { speak: true, text: spoken, event: eventName, truncated: filtered.truncated };
+  return { speak: true, text: spoken, event: eventName, truncated: filtered.truncated, problems };
 }

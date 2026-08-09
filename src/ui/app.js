@@ -370,8 +370,9 @@ function ignorePatternError(pattern) {
 }
 
 /**
- * 無視パターンの 1 行。入力のたびに使える正規表現かを確かめ、
+ * 無視パターンの 1 行。欄から離れたときに使える正規表現かを確かめ、
  * 駄目なら行の下に理由を出す（保存自体は止めない。あとから直せるように）。
+ * 入力の途中は必ず不完全なので、打っている間は理由を消しておく。
  */
 function ignorePatternRow(base, pattern, index) {
   const errorId = `${base.replace(/\./g, '-')}-ignore-error-${index}`;
@@ -379,27 +380,29 @@ function ignorePatternRow(base, pattern, index) {
     class: 'hint',
     style: 'margin:6px 0 0;color:var(--err)',
     id: errorId,
-    role: 'status', // 入力中に出る文言なので、読み上げソフトにも伝わるようにする
+    role: 'status', // 入力欄と結び付けて、読み上げソフトにも伝わるようにする
     'aria-live': 'polite',
   });
-  const validate = (value) => {
-    error.textContent = ignorePatternError(value) ?? '';
+  const input = h('input', {
+    type: 'text',
+    'data-path': `${base}.ignorePatterns.${index}`,
+    value: pattern ?? '',
+    placeholder: '例: ^バックグラウンドタスクの実行ログ',
+    'aria-describedby': errorId,
+  });
+  const show = (message) => {
+    error.textContent = message ?? '';
+    if (message) input.setAttribute('aria-invalid', 'true');
+    else input.removeAttribute('aria-invalid');
   };
-  validate(pattern);
+  input.addEventListener('input', () => show(null));
+  input.addEventListener('blur', () => show(ignorePatternError(input.value)));
+  show(ignorePatternError(pattern));
 
   return h(
     'tr',
     {},
-    h('td', {},
-      h('input', {
-        type: 'text',
-        'data-path': `${base}.ignorePatterns.${index}`,
-        value: pattern ?? '',
-        placeholder: '例: ^バックグラウンドタスクの実行ログ',
-        'aria-describedby': errorId,
-        oninput: (e) => validate(e.target.value),
-      }),
-      error),
+    h('td', {}, input, error),
     h('td', {}, h('button', { class: 'btn btn-sm btn-ghost btn-danger', onclick: () => removeArrayItem(`${base}.ignorePatterns`, index) }, '削除')),
   );
 }
