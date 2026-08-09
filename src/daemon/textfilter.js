@@ -160,7 +160,8 @@ const REL_CHAR = `[^${PATH_EXCLUDE}${JP_EXCLUDE}]`;
 //   1. 空白を含んでよいが `.ext` で終わるもの（`release notes.txt`）
 //   2. 空白も日本語も含まないもの（`app.logを確認` の「を確認」を残す）
 //   3. 日本語だけのディレクトリ名（`C:\Users\山田`）
-// 1 の後方参照で `C:\logs\app.log is missing` の後続本文を飲み込まずに済む。
+// 1 は末尾が拡張子であることを後読みで確かめるので、
+// `C:\logs\app.log is missing` の後続本文を飲み込まずに済む。
 // 拡張子の直後がまだパス要素なら（`file.test-case` の `-`）打ち切らない。
 // 途中で確定すると `file.test` と `-case` に割れてしまう。
 const LAST_SEG = `(?:${PATH_SEG}(?<=\\.[A-Za-z0-9]{1,10})(?!${REL_CHAR})|${REL_CHAR}+|${PATH_CHAR}+)`;
@@ -198,7 +199,7 @@ function isLikelyRelativePath(m) {
   if (parts.every((p) => NUMERIC_SEG.test(p))) return false; // 日付や分数
   if (EXTENSION.test(parts[parts.length - 1])) return true; // 拡張子付きならパス
   const seps = (m.match(/[\\/]/g) || []).length;
-  if (seps >= 2 && /[A-Za-z0-9]/.test(m)) return true; // src/daemon/ など
+  if (seps >= 2 && HAS_ASCII_ALNUM.test(m)) return true; // src/daemon/ など
   // 区切りが 1 つだけのときは `CI/CD` `A/B` `and/or` のような略語や併記と区別が付かない。
   // 各要素が 2 文字以上で、かつ `.` `_` `-` を含むもの（node_modules/pkg など）だけ通す。
   return parts.every((p) => p.length >= 2) && /[._-]/.test(m);
