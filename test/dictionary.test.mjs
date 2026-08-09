@@ -13,32 +13,46 @@ afterEach(() => {
 });
 
 /**
- * 所有状態のファイルをメモリ上で代替する。書き込んだ内容は次の読み込みに反映される。
- * @returns {Array<object>} writeState の呼び出しごとに積まれる state のスナップショット
+ * 所有状態のファイルをメモリ上で代替する。
+ * writeState は一時ファイルへ書いてから rename するので、その 2 段階も再現する。
+ * @returns {{writes:Array<object>, patch:(next:object)=>void}}
+ *   writes は writeState ごとの state のスナップショット、patch は保存済み state の書き換え
  */
 function stubState(initial = { words: {} }) {
   const writes = [];
   let current = JSON.stringify(initial);
+  let tmp = null;
   const realReadFileSync = fs.readFileSync;
   const realWriteFileSync = fs.writeFileSync;
+  const realRenameSync = fs.renameSync;
   const realMkdirSync = fs.mkdirSync;
   mock.method(fs, 'readFileSync', (file, ...rest) => {
     if (file === STATE_PATH) return current;
     return realReadFileSync(file, ...rest);
   });
   mock.method(fs, 'writeFileSync', (file, data, ...rest) => {
-    if (file === STATE_PATH) {
-      current = data;
-      writes.push(JSON.parse(data));
+    if (file === `${STATE_PATH}.tmp`) {
+      tmp = data;
       return undefined;
     }
     return realWriteFileSync(file, data, ...rest);
+  });
+  mock.method(fs, 'renameSync', (from, to, ...rest) => {
+    if (from === `${STATE_PATH}.tmp` && to === STATE_PATH) {
+      current = tmp;
+      writes.push(JSON.parse(current));
+      return undefined;
+    }
+    return realRenameSync(from, to, ...rest);
   });
   mock.method(fs, 'mkdirSync', (dir, ...rest) => {
     if (dir === CONFIG_DIR) return undefined;
     return realMkdirSync(dir, ...rest);
   });
-  return writes;
+  return {
+    writes,
+    patch: (next) => { current = JSON.stringify({ ...JSON.parse(current), ...next }); },
+  };
 }
 
 class FakeEngine {
@@ -87,7 +101,7 @@ class FakeEngine {
 const word = (surface, pronunciation) => ({ surface, pronunciation, accentType: 0 });
 
 test('同じ表記が複数あると 2 件目以降を skipped にして追加は 1 回だけにする', async () => {
-  const writes = stubState();
+  const { writes } = stubState();
   const engine = new FakeEngine();
 
   const result = await syncEngineDictionary(engine, [
@@ -103,7 +117,7 @@ test('同じ表記が複数あると 2 件目以降を skipped にして追加�
 });
 
 test('辞書一覧の取得に失敗したら同期を中止して追加も更新もしない', async () => {
-  const writes = stubState({ words: { VOICEVOX: 'uuid-old' } });
+  const { writes } = stubState({ words: { VOICEVOX: 'uuid-old' } });
   const engine = new FakeEngine({ userDictError: new Error('接続できません') });
 
   await assert.rejects(
@@ -116,7 +130,7 @@ test('辞書一覧の取得に失敗したら同期を中止して追加も更�
 });
 
 test('途中の追加が失敗しても成功済みの uuid は state に残る', async () => {
-  const writes = stubState();
+  const { writes } = stubState();
   const engine = new FakeEngine({
     onAdd: (payload, index) => {
       if (index === 1) throw new Error('追加に失敗しました');
@@ -133,7 +147,7 @@ test('途中の追加が失敗しても成功済みの uuid は state に残る'
 });
 
 test('既存の所有語は更新し、設定から消えた語は ENGINE からも削除する', async () => {
-  const writes = stubState({ words: { 残す語: 'uuid-keep', 消す語: 'uuid-drop' } });
+  const { writes } = stubState({ words: { 残す語: 'uuid-keep', 消す語: 'uuid-drop' } });
   const engine = new FakeEngine({ dict: { 'uuid-keep': {}, 'uuid-drop': {} } });
 
   const result = await syncEngineDictionary(engine, [word('残す語', 'ノコスゴ')]);
@@ -148,7 +162,7 @@ test('既存の所有語は更新し、設定から消えた語は ENGINE から
 });
 
 test('ENGINE 側から消えた所有語は再登録して新しい uuid を持ち直す', async () => {
-  const writes = stubState({ words: { 復活語: 'uuid-gone' } });
+  const { writes } = stubState({ words: { 復活語: 'uuid-gone' } });
   const engine = new FakeEngine({ dict: {} });
 
   const result = await syncEngineDictionary(engine, [word('復活語', 'フッカツゴ')]);
@@ -159,7 +173,7 @@ test('ENGINE 側から消えた所有語は再登録して新しい uuid を持�
 });
 
 test('追加が失敗しても ENGINE に登録されていれば uuid を拾って state に残す', async () => {
-  const writes = stubState();
+  const { writes } = stubState();
   // 登録は通ったが応答だけ失敗した状況を再現する
   const engine = new FakeEngine({
     onAdd: (payload, _index, self) => {
@@ -178,7 +192,7 @@ test('追加が失敗しても ENGINE に登録されていれば uuid を拾っ
 });
 
 test('追加の確認まで失敗しても、次回の同期が pending から実体を拾って二重登録しない', async () => {
-  const writes = stubState();
+  const { writes } = stubState();
   const engine = new FakeEngine({
     onAdd: (payload, _index, self) => {
       // 登録は通ったが、応答も直後の一覧取得も失敗した
@@ -194,7 +208,8 @@ test('追加の確認まで失敗しても、次回の同期が pending から�
   );
 
   assert.deepEqual(writes.at(-1).words, {});
-  assert.deepEqual(writes.at(-1).pending, { surface: '切断語', pronunciation: 'セツダンゴ' });
+  assert.equal(writes.at(-1).pending.surface, '切断語');
+  assert.equal(writes.at(-1).pending.pronunciation, 'セツダンゴ');
 
   // 復旧後の同期では追加をやり直さず、登録済みの uuid を所有し直す
   engine.userDictError = null;
@@ -206,34 +221,82 @@ test('追加の確認まで失敗しても、次回の同期が pending から�
   assert.deepEqual(writes.at(-1).words, { 切断語: 'uuid-registered' });
 });
 
-test('無関係な未知 UUID は回収せず、手動登録の語を奪わない', async () => {
-  const manual = { 'uuid-manual': { surface: '手動語', pronunciation: 'シュドウゴ' } };
-  const writes = stubState();
+test('追加前から在る同じ表記の手動登録語は回収しない', async () => {
+  // 表記も読みも同じ語が手動で登録済み。ツール側の追加は成立せずに失敗する
+  const manual = { 'uuid-manual': { surface: '同名語', pronunciation: 'ドウメイゴ' } };
+  const { writes, patch } = stubState();
   const engine = new FakeEngine({
-    onAdd: (_payload, _index, self) => {
-      // 追加は成立せず、その間に別クライアントが無関係な語を 1 件登録した
-      self.dict['uuid-manual'] = manual['uuid-manual'];
-      throw new Error('追加に失敗しました');
-    },
+    dict: { ...manual },
+    onAdd: () => { throw new Error('追加に失敗しました'); },
   });
 
   await assert.rejects(
-    () => syncEngineDictionary(engine, [word('未登録語', 'ミトウロクゴ')]),
+    () => syncEngineDictionary(engine, [word('同名語', 'ドウメイゴ')]),
     /追加に失敗しました/,
   );
 
+  // 手動登録語を所有すると、設定から消したときに巻き添えで削除してしまう
   assert.deepEqual(writes.at(-1).words, {});
+  assert.deepEqual(writes.at(-1).pending.knownUuids, ['uuid-manual']);
 
-  // 次の同期でも手動登録の語は所有せず、改めて追加する
-  const retryEngine = new FakeEngine({ dict: { ...manual } });
-  const result = await syncEngineDictionary(retryEngine, [word('未登録語', 'ミトウロクゴ')]);
+  // 猶予を過ぎたあとの同期でも、既存の uuid は奪わずに追加をやり直す
+  patch({ pending: { ...writes.at(-1).pending, at: 0 } });
+  engine.onAdd = null;
+  const result = await syncEngineDictionary(engine, [word('同名語', 'ドウメイゴ')]);
 
   assert.equal(result.added, 1);
-  assert.deepEqual(writes.at(-1).words, { 未登録語: 'uuid-未登録語' });
+  assert.deepEqual(writes.at(-1).words, { 同名語: 'uuid-同名語' });
+});
+
+test('前回の追加が確定していないうちは追加をやり直さず failed に積む', async () => {
+  const pending = { surface: '保留語', pronunciation: 'ホリュウゴ', knownUuids: [], at: Date.now() };
+  const { writes, patch } = stubState({ words: {}, pending });
+  const engine = new FakeEngine();
+
+  // ENGINE 側でまだ追加を処理中かもしれないので、猶予のあいだは触らない
+  const result = await syncEngineDictionary(engine, [word('保留語', 'ホリュウゴ')]);
+
+  assert.equal(result.added, 0);
+  assert.equal(result.failed.length, 1);
+  assert.deepEqual(engine.calls.filter(([kind]) => kind === 'add'), []);
+  assert.equal(writes.at(-1).pending.surface, '保留語');
+
+  // 猶予を過ぎたら改めて追加する
+  patch({ pending: { ...pending, at: 0 } });
+  const retry = await syncEngineDictionary(engine, [word('保留語', 'ホリュウゴ')]);
+
+  assert.equal(retry.added, 1);
+  assert.deepEqual(writes.at(-1).words, { 保留語: 'uuid-保留語' });
+});
+
+test('遅れて ENGINE に現れた登録は pending から回収して追加し直さない', async () => {
+  const pending = { surface: '遅延語', pronunciation: 'チエンゴ', knownUuids: [], at: Date.now() };
+  const { writes } = stubState({ words: {}, pending });
+  // 前回の同期がタイムアウトしたあと、ENGINE 側の処理が完了した状態
+  const engine = new FakeEngine({ dict: { 'uuid-late': { surface: '遅延語', pronunciation: 'チエンゴ' } } });
+
+  const result = await syncEngineDictionary(engine, [word('遅延語', 'チエンゴ')]);
+
+  assert.equal(result.added, 0);
+  assert.equal(result.updated, 1);
+  assert.deepEqual(writes.at(-1).words, { 遅延語: 'uuid-late' });
+});
+
+test('半角と全角の違いだけの表記も重複として弾く', async () => {
+  stubState();
+  const engine = new FakeEngine();
+
+  const result = await syncEngineDictionary(engine, [
+    word('VOICEVOX', 'ボイスボックス'),
+    word('ＶＯＩＣＥＶＯＸ', 'ボイスボックス'),
+  ]);
+
+  assert.equal(result.added, 1);
+  assert.deepEqual(result.skipped, [{ surface: 'ＶＯＩＣＥＶＯＸ', errors: ['表記が重複しています'] }]);
 });
 
 test('削除に失敗した語は failed に積み、所有を残して次回に持ち越す', async () => {
-  const writes = stubState({ words: { 消す語: 'uuid-drop' } });
+  const { writes } = stubState({ words: { 消す語: 'uuid-drop' } });
   const engine = new FakeEngine({
     dict: { 'uuid-drop': { surface: '消す語' } },
     onDelete: () => { throw new Error('削除できません'); },

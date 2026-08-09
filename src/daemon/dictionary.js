@@ -46,7 +46,11 @@ function readState() {
 
 function writeState(state) {
   fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2), 'utf8');
+  // 所有 uuid を失うと ENGINE 側の語を管理できなくなる。
+  // 直接上書きすると強制終了で壊れた JSON が残るので、config.json と同じく一時ファイル経由で置き換える
+  const tmp = `${STATE_PATH}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2), 'utf8');
+  fs.renameSync(tmp, STATE_PATH);
 }
 
 const KATAKANA_ONLY = /^[ァ-ヴー]+$/;
@@ -61,25 +65,36 @@ export function validateEngineWord(w) {
   return errors;
 }
 
+// 追加要求がタイムアウトしても ENGINE 側の処理は続いていることがある。
+// この猶予のあいだは同じ語を追加し直さず、後から二重登録になるのを避ける
+const PENDING_GRACE_MS = 30_000;
+
 /** ENGINE 側は表記を全角へ寄せることがあるため、照合前に正規化する。 */
 function normalizeSurface(s) {
   return String(s ?? '').normalize('NFKC');
 }
 
-/**
- * ENGINE 側の未所有語から、指定の表記と読みで登録した語を 1 件だけ特定する。
- * 手動登録の語を誤って奪わないよう、表記と読みが一致し、候補が 1 件のときだけ返す。
- * @returns {string|null} 特定できた uuid
- */
-function matchUnownedWord(dict, target, ownedUuids) {
+/** 表記と読みが pending と一致する uuid を列挙する。 */
+function matchingUuids(dict, target) {
   const surface = normalizeSurface(target?.surface);
   const pronunciation = target?.pronunciation ?? '';
-  const hits = Object.entries(dict ?? {}).filter(([uuid, word]) => (
-    !ownedUuids.has(uuid)
-    && normalizeSurface(word?.surface) === surface
-    && (word?.pronunciation ?? '') === pronunciation
-  ));
-  return hits.length === 1 ? hits[0][0] : null;
+  return Object.entries(dict ?? {})
+    .filter(([, word]) => (
+      normalizeSurface(word?.surface) === surface
+      && (word?.pronunciation ?? '') === pronunciation
+    ))
+    .map(([uuid]) => uuid);
+}
+
+/**
+ * ENGINE 側から、この pending の追加で新しく生まれた語を 1 件だけ特定する。
+ * 追加前から在った uuid（手動登録の同じ語を含む）は除くので、他人の語を奪わない。
+ * @returns {string|null} 特定できた uuid。判断できなければ null
+ */
+function recoverPendingUuid(dict, pending) {
+  const before = new Set(pending?.knownUuids ?? []);
+  const fresh = matchingUuids(dict, pending).filter((uuid) => !before.has(uuid));
+  return fresh.length === 1 ? fresh[0] : null;
 }
 
 /**
@@ -87,14 +102,14 @@ function matchUnownedWord(dict, target, ownedUuids) {
  * 応答の遅延や切断で reject しても登録自体は成立していることがある。
  * @returns {Promise<string|null>} 拾えた uuid。確認できなければ null
  */
-async function findOrphanUuid(engine, payload, ownedUuids) {
+async function findOrphanUuid(engine, pending) {
   let current;
   try {
     current = await engine.userDict();
   } catch {
     return null; // 確認手段がない。pending を残したまま次回の同期で拾い直す
   }
-  return matchUnownedWord(current, payload, ownedUuids);
+  return recoverPendingUuid(current, pending);
 }
 
 /**
@@ -121,12 +136,14 @@ async function runSync(engine, engineWords) {
       result.skipped.push({ surface: w?.surface ?? '(不明)', errors });
       continue;
     }
-    // 所有権は surface 単位で持つため、重複を通すと 2 件目以降の uuid が管理外になる
-    if (seen.has(w.surface)) {
+    // 所有権は surface 単位で持つため、重複を通すと 2 件目以降の uuid が管理外になる。
+    // ENGINE 側は全角へ寄せるので、半角と全角の違いも同じ表記として弾く
+    const key = normalizeSurface(w.surface);
+    if (seen.has(key)) {
       result.skipped.push({ surface: w.surface, errors: ['表記が重複しています'] });
       continue;
     }
-    seen.add(w.surface);
+    seen.add(key);
     valid.push(w);
   }
 
@@ -139,24 +156,28 @@ async function runSync(engine, engineWords) {
     throw new Error(`ユーザー辞書の一覧を取得できないため同期を中止しました: ${err.message}`);
   }
 
-  // 所有済みの uuid を追う。孤立 uuid の照合で手動登録の語を奪わないために使う
-  const ownedUuids = new Set(Object.values(owned));
-
-  // 前回の同期が追加の応答を受け取れずに終わっていたら、ENGINE 側の実体を所有へ戻す。
-  // 一覧を取得できた時点で判定は確定するので、拾えなくても pending は落とす
+  // 前回の同期が追加の応答を受け取れずに終わっていたら、ENGINE 側の実体を所有へ戻す
+  let unsettled = null; // 追加が確定せず、今回は手を出せない表記
   if (pending) {
-    if (!owned[pending.surface]) {
-      const recovered = matchUnownedWord(existing, pending, ownedUuids);
-      if (recovered) {
-        owned[pending.surface] = recovered;
-        ownedUuids.add(recovered);
-      }
+    const recovered = owned[pending.surface] ? null : recoverPendingUuid(existing, pending);
+    if (recovered) {
+      owned[pending.surface] = recovered;
+      pending = null;
+    } else if (!owned[pending.surface] && Date.now() - (pending.at ?? 0) < PENDING_GRACE_MS) {
+      // 一覧に無くても、ENGINE 側でまだ処理中かもしれない（クライアント側のタイムアウトは
+      // ENGINE の処理を止めない）。猶予のあいだは追加し直さず、二重登録を避ける
+      unsettled = normalizeSurface(pending.surface);
+    } else {
+      pending = null;
     }
-    pending = null;
     save();
   }
 
   for (const w of valid) {
+    if (unsettled !== null && normalizeSurface(w.surface) === unsettled) {
+      result.failed.push({ surface: w.surface, errors: ['前回の追加が確定していないため見送りました。しばらくしてから再実行してください'] });
+      continue;
+    }
     const payload = {
       surface: w.surface,
       pronunciation: w.pronunciation,
@@ -170,15 +191,21 @@ async function runSync(engine, engineWords) {
       await engine.updateUserDictWord(uuid, payload);
       result.updated += 1;
     } else {
-      // 追加前に印を残す。応答も再確認も失敗した場合、次回の同期がこの印で実体を拾う
-      pending = { surface: payload.surface, pronunciation: payload.pronunciation };
+      // 追加前に印を残す。応答も再確認も失敗した場合、次回の同期がこの印で実体を拾う。
+      // 追加前から在る同じ表記の uuid を控えておき、回収時に手動登録の語を奪わないようにする
+      pending = {
+        surface: payload.surface,
+        pronunciation: payload.pronunciation,
+        knownUuids: matchingUuids(existing, payload),
+        at: Date.now(),
+      };
       save();
       let newUuid;
       try {
         newUuid = await engine.addUserDictWord(payload);
       } catch (err) {
         // 応答だけ失敗して登録は通っている場合があるので、孤立 uuid を拾ってから中止する
-        const orphan = await findOrphanUuid(engine, payload, ownedUuids);
+        const orphan = await findOrphanUuid(engine, pending);
         if (orphan) {
           owned[w.surface] = orphan;
           pending = null;
@@ -186,7 +213,6 @@ async function runSync(engine, engineWords) {
         }
         throw err;
       }
-      ownedUuids.add(newUuid);
       owned[w.surface] = newUuid;
       pending = null;
       // 追加のたびに保存する。以降の語で失敗しても、この uuid を後から更新、削除できる
@@ -197,7 +223,7 @@ async function runSync(engine, engineWords) {
 
   // 設定から消えた単語を ENGINE 側からも消す
   for (const [surface, uuid] of Object.entries({ ...owned })) {
-    if (seen.has(surface)) continue;
+    if (seen.has(normalizeSurface(surface))) continue;
     if (existing[uuid]) {
       try {
         await engine.deleteUserDictWord(uuid);
