@@ -651,7 +651,8 @@ async function syncDictionary() {
     const r = await api('/api/dictionary/sync', { method: 'POST' });
     let msg = `辞書を反映しました（追加 ${r.added} / 更新 ${r.updated} / 削除 ${r.removed}）`;
     if (r.skipped?.length) msg += ` — ${r.skipped.length} 件は入力エラーで見送りました`;
-    toast(msg, Boolean(r.skipped?.length));
+    if (r.failed?.length) msg += ` — ${r.failed.length} 件はエンジン側の処理に失敗しました`;
+    toast(msg, Boolean(r.skipped?.length || r.failed?.length));
   } catch (err) {
     toast(`反映に失敗しました: ${err.message}`, true);
   }

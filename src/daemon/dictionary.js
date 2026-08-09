@@ -62,15 +62,36 @@ export function validateEngineWord(w) {
 }
 
 /**
+ * 追加 API が失敗したあと、ENGINE 側には登録されていないか確かめる。
+ * 応答の遅延や切断で reject しても登録自体は成立していることがあり、
+ * uuid を拾えないと次の同期で同じ語を二重登録してしまう。
+ * @returns {Promise<string|null>} 拾えた uuid。確認できなければ null
+ */
+async function findOrphanUuid(engine, surface, knownUuids) {
+  let current;
+  try {
+    current = await engine.userDict();
+  } catch {
+    return null; // 確認手段がない。ここは諦めて次回の同期に任せる
+  }
+  const added = Object.entries(current ?? {}).filter(([uuid]) => !knownUuids.has(uuid));
+  const matched = added.find(([, word]) => word?.surface === surface);
+  if (matched) return matched[0];
+  // ENGINE 側で表記が正規化される場合があるので、増えた uuid が 1 件だけならそれとみなす
+  return added.length === 1 ? added[0][0] : null;
+}
+
+/**
  * config の engineWords と ENGINE 側ユーザー辞書を突き合わせて同期する。
  * このツールが登録した単語だけを管理対象にする（state ファイルで所有権を持つ）。
- * @returns {{added:number, updated:number, removed:number, skipped:Array}}
+ * @returns {Promise<{added:number, updated:number, removed:number, skipped:Array, failed:Array}>}
  */
-export async function syncEngineDictionary(engine, engineWords = []) {
+async function runSync(engine, engineWords) {
   const state = readState();
   // 作業用のコピー。外部 API が成功するたびにここを更新し、その都度 state へ書き戻す
   const owned = { ...(state.words ?? {}) };
-  const result = { added: 0, updated: 0, removed: 0, skipped: [] };
+  // skipped は入力エラー、failed は ENGINE 側の処理に失敗した語（呼び出し元が警告する）
+  const result = { added: 0, updated: 0, removed: 0, skipped: [], failed: [] };
 
   const valid = [];
   const seen = new Set();
@@ -99,6 +120,9 @@ export async function syncEngineDictionary(engine, engineWords = []) {
     throw new Error(`ユーザー辞書の一覧を取得できないため同期を中止しました: ${err.message}`);
   }
 
+  // 追加で発行された uuid を追う。孤立 uuid の判定に使う
+  const knownUuids = new Set(Object.keys(existing));
+
   for (const w of valid) {
     const payload = {
       surface: w.surface,
@@ -113,7 +137,19 @@ export async function syncEngineDictionary(engine, engineWords = []) {
       await engine.updateUserDictWord(uuid, payload);
       result.updated += 1;
     } else {
-      const newUuid = await engine.addUserDictWord(payload);
+      let newUuid;
+      try {
+        newUuid = await engine.addUserDictWord(payload);
+      } catch (err) {
+        // 応答だけ失敗して登録は通っている場合があるので、孤立 uuid を拾ってから中止する
+        const orphan = await findOrphanUuid(engine, w.surface, knownUuids);
+        if (orphan) {
+          owned[w.surface] = orphan;
+          writeState({ ...state, words: { ...owned } });
+        }
+        throw err;
+      }
+      knownUuids.add(newUuid);
       owned[w.surface] = newUuid;
       // 追加のたびに保存する。以降の語で失敗しても、この uuid を後から更新、削除できる
       writeState({ ...state, words: { ...owned } });
@@ -128,8 +164,10 @@ export async function syncEngineDictionary(engine, engineWords = []) {
       try {
         await engine.deleteUserDictWord(uuid);
         result.removed += 1;
-      } catch {
-        // 消せなくても致命ではない。所有は残して次回の同期で消し直す
+      } catch (err) {
+        // 消せなくても致命ではないが、黙って成功扱いにはしない。
+        // 所有は残して次回の同期で消し直す
+        result.failed.push({ surface, errors: [`ENGINE から削除できませんでした: ${err.message}`] });
         continue;
       }
     }
@@ -140,4 +178,19 @@ export async function syncEngineDictionary(engine, engineWords = []) {
   // 途中で例外が出ても未処理分の uuid が state から消えることはない
   writeState({ ...state, words: owned });
   return result;
+}
+
+// 同期は state と ENGINE 一覧を読んでから書き戻すまでに間があるため、
+// 並行実行すると同じ表記に別々の uuid が発行され、片方が管理外に落ちる。
+// 起動時同期と /api/dictionary/sync は重なりうるので、プロセス内で直列化する。
+let syncChain = Promise.resolve();
+
+/**
+ * config の engineWords と ENGINE 側ユーザー辞書を突き合わせて同期する（直列実行）。
+ * @returns {Promise<{added:number, updated:number, removed:number, skipped:Array, failed:Array}>}
+ */
+export function syncEngineDictionary(engine, engineWords = []) {
+  const run = syncChain.then(() => runSync(engine, engineWords));
+  syncChain = run.then(() => undefined, () => undefined); // 失敗しても後続を止めない
+  return run;
 }
