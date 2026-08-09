@@ -73,6 +73,33 @@ test('国際化ドメイン名の URL も丸ごと置き換わる', () => {
   assert.doesNotMatch(text, /例え/);
 });
 
+test('繰り返し記号や全角英数字を含むパスも丸ごと置き換わる（クロスレビューで検出した回帰）', () => {
+  const { text: text1 } = filterText('参照 https://example.com/佐々木 です', F);
+  assert.match(text1, /リンク/);
+  assert.doesNotMatch(text1, /佐々木/);
+
+  const { text: text2 } = filterText('参照 https://example.com/商品Ａ です', F);
+  assert.match(text2, /リンク/);
+  assert.doesNotMatch(text2, /商品Ａ/);
+});
+
+test('対応する括弧を含む URL は括弧ごと置き換わり、外側の括弧は残る（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://en.wikipedia.org/wiki/Go_(programming_language) です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /wikipedia/);
+
+  const { text: text2 } = filterText('リンク(https://example.com)を開く', F);
+  assert.match(text2, /リンク\(リンク\)を開く/);
+});
+
+test('URL 直後に空白なしで ASCII の読点が続いても後続の日本語文は残る（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://example.com,次へ進む', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /次へ進む/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
 test('ファイルパスはファイル名だけ残る（語頭を食わない）', () => {
   const { text } = filterText('src/daemon/queue.js を更新しました', { ...F, inlineCode: 'read' });
   assert.match(text, /^queue\.js を更新しました$/);
