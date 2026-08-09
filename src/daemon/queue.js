@@ -186,8 +186,16 @@ export class SpeechQueue extends EventEmitter {
     const { wav } = await this.engine.synthesize(text, utterance.speaker, utterance.voice);
     fs.mkdirSync(CACHE_DIR, { recursive: true });
     const tmp = `${file}.tmp`;
-    fs.writeFileSync(tmp, wav);
-    fs.renameSync(tmp, file);
+    try {
+      fs.writeFileSync(tmp, wav);
+      fs.renameSync(tmp, file);
+    } catch (err) {
+      // 部分書き込みや rename 失敗 (EPERM/EBUSY) で書きかけを残さない
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+      throw err;
+    }
     if (useCache) this.#pruneCache(cfg.daemon?.cacheMaxEntries ?? 300);
     return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache };
   }
@@ -195,7 +203,10 @@ export class SpeechQueue extends EventEmitter {
   /** 一時 WAV を削除する。再生ワーカーは PLAY 時に全体をメモリへ読むので、再生後の削除は安全。 */
   #discardAudio(audio) {
     if (!audio?.ephemeral) return;
-    fs.unlink(audio.file, () => {});
+    fs.unlink(audio.file, (err) => {
+      // 一時的な EBUSY/EPERM (ウイルス対策など) は起動時掃除が拾うが、無通知にはしない
+      if (err && err.code !== 'ENOENT') this.log?.warn(`一時 WAV を削除できません: ${err.message}`);
+    });
   }
 
   /** 消費されなかった先読みの一時 WAV も削除する。 */
@@ -211,15 +222,21 @@ export class SpeechQueue extends EventEmitter {
    * デーモンはポート重複で多重起動しないので、起動時にまとめて消してよい。
    */
   cleanupEphemeral() {
+    let files;
     try {
-      for (const f of fs.readdirSync(CACHE_DIR)) {
-        if ((f.startsWith('tmp-') && f.endsWith('.wav')) || f.endsWith('.tmp')) {
-          try {
-            fs.unlinkSync(path.join(CACHE_DIR, f));
-          } catch {}
+      files = fs.readdirSync(CACHE_DIR);
+    } catch {
+      return; // CACHE_DIR がまだ無いのは正常
+    }
+    for (const f of files) {
+      if ((f.startsWith('tmp-') && f.endsWith('.wav')) || f.endsWith('.tmp')) {
+        try {
+          fs.unlinkSync(path.join(CACHE_DIR, f));
+        } catch (err) {
+          if (err.code !== 'ENOENT') this.log?.warn(`一時 WAV を削除できません (${f}): ${err.message}`);
         }
       }
-    } catch {}
+    }
   }
 
   #pruneCache(maxEntries) {

@@ -178,6 +178,25 @@ test('キャッシュ有効時は WAV を削除しない', async () => {
   assert.equal(unlinked.length, 0);
 });
 
+test('書き込みに失敗したら書きかけの .tmp をその場で削除する (AUD-02)', async () => {
+  mock.method(fs, 'renameSync', () => {
+    const err = new Error('EBUSY: resource busy');
+    err.code = 'EBUSY';
+    throw err;
+  });
+  const unlinked = [];
+  mock.method(fs, 'unlinkSync', (p) => unlinked.push(p));
+  const player = new FakePlayer();
+  const queue = makeQueue(player, { cacheEnabled: false });
+  const errors = [];
+  queue.on('error', (err) => errors.push(err));
+  queue.enqueue({ target: 'test', event: 'test', text: '失敗する発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  assert.equal(errors.length, 1);
+  assert.equal(unlinked.length, 1);
+  assert.match(path.basename(unlinked[0]), /\.tmp$/);
+});
+
 test('起動時の掃除は tmp-*.wav と書きかけの *.tmp だけを消す (AUD-02)', () => {
   mock.method(fs, 'readdirSync', () => ['tmp-1-2-0.wav', 'abcdef.wav', 'abcdef.wav.tmp']);
   const unlinked = [];
