@@ -2,12 +2,13 @@
 # デーモンとは HTTP だけでやり取りする（stdin を使わないので、
 # NotifyIcon が要求するメッセージポンプと素直に共存できる）。
 #
-# 使い方: powershell -File tray-worker.ps1 -Port 7591 -ParentPid 1234
+# 使い方: powershell -File tray-worker.ps1 -Port 7591 -ParentPid 1234 -Token <トークン>
 
 [CmdletBinding()]
 param(
     [int]$Port = 7591,
-    [int]$ParentPid = 0
+    [int]$ParentPid = 0,
+    [string]$Token = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,6 +61,10 @@ $Icons = @{
 function Invoke-Daemon([string]$path, [string]$method = 'GET', $body = $null) {
     try {
         $params = @{ Uri = "$Base$path"; Method = $method; TimeoutSec = 3 }
+        # 状態変更 API は起動ごとのトークンを要求する (AUD-01)
+        if ($Token) {
+            $params['Headers'] = @{ 'X-VoiceVox-Coding-Token' = $Token }
+        }
         if ($null -ne $body) {
             $params['Body'] = ($body | ConvertTo-Json -Depth 5 -Compress)
             $params['ContentType'] = 'application/json'

@@ -57,7 +57,74 @@ async function readJson(req) {
   return JSON.parse(text);
 }
 
-export function createServer({ store, engine, queue, log, engineProcess, runtime, commentaryMonitor, onShutdown }) {
+const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+
+function parseHostname(value) {
+  if (!value) return null;
+  try {
+    return new URL(`http://${value}`).hostname;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 状態変更リクエスト（GET/HEAD 以外）の受け入れ判定。
+ * 外部 Web ページからのドライブバイ操作（CSRF / DNS リバインディング）を副作用の前に拒否する。
+ *
+ * 経路ごとの扱い:
+ *   - ブラウザ（Origin ヘッダーあり）… 自オリジンのみ許可。Origin はブラウザが強制付与するため
+ *     攻撃ページには偽装できない。管理 UI の sendBeacon はヘッダーを追加できないので、
+ *     この経路はトークンではなく Origin で判定する。
+ *   - ブラウザ以外のローカルクライアント（Origin なし）… /api/* は起動ごとのトークンを要求する。
+ *     /hook だけはフック定義を変えずに済ませるためトークン不要（JSON の Content-Type は必須）。
+ *   - クロスオリジンの application/json はプリフライトが必要になり、CORS 応答を返さないため
+ *     ブラウザ側で遮断される。text/plain などの単純リクエストは Content-Type 検証で拒否する。
+ *
+ * 脅威モデルは「外部 Web ページからの CSRF / DNS リバインディング」。同一ユーザーの
+ * ローカルプロセスは対象外とする（トークンも設定ファイルも同じ権限で読めるため、
+ * ここで防いでも境界にならない）。
+ */
+export function checkMutationRequest({ pathname, headers = {}, port, token }) {
+  const hostname = parseHostname(headers.host);
+  if (!hostname || !LOCAL_HOSTNAMES.has(hostname)) {
+    return { ok: false, status: 403, error: 'ローカル以外の Host からの要求は受け付けません' };
+  }
+
+  // media type は厳密に比較する（application/jsonp などの JSON 風 MIME を通さない）
+  const contentType = headers['content-type'];
+  const mediaType = contentType?.split(';')[0].trim().toLowerCase();
+  if (contentType !== undefined && mediaType !== 'application/json') {
+    return { ok: false, status: 415, error: 'Content-Type は application/json のみ受け付けます' };
+  }
+  // 本文を読む /hook は Content-Type の省略も認めない（トークン免除の代わりの必須条件）
+  if (pathname === '/hook' && contentType === undefined) {
+    return { ok: false, status: 415, error: '/hook は Content-Type: application/json が必要です' };
+  }
+
+  const origin = headers.origin;
+  if (origin !== undefined) {
+    let allowed = false;
+    try {
+      const o = new URL(origin);
+      allowed = o.protocol === 'http:'
+        && LOCAL_HOSTNAMES.has(o.hostname)
+        && String(o.port || 80) === String(port);
+    } catch {
+      allowed = false;
+    }
+    if (!allowed) return { ok: false, status: 403, error: '許可されていない Origin からの要求です' };
+    return { ok: true };
+  }
+
+  if (pathname === '/hook') return { ok: true };
+  if (!token || headers['x-voicevox-coding-token'] !== token) {
+    return { ok: false, status: 403, error: '認証トークンが一致しません' };
+  }
+  return { ok: true };
+}
+
+export function createServer({ store, engine, queue, log, engineProcess, runtime, commentaryMonitor, onShutdown, port, token }) {
   const sseClients = new Set();
 
   /** 整形して発話キューに積む。ターゲットの設定に従う。 */
@@ -139,6 +206,15 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const { pathname } = url;
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      const verdict = checkMutationRequest({ pathname, headers: req.headers, port, token });
+      if (!verdict.ok) {
+        log.warn(`要求を拒否しました: ${req.method} ${pathname} — ${verdict.error}`);
+        json(res, verdict.status, { error: verdict.error });
+        return;
+      }
+    }
 
     try {
       // --- フック受信 ---

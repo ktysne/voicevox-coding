@@ -2,6 +2,7 @@
 // 常駐デーモンのエントリポイント。
 
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import { ConfigStore, CONFIG_PATH } from './config.js';
 import { Logger } from './logger.js';
 import { VoicevoxEngine } from './voicevox.js';
@@ -70,6 +71,11 @@ function startHealthCheck() {
   healthTimer.unref?.();
 }
 
+const port = store.config.daemon?.port ?? 7591;
+
+// 状態変更 API 用のトークン。起動ごとに変わり、トレイなどローカルクライアントにだけ渡す
+const apiToken = crypto.randomBytes(32).toString('hex');
+
 const server = createServer({
   store,
   engine,
@@ -79,9 +85,9 @@ const server = createServer({
   runtime,
   commentaryMonitor,
   onShutdown: () => shutdown(),
+  port,
+  token: apiToken,
 });
-
-const port = store.config.daemon?.port ?? 7591;
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -103,7 +109,7 @@ server.listen(port, '127.0.0.1', async () => {
   commentaryMonitor.start();
 
   if (store.config.daemon?.tray !== false && !noTray) {
-    tray = new Tray(port, log);
+    tray = new Tray(port, log, apiToken);
     tray.start();
   }
 
