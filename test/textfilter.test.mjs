@@ -158,14 +158,49 @@ test('ドライブレター起点のパスが後続の日本語文を巻き込�
   assert.match(text, /^app\.log と err\.log を確認$/);
 });
 
+test('空白を含むファイル名も 1 つのパスとして扱う（AUD-08）', () => {
+  const { text } = filterText('C:\\logs\\release notes.txt を確認', F);
+  assert.match(text, /^release notes\.txt を確認$/);
+  const omitted = filterText('C:\\logs\\release notes.txt を確認', { ...F, filePath: 'omit' });
+  assert.equal(omitted.text, 'を確認');
+});
+
+test('日本語セグメント内の空白もパスとして扱う（AUD-08）', () => {
+  const { text } = filterText('C:\\日本 語\\file.txt を確認', F);
+  assert.match(text, /^file\.txt を確認$/);
+});
+
+test('区切り文字が混在する Windows パスも従来どおり短縮できる（AUD-08）', () => {
+  const { text } = filterText('C:\\foo/bar.js を確認', F);
+  assert.match(text, /^bar\.js を確認$/);
+  const omitted = filterText('C:\\foo/bar.js を確認', { ...F, filePath: 'omit' });
+  assert.equal(omitted.text, 'を確認');
+});
+
 test('日付はパスとして短縮しない（AUD-08）', () => {
   const { text } = filterText('詳細は 2024/08/09 の記録', F);
   assert.equal(text, '詳細は 2024/08/09 の記録');
 });
 
+test('日本語が直結した日付もパスとして短縮しない（AUD-08）', () => {
+  const { text } = filterText('詳細は2024/08/09の記録', F);
+  assert.equal(text, '詳細は2024/08/09の記録');
+  const omitted = filterText('詳細は2024/08/09の記録', { ...F, filePath: 'omit' });
+  assert.equal(omitted.text, '詳細は2024/08/09の記録');
+});
+
+test('日本語が直結した相対パスはパス部分だけ短縮される（AUD-08）', () => {
+  const { text } = filterText('src/a.jsを更新', F);
+  assert.equal(text, 'a.jsを更新');
+  const omitted = filterText('src/a.jsを更新', { ...F, filePath: 'omit' });
+  assert.equal(omitted.text, 'を更新');
+});
+
 test('A/B のような表記はパスとして短縮しない（AUD-08）', () => {
   const { text } = filterText('A/B テストの結果', F);
   assert.equal(text, 'A/B テストの結果');
+  const noSpace = filterText('A/Bテストの結果', F);
+  assert.equal(noSpace.text, 'A/Bテストの結果');
   const jp = filterText('入力/出力/変換 の処理', F);
   assert.equal(jp.text, '入力/出力/変換 の処理');
 });

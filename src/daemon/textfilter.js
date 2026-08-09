@@ -129,34 +129,38 @@ const MD_EMPHASIS = /(\*\*|__|\*|_|~~)(?=\S)([\s\S]*?\S)\1/g;
 const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE0F}\u{200D}]/gu;
 const BOX_DRAWING = /[─-╿▀-▟]/g;
 
-// パス要素として認める 1 文字。ASCII に限らず、日本語のユーザー名やディレクトリ名
-// （C:\Users\山田\... など）を 1 つのセグメントとして扱えるようにする。
-// 除外するのは区切り文字、Windows のパスに使えない文字（: * ? " < > |）、空白、
-// 日本語の句読点、Markdown のバッククォート、URL 退避の目印 § と、
-// 日本語文の区切りに使われる ASCII の , ; 。
-const PATH_CHAR = String.raw`[^\\/:*?"<>|\s\x60§,;、。，．！？…]`;
+// パス要素から常に除外する文字。区切り文字、Windows のパスに使えない文字
+// （: * ? " < > |）、空白、日本語の句読点、Markdown のバッククォート、
+// URL 退避の目印 § と、日本語文の区切りに使われる ASCII の , ; 。
+const PATH_EXCLUDE = String.raw`\\/:*?"<>|\s\x60§,;、。，．！？…`;
+// ひらがな・カタカナ・漢字。相対パスの判定でだけ追加で除外する。
+const JP_EXCLUDE = String.raw`\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}ー々〆`;
 
-// ひらがな・カタカナ・漢字。セグメント内に空白を許してよいかの判定にだけ使う。
-const JP_CHAR = String.raw`[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}ー々〆]`;
+// ドライブレター起点のパス要素として認める 1 文字。ASCII に限らず、
+// 日本語のユーザー名やディレクトリ名（C:\Users\山田\... など）も 1 要素として扱う。
+const PATH_CHAR = `[^${PATH_EXCLUDE}]`;
 
-const PATH_SEG = `${PATH_CHAR}+`;
-// 空白を含めてよいセグメント。`Program Files` や `My Project` を 1 要素として拾う。
-// 日本語は語の区切りに空白を使わないので、空白の前後どちらかが日本語なら
-// そこはパスではなく本文との境界とみなして打ち切る
-// （`C:\logs\app.log と logs\err.log` の「と」で食い荒らさないため）。
-const PATH_SEG_SPACED = `${PATH_SEG}(?:(?<!${JP_CHAR}) (?!${JP_CHAR})${PATH_SEG})*`;
+// 空白をパス要素の内側とみなしてよい条件。直後の語（次の空白までの連なり）が
+// ASCII 英字か区切り文字を含むときだけ許す。
+// `Program Files`、`Program Files (x86)`、`日本 語\file.txt` は 1 つのパスとして拾い、
+// `app.log と logs\err.log` の「と」のような助詞では打ち切る。
+// 日本語は語の区切りに空白を使わないため、この条件で本文との境界をほぼ言い当てられる。
+// 既知の限界：`C:\temp and see src\a.js` のように英単語だけで文を続けると
+// パスの一部として飲み込む。日本語を前提とする読み上げでは実害が小さいため許容する。
+const PATH_SPACE = String.raw` (?=[^\s]*[A-Za-z\\/])`;
+const PATH_SEG = `${PATH_CHAR}+(?:${PATH_SPACE}${PATH_CHAR}+)*`;
 
-// ドライブレター起点の Windows パス。中間セグメントには空白を許し、
-// 最終セグメントは空白で打ち切る。区切り文字は先頭で確定したものへ揃える
-// （`C:\temp and see src/a.js` のように別の相対パスまで巻き込まないため）。
-const WIN_ABS_PATH = new RegExp(
-  String.raw`[A-Za-z]:([\\/])(?:${PATH_SEG_SPACED}\1)*${PATH_SEG}[\\/]?`,
-  'gu',
-);
+// ドライブレター起点の Windows パス。空白を含むセグメントを許すぶん寛容に扱う。
+// 区切りは `\` と `/` の混在も認める（Node.js も Windows も混在パスを解決できる）。
+const WIN_ABS_PATH = new RegExp(String.raw`[A-Za-z]:[\\/](?:${PATH_SEG}[\\/])*${PATH_SEG}[\\/]?`, 'gu');
 
-// 相対パス。空白まで許すと日本語の文全体を巻き込むため、従来どおり空白は含めない。
+// 相対パス。ドライブレターという目印が無いぶん保守的に扱う。
+// 空白を許すと日本語の文全体を巻き込むため含めず、日本語の文字も要素に含めない。
+// 日本語は語間に空白を置かないので、`詳細は2024/08/09の記録` のように地の文が
+// 直結したとき、どこからがパスかを文字種以外では判別できないため。
 // 先頭のセグメントも含めないと src/daemon/queue.js が「src」と「queue.js」に割れる。
-const REL_PATH = new RegExp(String.raw`${PATH_SEG}(?:[\\/]${PATH_SEG})+[\\/]?`, 'gu');
+const REL_CHAR = `[^${PATH_EXCLUDE}${JP_EXCLUDE}]`;
+const REL_PATH = new RegExp(String.raw`${REL_CHAR}+(?:[\\/]${REL_CHAR}+)+[\\/]?`, 'gu');
 
 const NUMERIC_SEG = /^\d+(?:\.\d+)?$/;
 const EXTENSION = /\.[A-Za-z0-9]{1,10}$/;
@@ -226,7 +230,8 @@ function applyFilePaths(text, mode) {
   };
 
   // ドライブレター起点を先に処理する。先に相対パスを当てると `C:\a\b` の
-  // 途中（`a\b`）だけを拾ってしまう。
+  // 途中（`a\b`）だけを拾ってしまう。ドライブレター側で拾い切れなかった残りは
+  // 相対パスとして処理される。
   const replaced = guarded
     .replace(WIN_ABS_PATH, (m) => shorten(m))
     .replace(REL_PATH, (m) => (isLikelyRelativePath(m) ? shorten(m) : m));
