@@ -1,0 +1,36 @@
+{
+  "upstream": {
+    "repo": "https://github.com/ktysne/ai-cross-review.git",
+    "ref": "main"
+  },
+  "lastSyncedCommit": null,
+  "files": [
+    { "from": "tools/cross-review.js", "to": "tools/cross-review.js" },
+    { "from": "tools/cross-review.sync.js", "to": "tools/cross-review.sync.js" },
+    { "from": "tools/cross-review.sync-all.js", "to": "tools/cross-review.sync-all.js" },
+    { "from": "docs/cross-review.md", "to": "docs/cross-review.md" },
+    { "from": ".cross-review.example.md", "to": ".cross-review.example.md" },
+    { "from": ".claude/skills/cross-review/SKILL.md", "to": ".claude/skills/cross-review/SKILL.md" },
+    {
+      "from": "tests/cross-review.test.js",
+      "to": "tests/tools/cross-review.test.js",
+      "replace": [
+        { "from": "../tools/cross-review.js", "to": "../../tools/cross-review.js" }
+      ]
+    },
+    {
+      "from": "tests/cross-review.sync.test.js",
+      "to": "tests/tools/cross-review.sync.test.js",
+      "replace": [
+        { "from": "../tools/cross-review.sync.js", "to": "../../tools/cross-review.sync.js" }
+      ]
+    },
+    {
+      "from": "tests/cross-review.sync-all.test.js",
+      "to": "tests/tools/cross-review.sync-all.test.js",
+      "replace": [
+        { "from": "../tools/cross-review.sync-all.js", "to": "../../tools/cross-review.sync-all.js" }
+      ]
+    }
+  ]
+}

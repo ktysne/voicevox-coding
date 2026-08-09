@@ -1,0 +1,6 @@
+{
+  "name": "voicevox-coding-tools",
+  "private": true,
+  "description": "tools/*.js は CommonJS (require)。ルート package.json の \"type\": \"module\" の影響を受けないよう、このサブディレクトリで commonjs を明示する (cross-review.js / cross-review.sync.js 用)。",
+  "type": "commonjs"
+}

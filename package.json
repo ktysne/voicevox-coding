@@ -11,7 +11,12 @@
     "start": "node src/daemon/main.js",
     "console": "node src/daemon/main.js --open",
     "test": "node --test test/textfilter.test.mjs test/message-stream.test.mjs test/doctor.test.mjs test/queue.test.mjs test/codex-commentary-monitor.test.mjs",
-    "doctor": "node scripts/doctor.mjs"
+    "doctor": "node scripts/doctor.mjs",
+    "review:codex": "node tools/cross-review.js codex",
+    "review:codex:fix": "node tools/cross-review.js codex --fix",
+    "review:claude": "node tools/cross-review.js claude",
+    "sync": "node tools/cross-review.sync.js",
+    "sync:check": "node tools/cross-review.sync.js --check"
   },
   "engines": {
     "node": ">=20"

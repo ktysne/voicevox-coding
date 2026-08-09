@@ -1,4 +1,11 @@
 node_modules/
+tools/node_modules/
 *.log
 .DS_Store
 Thumbs.db
+
+# CodeGraph の索引 (SQLite DB 等。マシンローカルの生成物なので非同梱)
+/.codegraph/
+
+# Claude Code local settings
+.claude/settings.local.json
