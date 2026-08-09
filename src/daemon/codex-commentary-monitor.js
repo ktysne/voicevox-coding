@@ -137,12 +137,21 @@ export class CodexCommentaryMonitor extends EventEmitter {
     if (!this.running) return;
     const transport = this.transportFactory();
     this.transport = transport;
+    // ポーリングタイマーは接続世代ごとに所有し、その世代の close で必ず解除する。
+    // this.timer だけに頼ると、世代をまたいだときに古いタイマーへの参照を失う。
+    let timer = null;
+    const clearOwnTimer = () => {
+      if (!timer) return;
+      clearInterval(timer);
+      if (this.timer === timer) this.timer = null;
+      timer = null;
+    };
     transport.on?.('close', (err) => {
+      // 既に別世代へ切り替わっていても、この世代のタイマーだけは確実に止める。
+      clearOwnTimer();
       if (transport !== this.transport || !this.running) return;
       this.log?.warn?.(err?.message ?? 'Codex app-server との接続が切れました');
       this.transport = null;
-      clearInterval(this.timer);
-      this.timer = null;
       this.#scheduleRestart();
     });
     try {
@@ -153,10 +162,21 @@ export class CodexCommentaryMonitor extends EventEmitter {
       });
       transport.notify?.('initialized', {});
       if (!this.running || transport !== this.transport) return;
-      await this.scan();
+      await this.scan(transport);
+      // 初回走査の待機中に切断や停止が起きていることがあるため、
+      // タイマーを作る直前にも接続世代を確認する。古い世代はここで手を引く。
+      if (!this.running || transport !== this.transport) return;
       this.backoffMs = 1000;
-      this.timer = setInterval(() => this.scan(), this.pollMs);
-      this.timer.unref?.();
+      timer = setInterval(() => {
+        // 解除漏れへの保険。世代が古くなっていれば走査せず自分自身を止める。
+        if (!this.running || transport !== this.transport) {
+          clearOwnTimer();
+          return;
+        }
+        this.scan(transport);
+      }, this.pollMs);
+      timer.unref?.();
+      this.timer = timer;
     } catch (err) {
       if (!this.running || transport !== this.transport) return;
       this.log?.warn?.(`Codex の途中経過監視を開始できません: ${err.message}`);
@@ -177,20 +197,24 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.restartTimer.unref?.();
   }
 
-  async scan() {
-    if (this.polling || !this.transport) return;
+  /** 引数の transport（接続世代）で走査する。省略時は現在の接続を使う。 */
+  async scan(transport = this.transport) {
+    if (this.polling || !transport || transport !== this.transport) return;
     this.polling = true;
     try {
-      const result = await this.transport.request('thread/list', {
+      const result = await transport.request('thread/list', {
         sourceKinds: ['vscode'], limit: 20, sortKey: 'updated_at',
       });
+      // 待機中に切断されていれば、古い応答は新しい接続へ持ち込まずに捨てる。
+      if (transport !== this.transport) return;
       const threads = result?.data ?? result?.threads ?? [];
       for (const thread of threads) {
         const threadId = thread?.id;
         if (!threadId) continue;
-        const turnsResult = await this.transport.request('thread/turns/list', {
+        const turnsResult = await transport.request('thread/turns/list', {
           threadId, limit: 1, sortDirection: 'desc', itemsView: 'full',
         });
+        if (transport !== this.transport) return;
         const turn = (turnsResult?.data ?? turnsResult?.turns ?? [])[0];
         for (const item of extractCommentaryItems(turn)) {
           const itemKey = `${threadId}:${turn?.id ?? ''}:${item.itemId}`;
