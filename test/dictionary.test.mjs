@@ -324,6 +324,40 @@ test('所有済みの表記を半角から全角へ変えても追加し直さ�
   assert.deepEqual(writes.at(-1).words, { VOICEVOX: 'uuid-keep' });
 });
 
+test('__proto__ や constructor という表記でも所有 uuid を保存できる', async () => {
+  const { writes } = stubState();
+  const engine = new FakeEngine();
+
+  const result = await syncEngineDictionary(engine, [
+    word('__proto__', 'プロト'),
+    word('constructor', 'コンストラクタ'),
+  ]);
+
+  // オブジェクトリテラルでは __proto__ がプロトタイプ指定になるため、キーごとに確かめる
+  const saved = writes.at(-1).words;
+  assert.equal(result.added, 2);
+  assert.deepEqual(Object.keys(saved).sort(), ['__proto__', 'constructor']);
+  assert.equal(Object.getOwnPropertyDescriptor(saved, '__proto__').value, 'uuid-__proto__');
+  assert.equal(saved.constructor, 'uuid-constructor');
+});
+
+test('4xx で拒否された追加は保留せず、直したらすぐ追加し直せる', async () => {
+  const { writes } = stubState();
+  const rejected = Object.assign(new Error('ENGINE が 422 を返しました'), { status: 422 });
+  const engine = new FakeEngine({ onAdd: () => { throw rejected; } });
+
+  await assert.rejects(() => syncEngineDictionary(engine, [word('不正語', 'フセイゴ')]), /422/);
+
+  // 要求ごと拒否されており ENGINE 側に副作用は無い。未確定として抱え込まない
+  assert.equal(writes.at(-1).pending, null);
+
+  engine.onAdd = null;
+  const result = await syncEngineDictionary(engine, [word('不正語', 'フセイゴ')]);
+
+  assert.equal(result.added, 1);
+  assert.deepEqual(result.failed, []);
+});
+
 test('削除に失敗した語は failed に積み、所有を残して次回に持ち越す', async () => {
   const { writes } = stubState({ words: { 消す語: 'uuid-drop' } });
   const engine = new FakeEngine({

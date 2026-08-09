@@ -89,6 +89,22 @@ function ownedKeyFor(owned, surface) {
   return Object.keys(owned).find((k) => normalizeSurface(k) === key) ?? key;
 }
 
+/**
+ * 表記をキーにしたマップを作る。
+ * `__proto__` や `constructor` のような表記でも普通のキーとして扱えるよう、
+ * プロトタイプを持たないオブジェクトにする。
+ */
+function toWordMap(words) {
+  return Object.assign(Object.create(null), words ?? {});
+}
+
+/** 4xx は要求そのものが拒否された合図。副作用が残っていないと判断できる。 */
+function isRejectedRequest(err) {
+  const status = Number(err?.status);
+  // 408 と 429 は再試行前提で、ENGINE 側の処理状況は分からない
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
+}
+
 /** 表記と読みが pending と一致する uuid を列挙する。 */
 function matchingUuids(dict, target) {
   const surface = normalizeSurface(target?.surface);
@@ -104,6 +120,9 @@ function matchingUuids(dict, target) {
 /**
  * ENGINE 側から、この pending の追加で新しく生まれた語を 1 件だけ特定する。
  * 追加前から在った uuid（手動登録の同じ語を含む）は除くので、他人の語を奪わない。
+ *
+ * 追加が実際には失敗し、そのあと利用者が同じ表記と読みを手動登録した場合には、
+ * その語を所有してしまう。これは承知のうえで、二重登録と管理外の語が残るほうを避ける。
  * @returns {string|null} 特定できた uuid。判断できなければ null
  */
 function recoverPendingUuid(dict, pending) {
@@ -135,7 +154,7 @@ async function findOrphanUuid(engine, pending) {
 async function runSync(engine, engineWords) {
   const state = readState();
   // 作業用のコピー。外部 API が成功するたびにここを更新し、その都度 state へ書き戻す
-  const owned = { ...(state.words ?? {}) };
+  const owned = toWordMap(state.words);
   // 追加を試みている語。応答を受け取れないまま落ちても次回の同期で実体を拾えるようにする
   let pending = state.pending ?? null;
   const save = () => writeState({ ...state, words: { ...owned }, pending });
@@ -166,7 +185,7 @@ async function runSync(engine, engineWords) {
   // ここを空辞書で代用すると所有語をすべて未登録とみなして重複登録するので、同期ごと中止する
   let existing;
   try {
-    existing = await engine.userDict();
+    existing = (await engine.userDict()) ?? {};
   } catch (err) {
     throw new Error(`ユーザー辞書の一覧を取得できないため同期を中止しました: ${err.message}`);
   }
@@ -207,7 +226,7 @@ async function runSync(engine, engineWords) {
       priority: Number.isInteger(w.priority) ? w.priority : 8,
     };
     const uuid = owned[key];
-    if (uuid && existing[uuid]) {
+    if (uuid && Object.hasOwn(existing, uuid)) {
       // uuid は変わらないので、途中で失敗しても所有は保たれる
       await engine.updateUserDictWord(uuid, payload);
       result.updated += 1;
@@ -230,8 +249,12 @@ async function runSync(engine, engineWords) {
         if (orphan) {
           owned[key] = orphan;
           pending = null;
-          save();
+        } else if (isRejectedRequest(err)) {
+          // 要求ごと拒否された（読みやアクセントの不備など）。登録は起きていないので
+          // 保留にせず、設定を直したらすぐ追加し直せるようにする
+          pending = null;
         }
+        save();
         throw err;
       }
       owned[key] = newUuid;
@@ -243,9 +266,9 @@ async function runSync(engine, engineWords) {
   }
 
   // 設定から消えた単語を ENGINE 側からも消す
-  for (const [surface, uuid] of Object.entries({ ...owned })) {
+  for (const [surface, uuid] of Object.entries(owned)) {
     if (keep.has(surface)) continue;
-    if (existing[uuid]) {
+    if (Object.hasOwn(existing, uuid)) {
       try {
         await engine.deleteUserDictWord(uuid);
         result.removed += 1;
