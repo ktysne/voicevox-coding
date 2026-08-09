@@ -58,6 +58,21 @@ test('空白区切りやクエリ付き URL は従来どおり丸ごと消える
   assert.doesNotMatch(text, /example\.com/);
 });
 
+test('パスに生の日本語を含む URL は丸ごと置き換わる（クロスレビューで検出した回帰）', () => {
+  const { text } = filterText('参照 https://ja.wikipedia.org/wiki/日本語 を確認', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /を確認/);
+  assert.doesNotMatch(text, /日本語/);
+  assert.doesNotMatch(text, /wikipedia/);
+});
+
+test('国際化ドメイン名の URL も丸ごと置き換わる', () => {
+  const { text } = filterText('参照 https://例え.テスト/ です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /例え/);
+});
+
 test('ファイルパスはファイル名だけ残る（語頭を食わない）', () => {
   const { text } = filterText('src/daemon/queue.js を更新しました', { ...F, inlineCode: 'read' });
   assert.match(text, /^queue\.js を更新しました$/);
