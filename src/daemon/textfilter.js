@@ -141,13 +141,13 @@ const JP_EXCLUDE = String.raw`\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Ha
 const PATH_CHAR = `[^${PATH_EXCLUDE}]`;
 
 // 空白をパス要素の内側とみなしてよい条件。直後の語（次の空白までの連なり）が
-// ASCII 英字か区切り文字を含むときだけ許す。
+// ASCII 英字か区切り文字を含むときだけ許す。全角空白も同じ扱いにする。
 // `Program Files`、`Program Files (x86)`、`日本 語\file.txt` は 1 つのパスとして拾い、
 // `app.log と logs\err.log` の「と」のような助詞では打ち切る。
 // 日本語は語の区切りに空白を使わないため、この条件で本文との境界をほぼ言い当てられる。
 // 既知の限界：`C:\temp and see src\a.js` のように英単語だけで文を続けると
 // パスの一部として飲み込む。日本語を前提とする読み上げでは実害が小さいため許容する。
-const PATH_SPACE = String.raw` (?=[^\s]*[A-Za-z\\/])`;
+const PATH_SPACE = String.raw`[ 　](?=[^\s]*[A-Za-z\\/])`;
 const PATH_SEG = `${PATH_CHAR}+(?:${PATH_SPACE}${PATH_CHAR}+)*`;
 
 // 相対パスの要素。ドライブレターという目印が無いぶん保守的に扱い、
@@ -161,7 +161,9 @@ const REL_CHAR = `[^${PATH_EXCLUDE}${JP_EXCLUDE}]`;
 //   2. 空白も日本語も含まないもの（`app.logを確認` の「を確認」を残す）
 //   3. 日本語だけのディレクトリ名（`C:\Users\山田`）
 // 1 の後方参照で `C:\logs\app.log is missing` の後続本文を飲み込まずに済む。
-const LAST_SEG = `(?:${PATH_SEG}(?<=\\.[A-Za-z0-9]{1,10})|${REL_CHAR}+|${PATH_CHAR}+)`;
+// 拡張子の直後がまだパス要素なら（`file.test-case` の `-`）打ち切らない。
+// 途中で確定すると `file.test` と `-case` に割れてしまう。
+const LAST_SEG = `(?:${PATH_SEG}(?<=\\.[A-Za-z0-9]{1,10})(?!${REL_CHAR})|${REL_CHAR}+|${PATH_CHAR}+)`;
 
 // ドライブレター起点の Windows パスと UNC パス（\\server\share）。
 // 途中のセグメントには空白を許すぶん寛容に扱う。
@@ -178,6 +180,8 @@ const REL_PATH = new RegExp(String.raw`${REL_CHAR}+(?:[\\/]${REL_CHAR}+)+[\\/]?`
 
 const NUMERIC_SEG = /^\d+(?:\.\d+)?$/;
 const EXTENSION = /\.[A-Za-z0-9]{1,10}$/;
+const RELATIVE_PREFIX = /^\.{1,2}[\\/]/;
+const HAS_ASCII_ALNUM = /[A-Za-z0-9]/;
 
 function pathSegments(m) {
   return m.split(/[\\/]/).filter(Boolean);
@@ -190,6 +194,7 @@ function pathSegments(m) {
 function isLikelyRelativePath(m) {
   const parts = pathSegments(m);
   if (parts.length < 2) return false;
+  if (RELATIVE_PREFIX.test(m)) return true; // ./src ../lib は明確なパス表現
   if (parts.every((p) => NUMERIC_SEG.test(p))) return false; // 日付や分数
   if (EXTENSION.test(parts[parts.length - 1])) return true; // 拡張子付きならパス
   const seps = (m.match(/[\\/]/g) || []).length;
@@ -296,10 +301,14 @@ function applyFilePaths(text, mode) {
   const shorten = (m, requireLikely) => {
     const { lead, core, trail } = splitOuterBrackets(m);
     if (!core || (requireLikely && !isLikelyRelativePath(core))) return m;
-    if (mode === 'omit') return `${lead} ${trail}`;
     const parts = pathSegments(core);
     if (!parts.length) return m;
-    return lead + parts[parts.length - 1] + trail;
+    const last = parts[parts.length - 1];
+    // 最終要素が ASCII 英数字を含まない（日本語だけの）場合、ディレクトリ名なのか
+    // 直結した地の文なのかを判別できない。omit でも最終要素だけは残し、
+    // `C:\Users\山田\資料を確認` の「を確認」ごと消してしまう事故を避ける。
+    if (mode === 'omit') return HAS_ASCII_ALNUM.test(last) ? `${lead} ${trail}` : `${lead} ${last}${trail}`;
+    return lead + last + trail;
   };
 
   // 絶対パス（ドライブレターと UNC）を先に処理する。先に相対パスを当てると

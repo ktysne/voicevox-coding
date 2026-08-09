@@ -191,6 +191,33 @@ test('絶対パス直後に英文が続いても後続本文は残る（AUD-08�
   assert.equal(omitted.text, 'is missing');
 });
 
+test('日本語だけの最終要素は omit でも本文ごと消さない（AUD-08）', () => {
+  const { text } = filterText('C:\\Users\\山田\\資料を確認', { ...F, filePath: 'omit' });
+  assert.match(text, /を確認/);
+});
+
+test('全角空白を含むパスも 1 つのパスとして扱う（AUD-08）', () => {
+  const { text } = filterText('C:\\日本　語\\file.txt を確認', F);
+  assert.match(text, /^file\.txt を確認$/);
+  const omitted = filterText('C:\\日本　語\\file.txt を確認', { ...F, filePath: 'omit' });
+  assert.equal(omitted.text, 'を確認');
+});
+
+test('拡張子らしい途中位置でファイル名が割れない（AUD-08）', () => {
+  const { text } = filterText('C:\\logs\\file.test-case を確認', F);
+  assert.match(text, /^file\.test-case を確認$/);
+  const omitted = filterText('C:\\logs\\file.test-case を確認', { ...F, filePath: 'omit' });
+  assert.equal(omitted.text, 'を確認');
+  const dated = filterText('C:\\logs\\report.2026-08-10 を確認', { ...F, filePath: 'omit' });
+  assert.equal(dated.text, 'を確認');
+});
+
+test('./ や ../ 起点の相対パスも短縮される（AUD-08）', () => {
+  assert.match(filterText('./src を確認', F).text, /^src を確認$/);
+  assert.match(filterText('../lib を確認', F).text, /^lib を確認$/);
+  assert.match(filterText('./src/index.js を更新', F).text, /^index\.js を更新$/);
+});
+
 test('UNC パスもファイル名だけになる（AUD-08）', () => {
   const { text } = filterText('\\\\server\\share\\docs\\a.txt を開く', F);
   assert.match(text, /^a\.txt を開く$/);
