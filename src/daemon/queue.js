@@ -168,7 +168,11 @@ export class SpeechQueue extends EventEmitter {
     const cfg = this.getConfig();
     const useCache = cfg.daemon?.cacheEnabled !== false;
     const key = this.#cacheKey(text, utterance.speaker, utterance.voice);
-    const file = path.join(CACHE_DIR, `${key}.wav`);
+    // キャッシュ無効時は発話専用の一時ファイルにする。再生後に削除するので蓄積しない。
+    // (キャッシュキーは hex なので tmp- と衝突しない)
+    const file = useCache
+      ? path.join(CACHE_DIR, `${key}.wav`)
+      : path.join(CACHE_DIR, `tmp-${process.pid}-${utterance.id}-${index}.wav`);
 
     if (useCache && fs.existsSync(file)) {
       try {
@@ -185,7 +189,37 @@ export class SpeechQueue extends EventEmitter {
     fs.writeFileSync(tmp, wav);
     fs.renameSync(tmp, file);
     if (useCache) this.#pruneCache(cfg.daemon?.cacheMaxEntries ?? 300);
-    return { file, durationMs: wavDurationMs(wav) };
+    return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache };
+  }
+
+  /** 一時 WAV を削除する。再生ワーカーは PLAY 時に全体をメモリへ読むので、再生後の削除は安全。 */
+  #discardAudio(audio) {
+    if (!audio?.ephemeral) return;
+    fs.unlink(audio.file, () => {});
+  }
+
+  /** 消費されなかった先読みの一時 WAV も削除する。 */
+  #discardPrefetch(utterance) {
+    const pre = utterance.prefetch;
+    utterance.prefetch = null;
+    if (!pre?.promise) return;
+    Promise.resolve(pre.promise).then((a) => this.#discardAudio(a), () => {});
+  }
+
+  /**
+   * 前回の実行が残した一時 WAV (tmp-*.wav と書きかけの *.tmp) を掃除する。
+   * デーモンはポート重複で多重起動しないので、起動時にまとめて消してよい。
+   */
+  cleanupEphemeral() {
+    try {
+      for (const f of fs.readdirSync(CACHE_DIR)) {
+        if ((f.startsWith('tmp-') && f.endsWith('.wav')) || f.endsWith('.tmp')) {
+          try {
+            fs.unlinkSync(path.join(CACHE_DIR, f));
+          } catch {}
+        }
+      }
+    } catch {}
   }
 
   #pruneCache(maxEntries) {
@@ -237,15 +271,23 @@ export class SpeechQueue extends EventEmitter {
 
           let audio;
           try {
-            audio = utterance.prefetch?.index === i
-              ? await utterance.prefetch.promise
-              : await this.#synthesizeChunk(utterance, i);
+            // 先読みは消費と同時に手放す (後段の #discardPrefetch と二重処理しない)
+            const pre = utterance.prefetch;
+            if (pre?.index === i) {
+              utterance.prefetch = null;
+              audio = await pre.promise;
+            } else {
+              audio = await this.#synthesizeChunk(utterance, i);
+            }
           } catch (err) {
             this.log?.warn(`合成に失敗しました: ${err.message}`);
             this.emit('error', err);
             break;
           }
-          if (!audio || this.skipRequested) break;
+          if (!audio || this.skipRequested) {
+            this.#discardAudio(audio);
+            break;
+          }
 
           // 再生している間に次チャンクを先に合成しておく
           if (i + 1 < utterance.chunks.length) {
@@ -262,10 +304,12 @@ export class SpeechQueue extends EventEmitter {
           } catch (err) {
             this.log?.warn(`再生に失敗しました: ${err.message}`);
             await stopHold();
+            this.#discardAudio(audio);
             break;
           }
 
           await this.#waitPlayback(audio.durationMs ?? 1500);
+          this.#discardAudio(audio);
 
           // 次チャンクまたは次発話がある間だけ、再生完了直後から無音をループする。
           // skip/clear 後は STOP 済みなので HOLD を開始しない。
@@ -284,7 +328,7 @@ export class SpeechQueue extends EventEmitter {
           }
         }
 
-        utterance.prefetch = null;
+        this.#discardPrefetch(utterance);
         // 最終チャンク後に次発話があれば HOLD を次の PLAY まで維持する。
         // キューが空になった場合や skip/clear で抜けた場合だけ停止する。
         if (this.skipRequested || this.queue.length === 0) await stopHold();

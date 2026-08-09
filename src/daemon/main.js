@@ -35,6 +35,7 @@ player.start();
 
 const queue = new SpeechQueue(engine, player, () => store.config, log);
 queue.on('error', (err) => log.warn(`合成エラー: ${err.message}`));
+queue.cleanupEphemeral();
 const commentaryMonitor = new CodexCommentaryMonitor({ log });
 
 let tray = null;
