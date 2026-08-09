@@ -25,12 +25,34 @@ function toolAllowed(toolName, filter) {
 const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PermissionRequest']);
 
 /**
- * 繰り返しの入れ子（`(a+)+` のような書き方）を大まかに見つける。
- * この形は入力が少し伸びるだけで照合時間が指数的に増え、デーモンは 1 スレッドなので
- * 読み上げどころか HTTP API ごと止まる。判定は控えめな見当で、取りこぼしも空振りもありうる。
+ * グループ全体を繰り返す書き方（`(a+)+`、`(a|aa)+`、`(\s*x){2,}` など）を見つける。
+ * 照合時間が入力の長さに対して指数的に伸びるのは、繰り返しが入れ子になったときで、
+ * それには必ずグループへの繰り返しが要る。デーモンは 1 スレッドなので、これを踏むと
+ * 読み上げどころか HTTP API ごと固まる。個別の危なさを見分けるのは難しいので、
+ * グループの繰り返しは一律で断る（`(abc)?` のように繰り返さないものは通す）。
  */
-const NESTED_REPEAT = /\((?:[^()\\]|\\.)*(?:[*+]|\{\d+,\})(?:[^()\\]|\\.)*\)(?:[*+]|\{\d+,\})/;
+export function hasRepeatedGroup(pattern) {
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i += 1) {
+    const c = pattern[i];
+    if (c === '\\') {
+      i += 1; // エスケープされた 1 文字は読み飛ばす
+      continue;
+    }
+    if (inClass) {
+      if (c === ']') inClass = false;
+      continue;
+    }
+    if (c === '[') {
+      inClass = true;
+      continue;
+    }
+    if (c === ')' && '*+{'.includes(pattern[i + 1] ?? '')) return true;
+  }
+  return false;
+}
 
+/** 無視パターンとして使えるか。使えないときは理由を返す。 */
 export function ignorePatternError(pattern) {
   if (typeof pattern !== 'string' || pattern === '') return null;
   try {
@@ -38,8 +60,8 @@ export function ignorePatternError(pattern) {
   } catch (err) {
     return `正規表現として解釈できません: ${err.message}`;
   }
-  if (NESTED_REPEAT.test(pattern)) {
-    return '繰り返しの入れ子（(a+)+ のような書き方）は照合が極端に遅くなることがあるため使えません';
+  if (hasRepeatedGroup(pattern)) {
+    return 'グループ全体を繰り返す書き方（(a+)+ や (a|aa)+ など）は照合が極端に遅くなることがあるため使えません';
   }
   return null;
 }

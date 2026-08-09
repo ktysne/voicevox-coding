@@ -216,20 +216,26 @@ test('無視パターンが配列でなくても落ちない', () => {
   assert.equal(resolveStop('作業が終わりました。', [null, 3, {}]).speak, true);
 });
 
-test('繰り返しが入れ子のパターンは使わない', () => {
-  // (a+)+$ のような書き方は照合が指数的に遅くなる。飛ばしてすぐ返ること
-  const started = Date.now();
-  const r = resolveStop(`${'a'.repeat(40)}!`, ['(a+)+$']);
-  assert.equal(r.speak, true);
-  assert.ok(Date.now() - started < 1000);
+test('グループを繰り返すパターンは使わない', () => {
+  // (a+)+$ や (a|aa)+$ は照合が指数的に遅くなる。飛ばしてすぐ返ること
+  for (const pattern of ['(a+)+$', '(a|aa)+$', '(a*)*$', '(a|aa){2,}$']) {
+    const started = Date.now();
+    const r = resolveStop(`${'a'.repeat(40)}!`, [pattern]);
+    assert.equal(r.speak, true, pattern);
+    assert.ok(Date.now() - started < 1000, `${pattern} で時間がかかりすぎ`);
+  }
 });
 
 test('無視パターンの検証は理由を返す', () => {
   assert.equal(ignorePatternError('^実行ログ'), null);
   assert.equal(ignorePatternError(''), null);
+  assert.equal(ignorePatternError('^(実行ログ|ログ)?完了'), null); // 繰り返さないグループは使える
+  assert.equal(ignorePatternError('^[(){}*+]+'), null); // 文字クラスの中の記号は量指定子ではない
+  assert.equal(ignorePatternError('^\\(a\\)+'), null); // エスケープした括弧も同様
   assert.match(ignorePatternError('['), /解釈できません/);
-  assert.match(ignorePatternError('(a+)+'), /入れ子/);
-  assert.equal(ignorePatternError('(foo|bar)+'), null);
+  for (const pattern of ['(a+)+', '(a|aa)+', '(?:ab)*', '(x){2,}']) {
+    assert.match(ignorePatternError(pattern), /グループ全体を繰り返す/, pattern);
+  }
 });
 
 test('ターゲット全体を無効にすると読み上げない', () => {

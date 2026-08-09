@@ -84,9 +84,6 @@ function toast(message, isError = false) {
 
 let saveTimer;
 let savePending = false;
-// 自分の保存でも config の SSE 通知が返ってくる。これで再描画すると入力中の欄から
-// フォーカスが飛ぶので、保存の前後しばらくは通知を捨てる（デーモン側のウォッチャー抑止と同じ考え方）。
-let suppressConfigUntil = 0;
 
 function scheduleSave() {
   savePending = true;
@@ -98,10 +95,8 @@ function scheduleSave() {
 async function saveNow() {
   if (!savePending) return;
   savePending = false;
-  suppressConfigUntil = Date.now() + 1500;
   try {
     await api('/api/config', { method: 'PUT', body: JSON.stringify(state.config) });
-    suppressConfigUntil = Date.now() + 1000;
     $('#save-indicator').textContent = '保存しました';
     setTimeout(() => {
       if (!savePending) $('#save-indicator').textContent = '';
@@ -364,10 +359,29 @@ function renderToolFilterCard(targetId, base, profile) {
   );
 }
 
-// 繰り返しの入れ子（(a+)+ のような書き方）を大まかに見つける。
-// ブラウザからは daemon のモジュールを読めないので、src/daemon/events.js の同名の定数を写している。
-// 片方を直したらもう片方も直すこと。
-const NESTED_REPEAT = /\((?:[^()\\]|\\.)*(?:[*+]|\{\d+,\})(?:[^()\\]|\\.)*\)(?:[*+]|\{\d+,\})/;
+// グループ全体を繰り返す書き方を見つける。この形だけが照合時間を指数的に伸ばせる。
+// ブラウザからは daemon のモジュールを読めないので、src/daemon/events.js の同名の関数を写している。
+// 片方を直したらもう片方も直すこと（読み上げ側の判定はあくまで events.js が持つ）。
+function hasRepeatedGroup(pattern) {
+  let inClass = false;
+  for (let i = 0; i < pattern.length; i += 1) {
+    const c = pattern[i];
+    if (c === '\\') {
+      i += 1;
+      continue;
+    }
+    if (inClass) {
+      if (c === ']') inClass = false;
+      continue;
+    }
+    if (c === '[') {
+      inClass = true;
+      continue;
+    }
+    if (c === ')' && '*+{'.includes(pattern[i + 1] ?? '')) return true;
+  }
+  return false;
+}
 
 function ignorePatternError(pattern) {
   if (!pattern) return null;
@@ -376,8 +390,8 @@ function ignorePatternError(pattern) {
   } catch (err) {
     return `正規表現として解釈できません: ${err.message}`;
   }
-  if (NESTED_REPEAT.test(pattern)) {
-    return '繰り返しの入れ子（(a+)+ のような書き方）は照合が極端に遅くなることがあるため使えません';
+  if (hasRepeatedGroup(pattern)) {
+    return 'グループ全体を繰り返す書き方（(a+)+ や (a|aa)+ など）は照合が極端に遅くなることがあるため使えません';
   }
   return null;
 }
@@ -387,7 +401,14 @@ function ignorePatternError(pattern) {
  * 駄目なら行の下に理由を出す（保存自体は止めない。あとから直せるように）。
  */
 function ignorePatternRow(base, pattern, index) {
-  const error = h('span', { class: 'hint', style: 'margin:6px 0 0;color:var(--err)' });
+  const errorId = `${base.replace(/\./g, '-')}-ignore-error-${index}`;
+  const error = h('span', {
+    class: 'hint',
+    style: 'margin:6px 0 0;color:var(--err)',
+    id: errorId,
+    role: 'status', // 入力中に出る文言なので、読み上げソフトにも伝わるようにする
+    'aria-live': 'polite',
+  });
   const validate = (value) => {
     error.textContent = ignorePatternError(value) ?? '';
   };
@@ -402,6 +423,7 @@ function ignorePatternRow(base, pattern, index) {
         'data-path': `${base}.ignorePatterns.${index}`,
         value: pattern ?? '',
         placeholder: '例: ^バックグラウンドタスクの実行ログ',
+        'aria-describedby': errorId,
         oninput: (e) => validate(e.target.value),
       }),
       error),
@@ -866,9 +888,11 @@ function connectStream() {
   });
   es.addEventListener('log', (e) => appendLog(JSON.parse(e.data)));
   es.addEventListener('config', (e) => {
-    // 外部エディタでの編集を反映する。入力中の上書きを避けるため、保存待ちのときと
-    // 自分の保存で返ってきた通知（直前に保存したとき）は無視する
-    if (savePending || Date.now() < suppressConfigUntil) return;
+    // 外部エディタでの編集を反映する。入力中の上書きを避けるため保存待ちのときは無視する
+    if (savePending) return;
+    // 自分の保存でも通知は返ってくる。中身が手元と同じなら描き直さない
+    // （描き直すと入力中の欄からフォーカスが飛ぶ）。外部の変更なら中身が違うので通る。
+    if (e.data === JSON.stringify(state.config)) return;
     state.config = JSON.parse(e.data);
     renderActivePanel();
   });
