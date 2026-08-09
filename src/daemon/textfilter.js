@@ -129,9 +129,55 @@ const MD_EMPHASIS = /(\*\*|__|\*|_|~~)(?=\S)([\s\S]*?\S)\1/g;
 const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE0F}\u{200D}]/gu;
 const BOX_DRAWING = /[─-╿▀-▟]/g;
 
-// パス「らしい」文字列。区切りが 1 つ以上ある連なりを 1 つのパスとして捉える。
+// パス要素として認める 1 文字。ASCII に限らず、日本語のユーザー名やディレクトリ名
+// （C:\Users\山田\... など）を 1 つのセグメントとして扱えるようにする。
+// 除外するのは区切り文字、Windows のパスに使えない文字（: * ? " < > |）、空白、
+// 日本語の句読点、Markdown のバッククォート、URL 退避の目印 § と、
+// 日本語文の区切りに使われる ASCII の , ; 。
+const PATH_CHAR = String.raw`[^\\/:*?"<>|\s\x60§,;、。，．！？…]`;
+
+// ひらがな・カタカナ・漢字。セグメント内に空白を許してよいかの判定にだけ使う。
+const JP_CHAR = String.raw`[\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}ー々〆]`;
+
+const PATH_SEG = `${PATH_CHAR}+`;
+// 空白を含めてよいセグメント。`Program Files` や `My Project` を 1 要素として拾う。
+// 日本語は語の区切りに空白を使わないので、空白の前後どちらかが日本語なら
+// そこはパスではなく本文との境界とみなして打ち切る
+// （`C:\logs\app.log と logs\err.log` の「と」で食い荒らさないため）。
+const PATH_SEG_SPACED = `${PATH_SEG}(?:(?<!${JP_CHAR}) (?!${JP_CHAR})${PATH_SEG})*`;
+
+// ドライブレター起点の Windows パス。中間セグメントには空白を許し、
+// 最終セグメントは空白で打ち切る。区切り文字は先頭で確定したものへ揃える
+// （`C:\temp and see src/a.js` のように別の相対パスまで巻き込まないため）。
+const WIN_ABS_PATH = new RegExp(
+  String.raw`[A-Za-z]:([\\/])(?:${PATH_SEG_SPACED}\1)*${PATH_SEG}[\\/]?`,
+  'gu',
+);
+
+// 相対パス。空白まで許すと日本語の文全体を巻き込むため、従来どおり空白は含めない。
 // 先頭のセグメントも含めないと src/daemon/queue.js が「src」と「queue.js」に割れる。
-const FILE_PATH = /(?:[A-Za-z]:[\\/])?[\w.@+-]+(?:[\\/][\w.@+-]+)+[\\/]?/g;
+const REL_PATH = new RegExp(String.raw`${PATH_SEG}(?:[\\/]${PATH_SEG})+[\\/]?`, 'gu');
+
+const NUMERIC_SEG = /^\d+(?:\.\d+)?$/;
+const EXTENSION = /\.[A-Za-z0-9]{1,10}$/;
+
+function pathSegments(m) {
+  return m.split(/[\\/]/).filter(Boolean);
+}
+
+/**
+ * 相対パスらしさの判定。ドライブレターという明確な目印が無いぶん保守的に扱い、
+ * 日付（2024/08/09）や `A/B テスト` のような表記をパスとみなさない。
+ */
+function isLikelyRelativePath(m) {
+  const parts = pathSegments(m);
+  if (!parts.length) return false;
+  if (parts.every((p) => NUMERIC_SEG.test(p))) return false; // 日付や分数
+  if (EXTENSION.test(parts[parts.length - 1])) return true; // 拡張子付きなら 1 段でもパス
+  const seps = (m.match(/[\\/]/g) || []).length;
+  // 区切りが 2 つ以上あり、かつ ASCII 英数字を含むもの（`入力/出力/変換` は除く）
+  return seps >= 2 && /[A-Za-z0-9]/.test(m);
+}
 
 // URL を一時退避するときの目印。区切り文字も \w も含まないので、
 // パス判定にも Markdown 記号の除去にも巻き込まれない。
@@ -173,11 +219,17 @@ function applyFilePaths(text, mode) {
     return PARK_OPEN + (parked.length - 1) + PARK_CLOSE;
   });
 
-  const replaced = guarded.replace(FILE_PATH, (m) => {
+  const shorten = (m) => {
     if (mode === 'omit') return ' ';
-    const parts = m.split(/[\\/]/).filter(Boolean);
+    const parts = pathSegments(m);
     return parts.length ? parts[parts.length - 1] : ' ';
-  });
+  };
+
+  // ドライブレター起点を先に処理する。先に相対パスを当てると `C:\a\b` の
+  // 途中（`a\b`）だけを拾ってしまう。
+  const replaced = guarded
+    .replace(WIN_ABS_PATH, (m) => shorten(m))
+    .replace(REL_PATH, (m) => (isLikelyRelativePath(m) ? shorten(m) : m));
 
   return replaced.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
 }

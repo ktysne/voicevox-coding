@@ -126,6 +126,55 @@ test('Windows のフルパスもファイル名だけになる', () => {
   assert.doesNotMatch(text, /Desktop/);
 });
 
+test('日本語と空白を含む Windows パスもファイル名だけになる（AUD-08）', () => {
+  const { text } = filterText('C:\\Users\\山田\\My Project\\src\\index.ts を更新', F);
+  assert.match(text, /index\.ts を更新/);
+  assert.doesNotMatch(text, /山田/);
+  assert.doesNotMatch(text, /My/);
+});
+
+test('Program Files のような空白入りパスもファイル名だけになる（AUD-08）', () => {
+  const { text } = filterText('C:\\Program Files\\nodejs\\node.exe を使います', F);
+  assert.match(text, /^node\.exe を使います$/);
+});
+
+test('括弧と空白を含むパスもファイル名だけになる（AUD-08）', () => {
+  const { text } = filterText('C:\\Program Files (x86)\\nodejs\\node.exe', F);
+  assert.equal(text, 'node.exe');
+});
+
+test('空白を含むリポジトリ名のパスもファイル名だけになる（AUD-08）', () => {
+  const { text } = filterText('D:\\repos\\My Awesome Repo\\src\\main.js を確認', F);
+  assert.match(text, /^main\.js を確認$/);
+});
+
+test('omit なら日本語と空白を含むパスごと消える（AUD-08）', () => {
+  const { text } = filterText('C:\\Users\\山田\\My Project\\src\\index.ts を更新', { ...F, filePath: 'omit' });
+  assert.equal(text, 'を更新');
+});
+
+test('ドライブレター起点のパスが後続の日本語文を巻き込まない（AUD-08）', () => {
+  const { text } = filterText('C:\\logs\\app.log と logs\\err.log を確認', F);
+  assert.match(text, /^app\.log と err\.log を確認$/);
+});
+
+test('日付はパスとして短縮しない（AUD-08）', () => {
+  const { text } = filterText('詳細は 2024/08/09 の記録', F);
+  assert.equal(text, '詳細は 2024/08/09 の記録');
+});
+
+test('A/B のような表記はパスとして短縮しない（AUD-08）', () => {
+  const { text } = filterText('A/B テストの結果', F);
+  assert.equal(text, 'A/B テストの結果');
+  const jp = filterText('入力/出力/変換 の処理', F);
+  assert.equal(jp.text, '入力/出力/変換 の処理');
+});
+
+test('相対パスの既存挙動は変わらない（AUD-08）', () => {
+  const { text } = filterText('test/textfilter.test.mjs と src/daemon/queue.js を更新', { ...F, inlineCode: 'read' });
+  assert.match(text, /^textfilter\.test\.mjs と queue\.js を更新$/);
+});
+
 test('URL を read にしてもパス判定に食われない', () => {
   const { text } = filterText('参照: https://example.com/docs/guide', { ...F, url: 'read' });
   assert.match(text, /https:\/\/example\.com\/docs\/guide/);
