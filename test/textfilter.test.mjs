@@ -217,38 +217,44 @@ test('無視パターンが配列でなくても落ちない', () => {
 });
 
 // 照合が終わらないパターン。繰り返しを並べるほど重くなる。
-// 一度時間切れになったものは次から短い枠で試されるので、テストごとに違う数で作る。
 const heavy = (repeats) => `${'a*'.repeat(repeats)}X`;
+// 時間切れの記録はモジュールに溜まるので、時間を測るテストは毎回まっさらから始める。
+const LONG_TEXT = `${'a'.repeat(4000)}!`;
+
+/** 経過時間をミリ秒で測る。数ミリ秒を見るので performance.now を使う。 */
+function measure(fn) {
+  const started = performance.now();
+  const value = fn();
+  return { value, ms: performance.now() - started };
+}
 
 test('照合が終わらないパターンは時間で打ち切る', () => {
   // 素の RegExp では終わらない書き方。打ち切って読み上げに進むこと。
   // (a+)+$ は繰り返しの入れ子、a*a*X はグループ無しでも計算量が跳ねる例。
-  const text = `${'a'.repeat(4000)}!`;
+  resetIgnoreMatchState();
   for (const pattern of ['(a+)+$', '(a|aa)+$', heavy(2), '^a*a*a*a*a*a*a*a*X$']) {
-    const started = Date.now();
-    const r = resolveStop(text, [pattern]);
-    assert.equal(r.speak, true, pattern);
-    assert.ok(
-      Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3,
-      `${pattern} の打ち切りに ${Date.now() - started}ms かかった`,
-    );
+    const { value, ms } = measure(() => resolveStop(LONG_TEXT, [pattern]));
+    assert.equal(value.speak, true, pattern);
+    assert.ok(ms < IGNORE_MATCH_BUDGET_MS * 3, `${pattern} の打ち切りに ${ms}ms かかった`);
   }
 });
 
 test('打ち切りの予算はパターン全体で共有する', () => {
   // 重いパターンを並べても、1 回の判定にかかる時間は予算の範囲に収まること
+  resetIgnoreMatchState();
   const patterns = Array.from({ length: 5 }, (_, i) => heavy(3 + i));
-  const started = Date.now();
-  assert.equal(resolveStop(`${'a'.repeat(4000)}!`, patterns).speak, true);
-  assert.ok(Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3, `${Date.now() - started}ms かかった`);
+  const { value, ms } = measure(() => resolveStop(LONG_TEXT, patterns));
+  assert.equal(value.speak, true);
+  assert.ok(ms < IGNORE_MATCH_BUDGET_MS * 3, `${ms}ms かかった`);
 });
 
 test('空のパターンが並んでいても予算を超えない', () => {
   // 予算切れの判定を空文字より先に行っていること
+  resetIgnoreMatchState();
   const patterns = [heavy(9), ...Array.from({ length: 10000 }, () => '')];
-  const started = Date.now();
-  assert.equal(resolveStop(`${'a'.repeat(4000)}!`, patterns).speak, true);
-  assert.ok(Date.now() - started < IGNORE_MATCH_BUDGET_MS * 3, `${Date.now() - started}ms かかった`);
+  const { value, ms } = measure(() => resolveStop(LONG_TEXT, patterns));
+  assert.equal(value.speak, true);
+  assert.ok(ms < IGNORE_MATCH_BUDGET_MS * 3, `${ms}ms かかった`);
 });
 
 test('使えなかった無視パターンは理由が残る', () => {
@@ -269,21 +275,16 @@ test('理由の文面は長いパターンを短く切る', () => {
 
 test('時間切れになったパターンは次から短い時間で試す', () => {
   resetIgnoreMatchState();
-  const text = `${'a'.repeat(4000)}!`;
   const pattern = heavy(10);
-  const first = Date.now();
-  const r1 = resolveStop(text, [pattern]);
-  const firstMs = Date.now() - first;
-  assert.match(r1.problems[0], /時間内に終わりません/);
-  assert.ok(firstMs >= IGNORE_MATCH_PATTERN_MS / 2, `${firstMs}ms しかかかっていない`);
+  const first = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  assert.match(first.value.problems[0], /時間内に終わりません/);
+  assert.ok(first.ms >= IGNORE_MATCH_PATTERN_MS / 2, `${first.ms}ms しかかかっていない`);
 
   // 2 回目は短い時間で打ち切る。絶対値ではなく初回との比で見る（実行環境の速さに左右されないように）
-  const second = Date.now();
-  const r2 = resolveStop(text, [pattern]);
-  const secondMs = Date.now() - second;
-  assert.equal(r2.speak, true);
-  assert.match(r2.problems[0], /時間内に終わりません/);
-  assert.ok(secondMs < firstMs / 2, `初回 ${firstMs}ms に対して 2 回目が ${secondMs}ms`);
+  const second = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  assert.equal(second.value.speak, true);
+  assert.match(second.value.problems[0], /時間内に終わりません/);
+  assert.ok(second.ms < first.ms / 2, `初回 ${first.ms}ms に対して 2 回目が ${second.ms}ms`);
 
   // 本文が短ければ短い枠でも間に合うので、同じパターンがちゃんと効く
   const short = resolveStop('aaX', [pattern]);
@@ -292,24 +293,20 @@ test('時間切れになったパターンは次から短い時間で試す', ()
   assert.deepEqual(short.problems, []);
 
   // 短い本文で間に合っても枠は戻さない。長短が交互に来ても毎回止まらないこと
-  const third = Date.now();
-  assert.equal(resolveStop(text, [pattern]).speak, true);
-  assert.ok(Date.now() - third < firstMs / 2, `${Date.now() - third}ms かかった`);
+  const third = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  assert.equal(third.value.speak, true);
+  assert.ok(third.ms < first.ms / 2, `${third.ms}ms かかった`);
 });
 
-test('設定を直したら時間切れの記録は測り直す', () => {
-  const text = `${'a'.repeat(4000)}!`;
+test('記録を捨てると時間切れのパターンをまた測り直す', () => {
+  resetIgnoreMatchState();
   const pattern = heavy(12);
-  assert.match(resolveStop(text, [pattern]).problems[0], /時間内に終わりません/);
-
-  const shortLeash = Date.now();
-  resolveStop(text, [pattern]);
-  const shortLeashMs = Date.now() - shortLeash;
+  assert.match(resolveStop(LONG_TEXT, [pattern]).problems[0], /時間内に終わりません/);
+  const shortLeash = measure(() => resolveStop(LONG_TEXT, [pattern]));
 
   resetIgnoreMatchState();
-  const again = Date.now();
-  resolveStop(text, [pattern]);
-  assert.ok(Date.now() - again > shortLeashMs, '記録を捨てたのに短い枠のままだった');
+  const again = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  assert.ok(again.ms > shortLeash.ms * 2, `捨てる前 ${shortLeash.ms}ms、捨てた後 ${again.ms}ms`);
 });
 
 test('重いパターンの後ろでも軽いパターンは判定される', () => {

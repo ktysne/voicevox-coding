@@ -365,7 +365,7 @@ function ignorePatternError(pattern) {
     new RegExp(pattern);
   } catch {
     // ブラウザの例外メッセージは英語なので、そのまま出さずに日本語で言い換える
-    return '正規表現として解釈できません。括弧や角括弧の対応を確認してください';
+    return '正規表現として解釈できません。書き方を確認してください';
   }
   return null;
 }
@@ -379,7 +379,7 @@ function ignorePatternRow(base, pattern, index) {
   const errorId = `${base.replace(/\./g, '-')}-ignore-error-${index}`;
   const error = h('span', {
     class: 'hint',
-    style: 'margin:6px 0 0;color:var(--err)',
+    style: 'display:block;margin:6px 0 0;color:var(--err)',
     id: errorId,
     // 入力欄から aria-describedby で参照する。role="status" と併用すると二重に読まれる
     'aria-live': 'polite',

@@ -52,7 +52,7 @@ export function resetIgnoreMatchState() {
 }
 
 /** ログに載せるための短縮。設定はいくらでも長く書けるので、そのまま出さない。 */
-function preview(pattern) {
+function shorten(pattern) {
   return pattern.length > 40 ? `${pattern.slice(0, 40)}…` : pattern;
 }
 
@@ -92,16 +92,17 @@ export function matchesIgnorePattern(text, patterns, problems = []) {
         // 理由の文面は毎回同じにする（呼び出し側の重複抑止が効くように）。
         // vm の中で起きたエラーは別の realm のものなので、instanceof ではなくコードで見分ける
         if (err?.code === 'ERR_SCRIPT_EXECUTION_TIMEOUT') {
-          if (timedOutPatterns.size >= TIMED_OUT_LIMIT) {
+          // すでに覚えているパターンなら数は増えない。捨てるのは新しく覚えるときだけ
+          if (!timedOutPatterns.has(pattern) && timedOutPatterns.size >= TIMED_OUT_LIMIT) {
             for (const oldest of timedOutPatterns) {
               timedOutPatterns.delete(oldest);
               break;
             }
           }
           timedOutPatterns.add(pattern);
-          problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は、照合が時間内に終わりません`);
+          problems.push(`無視パターン ${index + 1}（${shorten(pattern)}）は、照合が時間内に終わりません`);
         } else {
-          problems.push(`無視パターン ${index + 1}（${preview(pattern)}）は正規表現として解釈できません`);
+          problems.push(`無視パターン ${index + 1}（${shorten(pattern)}）は正規表現として解釈できません`);
         }
       }
     }

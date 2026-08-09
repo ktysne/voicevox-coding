@@ -63,10 +63,19 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   // 同じ警告を発話のたびに出すとログが埋まるので、一度出したものは覚えておく。
   // 設定を変えたら出し直したいので、config の変更で忘れる。
   const warnedOnce = new Set();
-  store.on('change', () => {
+  const ignorePatternsOf = (cfg) => JSON.stringify(
+    Object.values(cfg.targets ?? {}).map((p) => p?.ignorePatterns ?? []),
+  );
+  let lastIgnorePatterns = ignorePatternsOf(store.config);
+  store.on('change', (cfg) => {
     warnedOnce.clear();
-    // 設定を直したら、時間切れの記録も測り直す
-    resetIgnoreMatchState();
+    // 無視パターンを直したときだけ、時間切れの記録を捨てて測り直す。
+    // 設定はどの欄をいじっても保存されるので、変わっていないなら測り直さない。
+    const next = ignorePatternsOf(cfg);
+    if (next !== lastIgnorePatterns) {
+      lastIgnorePatterns = next;
+      resetIgnoreMatchState();
+    }
   });
 
   /** 使えなかった無視パターンをログに残す。黙って飛ばすと直しようがない。 */
