@@ -106,6 +106,9 @@ server.listen(port, '127.0.0.1', async () => {
   const url = `http://127.0.0.1:${port}/`;
   log.info(`VOICEVOX Coding デーモンを起動しました: ${url}`);
   log.info(`設定ファイル: ${CONFIG_PATH}`);
+  // 前回実行の一時 WAV の掃除は、ポート取得に成功した後で行う。
+  // 二重起動した後発プロセスが、稼働中デーモンの再生待ちファイルを消してしまわないため。
+  queue.cleanupEphemeral();
   commentaryMonitor.start();
 
   if (store.config.daemon?.tray !== false && !noTray) {
