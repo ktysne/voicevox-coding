@@ -253,7 +253,10 @@ if ($RegisterStartup) {
 Set sh = CreateObject("WScript.Shell")
 sh.Run """$node"" ""$mainJs""", 0, False
 "@
-    Set-Content -LiteralPath $vbsPath -Value $vbs -Encoding UTF8
+    # PowerShell 7 の -Encoding UTF8 は BOM なしで書くため、Windows Script Host が
+    # VBS を ANSI として解釈してしまい、日本語を含むパスが文字化けする。
+    # UTF-16LE（Unicode）で保存すると WSH が確実に文字コードを判別できる。
+    Set-Content -LiteralPath $vbsPath -Value $vbs -Encoding Unicode
     Copy-Item -LiteralPath $vbsPath -Destination (Join-Path $startupDir 'VOICEVOX Coding.vbs') -Force
     Write-Ok "$startupDir\VOICEVOX Coding.vbs"
     Write-Ok 'サインイン時にデーモンが起動し、タスクトレイに常駐します'
