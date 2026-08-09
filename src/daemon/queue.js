@@ -306,12 +306,16 @@ export class SpeechQueue extends EventEmitter {
             break;
           }
 
-          // 再生している間に次チャンクを先に合成しておく
+          // 再生している間に次チャンクを先に合成しておく。
+          // 失敗は rejection のまま保持し、消費時 (このループの先頭の catch) で
+          // 通常の合成失敗と同じ扱い (警告ログ + error イベント) にする。
+          // ここで .catch(() => {}) を付けるのは、誰にも await されないまま
+          // 発話が終了・スキップされた場合の unhandledRejection を防ぐためだけで、
+          // 実際の結果 (reject) は変えない。
           if (i + 1 < utterance.chunks.length) {
-            utterance.prefetch = {
-              index: i + 1,
-              promise: this.#synthesizeChunk(utterance, i + 1).catch(() => null),
-            };
+            const promise = this.#synthesizeChunk(utterance, i + 1);
+            promise.catch(() => {});
+            utterance.prefetch = { index: i + 1, promise };
           }
 
           try {

@@ -206,6 +206,112 @@ test('起動時の掃除は tmp-*.wav と書きかけの *.tmp だけを消す (
   assert.deepEqual(unlinked.map((p) => path.basename(p)).sort(), ['abcdef.wav.tmp', 'tmp-1-2-0.wav']);
 });
 
+test('先読み合成の失敗が通常の合成失敗と同じに扱われる (AUD-03)', async () => {
+  const player = new FakePlayer();
+  let callCount = 0;
+  // 1 チャンク目 (通常合成) は成功、2 チャンク目 (先読み) は ENGINE 障害を模して失敗する。
+  const engine = {
+    synthesize: async () => {
+      callCount += 1;
+      if (callCount === 2) throw new Error('ENGINE が応答しません');
+      return { wav: WAV };
+    },
+  };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: false, cacheMaxEntries: 1000 } });
+  const warnings = [];
+  const errors = [];
+  const queue = new SpeechQueue(engine, player, config, { warn: (msg) => warnings.push(msg) });
+  queue.on('error', (err) => errors.push(err));
+  mock.method(fs, 'unlink', (file, cb) => cb?.(null));
+
+  const firstChunk = `${'あ'.repeat(99)}。`;
+  const text = `${firstChunk}い。`;
+  queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 先読みの失敗が null に化けて発話終了扱いにならず、通常の合成失敗と同じ
+  // 警告ログ + error イベントが出ること。
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /ENGINE が応答しません/);
+  assert.ok(warnings.some((w) => w.includes('合成に失敗しました')));
+  // 1 チャンク目は無言で打ち切られず、実際に再生されている
+  // (末尾の stop は #drain 終了時の HOLD 後始末)。
+  assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'stop']);
+});
+
+test('先読み失敗が消費されても process の unhandledRejection にならない (AUD-03)', async () => {
+  const player = new FakePlayer();
+  let callCount = 0;
+  const engine = {
+    synthesize: async () => {
+      callCount += 1;
+      if (callCount === 2) throw new Error('先読み失敗');
+      return { wav: WAV };
+    },
+  };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: false, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} });
+  queue.on('error', () => {}); // ここでは unhandledRejection の有無だけを検証する
+  mock.method(fs, 'unlink', (file, cb) => cb?.(null));
+
+  const unhandled = [];
+  const onUnhandled = (err) => unhandled.push(err);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const firstChunk = `${'あ'.repeat(99)}。`;
+    const text = `${firstChunk}い。`;
+    queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    await waitIdle(queue);
+    // unhandledRejection はマイクロタスク完了後に発火するため一拍待って確認する。
+    await sleep(50);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+  assert.equal(unhandled.length, 0);
+});
+
+test('スキップで先読み失敗が消費されなくても unhandledRejection にならない (AUD-03)', async () => {
+  const queueRef = { current: null };
+  class SkippingPlayer extends FakePlayer {
+    async play(file) {
+      await super.play(file);
+      // 1 チャンク目の再生直後にスキップし、先読み中 (2 チャンク目、失敗する) を
+      // 誰にも await させずに #discardPrefetch へ回す。
+      if (this.calls.filter(([kind]) => kind === 'play').length === 1) {
+        queueRef.current.skip();
+      }
+    }
+  }
+  const player = new SkippingPlayer();
+  let callCount = 0;
+  const engine = {
+    synthesize: async () => {
+      callCount += 1;
+      if (callCount === 2) throw new Error('先読み失敗 (未消費)');
+      return { wav: WAV };
+    },
+  };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: false, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} });
+  queueRef.current = queue;
+  queue.on('error', () => {});
+  mock.method(fs, 'unlink', (file, cb) => cb?.(null));
+
+  const unhandled = [];
+  const onUnhandled = (err) => unhandled.push(err);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const firstChunk = `${'あ'.repeat(99)}。`;
+    const text = `${firstChunk}い。`;
+    queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    await waitIdle(queue);
+    await sleep(50);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+  assert.equal(unhandled.length, 0);
+});
+
 test('skip と clear は STOP を送る', async () => {
   const player = new FakePlayer();
   const queue = makeQueue(player);
