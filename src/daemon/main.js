@@ -52,6 +52,7 @@ async function initialDictionarySync() {
   try {
     const r = await syncEngineDictionary(engine, words);
     log.info(`ユーザー辞書を同期しました: 追加${r.added} 更新${r.updated} 削除${r.removed}`);
+    for (const f of r.failed) log.warn(`ユーザー辞書「${f.surface}」: ${f.errors.join(' / ')}`);
   } catch (err) {
     log.warn(`ユーザー辞書の同期を見送りました: ${err.message}`);
   }
