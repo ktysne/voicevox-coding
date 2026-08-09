@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { CodexCommentaryMonitor, extractCommentaryItems } from '../src/daemon/codex-commentary-monitor.js';
 
 test('agentMessage の commentary かつ空でない本文だけを抽出する', () => {
@@ -47,4 +48,128 @@ test('初回は seed のみ、既知 item は重複通知せず、新規 thread 
   ]);
   await monitor.scan();
   assert.equal(received.length, 2);
+});
+
+/** setInterval を監視し、生成数と未解除の本数を数える。 */
+function trackIntervals() {
+  const originalSet = globalThis.setInterval;
+  const originalClear = globalThis.clearInterval;
+  const active = new Set();
+  let created = 0;
+  globalThis.setInterval = (...args) => {
+    const handle = originalSet(...args);
+    created += 1;
+    active.add(handle);
+    return handle;
+  };
+  globalThis.clearInterval = (handle) => {
+    active.delete(handle);
+    return originalClear(handle);
+  };
+  return {
+    get created() { return created; },
+    get active() { return active.size; },
+    restore() {
+      globalThis.setInterval = originalSet;
+      globalThis.clearInterval = originalClear;
+    },
+  };
+}
+
+/** 条件が満たされるまで短い間隔で待つ。 */
+async function waitFor(predicate, { timeoutMs = 2000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('条件が満たされませんでした');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/** 接続と切断を制御できる app-server transport の代役。 */
+class FakeConnectionTransport extends EventEmitter {
+  constructor({ onThreadList } = {}) {
+    super();
+    this.onThreadList = onThreadList;
+    this.started = false;
+    this.disposed = false;
+    this.scanCount = 0;
+  }
+  start() { this.started = true; }
+  notify() {}
+  async request(method) {
+    if (method === 'initialize') return {};
+    if (method === 'thread/list') {
+      this.scanCount += 1;
+      await this.onThreadList?.(this);
+      return { data: [] };
+    }
+    return { data: [] };
+  }
+  dispose() { this.disposed = true; }
+}
+
+test('初回走査中に切断しても再接続後のポーリングタイマーは一本だけになる', async () => {
+  const timers = trackIntervals();
+  try {
+    const transports = [];
+    const monitor = new CodexCommentaryMonitor({
+      pollMs: 10,
+      transportFactory: () => {
+        // 一本目だけ、初回走査の最中に切断を発火させる。
+        const first = transports.length === 0;
+        const transport = new FakeConnectionTransport({
+          onThreadList: first ? (self) => self.emit('close', new Error('切断されました')) : undefined,
+        });
+        transports.push(transport);
+        return transport;
+      },
+    });
+    monitor.backoffMs = 5;
+    monitor.start();
+
+    await waitFor(() => transports.length === 2 && timers.active > 0);
+    // 一本目の世代はタイマーを作らず、二本目の世代だけがポーリングする。
+    assert.equal(timers.created, 1);
+    assert.equal(timers.active, 1);
+    assert.equal(monitor.transport, transports[1]);
+
+    const before = transports[0].scanCount;
+    await waitFor(() => transports[1].scanCount >= 2);
+    assert.equal(transports[0].scanCount, before);
+
+    monitor.dispose();
+    assert.equal(timers.active, 0);
+    assert.equal(monitor.timer, null);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('dispose() 後は再接続もポーリングも起こらない', async () => {
+  const timers = trackIntervals();
+  try {
+    const transports = [];
+    const monitor = new CodexCommentaryMonitor({
+      pollMs: 10,
+      transportFactory: () => {
+        const transport = new FakeConnectionTransport();
+        transports.push(transport);
+        return transport;
+      },
+    });
+    monitor.start();
+    await waitFor(() => timers.active === 1);
+
+    monitor.dispose();
+    assert.equal(timers.active, 0);
+    assert.equal(transports[0].disposed, true);
+
+    // 切断が遅れて届いても、停止後は再接続を予約しない。
+    transports[0].emit('close', new Error('停止後の切断'));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.equal(transports.length, 1);
+    assert.equal(timers.active, 0);
+  } finally {
+    timers.restore();
+  }
 });
