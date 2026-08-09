@@ -65,6 +65,16 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   const warnedOnce = new Set();
   store.on('change', () => warnedOnce.clear());
 
+  /** 使えなかった無視パターンをログに残す。黙って飛ばすと直しようがない。 */
+  const warnProblems = (target, problems) => {
+    for (const problem of problems ?? []) {
+      const key = `${target}: ${problem}`;
+      if (warnedOnce.has(key)) continue;
+      warnedOnce.add(key);
+      log.warn(`[${target}] ${problem}`);
+    }
+  };
+
   /** 整形して発話キューに積む。ターゲットの設定に従う。 */
   const speak = (target, eventName, payload) => {
     const profile = store.profile(target);
@@ -75,13 +85,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       dictionary: store.config.dictionary,
     });
 
-    // 使えなかった無視パターンは黙って飛ばしている。理由が分からないと直せないので残す
-    for (const problem of decision.problems ?? []) {
-      const key = `${target}: ${problem}`;
-      if (warnedOnce.has(key)) continue;
-      warnedOnce.add(key);
-      log.warn(`[${target}] ${problem}`);
-    }
+    warnProblems(target, decision.problems);
 
     if (runtime?.muted) {
       log.debug(`[${target}] ${eventName}: 一時停止中のため読み上げなし`);
@@ -288,7 +292,10 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           return;
         }
         // 無視パターンも本番と同じ順序で見る。ここで確かめられないと書いたパターンを試せない
-        if (matchesIgnorePattern(text ?? '', profile.ignorePatterns)) {
+        const previewProblems = [];
+        const skipped = matchesIgnorePattern(text ?? '', profile.ignorePatterns, previewProblems);
+        warnProblems(target, previewProblems);
+        if (skipped) {
           json(res, 200, { text: '', truncated: false, chars: 0, ignored: true });
           return;
         }
@@ -309,7 +316,10 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
         let spoken = text ?? '';
         if (!raw) {
           // raw は声の調整用の試聴なので、無視パターンは本文を読ませるときだけ見る
-          if (matchesIgnorePattern(spoken, profile.ignorePatterns)) {
+          const previewProblems = [];
+          const skipped = matchesIgnorePattern(spoken, profile.ignorePatterns, previewProblems);
+          warnProblems(target, previewProblems);
+          if (skipped) {
             json(res, 200, { spoken: false, reason: 'ignored-pattern' });
             return;
           }

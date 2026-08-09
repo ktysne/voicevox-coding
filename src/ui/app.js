@@ -363,8 +363,9 @@ function ignorePatternError(pattern) {
   if (!pattern) return null;
   try {
     new RegExp(pattern);
-  } catch (err) {
-    return `正規表現として解釈できません: ${err.message}`;
+  } catch {
+    // ブラウザの例外メッセージは英語なので、そのまま出さずに日本語で言い換える
+    return '正規表現として解釈できません。括弧や角括弧の対応を確認してください';
   }
   return null;
 }
@@ -500,6 +501,7 @@ function renderPreviewCard(targetId) {
   const output = h('div', { class: 'preview-out' }, '「整形を確認」を押すと、実際に読み上げるテキストが表示されます。');
 
   const runFilter = async () => {
+    await saveNow(); // 直前に書いた無視パターンや整形設定で判定させる
     try {
       const r = await api('/api/filter-preview', {
         method: 'POST',
