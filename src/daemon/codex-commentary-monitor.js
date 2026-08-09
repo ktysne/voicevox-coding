@@ -162,7 +162,7 @@ export class CodexCommentaryMonitor extends EventEmitter {
       });
       transport.notify?.('initialized', {});
       if (!this.running || transport !== this.transport) return;
-      await this.scan();
+      await this.scan(transport);
       // 初回走査の待機中に切断や停止が起きていることがあるため、
       // タイマーを作る直前にも接続世代を確認する。古い世代はここで手を引く。
       if (!this.running || transport !== this.transport) return;
@@ -173,7 +173,7 @@ export class CodexCommentaryMonitor extends EventEmitter {
           clearOwnTimer();
           return;
         }
-        this.scan();
+        this.scan(transport);
       }, this.pollMs);
       timer.unref?.();
       this.timer = timer;
@@ -197,20 +197,24 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.restartTimer.unref?.();
   }
 
-  async scan() {
-    if (this.polling || !this.transport) return;
+  /** 引数の transport（接続世代）で走査する。省略時は現在の接続を使う。 */
+  async scan(transport = this.transport) {
+    if (this.polling || !transport || transport !== this.transport) return;
     this.polling = true;
     try {
-      const result = await this.transport.request('thread/list', {
+      const result = await transport.request('thread/list', {
         sourceKinds: ['vscode'], limit: 20, sortKey: 'updated_at',
       });
+      // 待機中に切断されていれば、古い応答は新しい接続へ持ち込まずに捨てる。
+      if (transport !== this.transport) return;
       const threads = result?.data ?? result?.threads ?? [];
       for (const thread of threads) {
         const threadId = thread?.id;
         if (!threadId) continue;
-        const turnsResult = await this.transport.request('thread/turns/list', {
+        const turnsResult = await transport.request('thread/turns/list', {
           threadId, limit: 1, sortDirection: 'desc', itemsView: 'full',
         });
+        if (transport !== this.transport) return;
         const turn = (turnsResult?.data ?? turnsResult?.turns ?? [])[0];
         for (const item of extractCommentaryItems(turn)) {
           const itemKey = `${threadId}:${turn?.id ?? ''}:${item.itemId}`;

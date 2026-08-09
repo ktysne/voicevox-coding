@@ -93,15 +93,18 @@ class FakeConnectionTransport extends EventEmitter {
     this.started = false;
     this.disposed = false;
     this.scanCount = 0;
+    this.calls = [];
   }
   start() { this.started = true; }
   notify() {}
-  async request(method) {
+  async request(method, params) {
+    this.calls.push({ method, params });
     if (method === 'initialize') return {};
     if (method === 'thread/list') {
       this.scanCount += 1;
-      await this.onThreadList?.(this);
-      return { data: [] };
+      // onThreadList が応答を返した場合はそれを使う（切断後に解決する応答の再現用）。
+      const response = await this.onThreadList?.(this);
+      return response ?? { data: [] };
     }
     return { data: [] };
   }
@@ -140,6 +143,49 @@ test('初回走査中に切断しても再接続後のポーリングタイマ�
     monitor.dispose();
     assert.equal(timers.active, 0);
     assert.equal(monitor.timer, null);
+  } finally {
+    timers.restore();
+  }
+});
+
+test('切断後に古い走査が完了しても、その結果を新しい接続へ持ち込まない', async () => {
+  const timers = trackIntervals();
+  try {
+    let releaseStale = null;
+    const transports = [];
+    const monitor = new CodexCommentaryMonitor({
+      pollMs: 10,
+      transportFactory: () => {
+        const first = transports.length === 0;
+        const transport = new FakeConnectionTransport({
+          // 一本目は切断を発火したうえで、応答だけを遅れて返す。
+          onThreadList: first
+            ? (self) => {
+                self.emit('close', new Error('切断されました'));
+                return new Promise((resolve) => {
+                  releaseStale = () => resolve({ data: [{ id: 'stale' }] });
+                });
+              }
+            : undefined,
+        });
+        transports.push(transport);
+        return transport;
+      },
+    });
+    monitor.backoffMs = 5;
+    monitor.start();
+
+    await waitFor(() => transports.length === 2 && releaseStale !== null);
+    releaseStale();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // 古い世代の thread/list 結果で thread/turns/list を呼ばない。
+    const turnCalls = transports.flatMap((t) => t.calls.filter((c) => c.method === 'thread/turns/list'));
+    assert.deepEqual(turnCalls, []);
+    assert.equal(timers.active, 1);
+
+    monitor.dispose();
+    assert.equal(timers.active, 0);
   } finally {
     timers.restore();
   }
