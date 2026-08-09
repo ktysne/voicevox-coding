@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>VOICEVOX Coding — 管理コンソール</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">🔊</span>
+        <span class="brand-name">VOICEVOX Coding</span>
+      </div>
+      <div class="status-group">
+        <span id="engine-status" class="badge badge-unknown">エンジン確認中…</span>
+        <span id="queue-status" class="badge badge-idle">待機中</span>
+      </div>
+      <div class="topbar-actions">
+        <button id="btn-mute" class="btn btn-ghost" title="読み上げを一時的に止める">一時停止</button>
+        <button id="btn-skip" class="btn btn-ghost" title="読み上げ中の発話を打ち切る">スキップ</button>
+        <button id="btn-clear" class="btn btn-ghost" title="キューを空にする">全停止</button>
+        <span id="save-indicator" class="save-indicator"></span>
+      </div>
+    </header>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab is-active" data-tab="claudeCode">Claude Code</button>
+      <button class="tab" data-tab="codex">Codex</button>
+      <button class="tab" data-tab="dictionary">用語辞書</button>
+      <button class="tab" data-tab="engine">エンジン・詳細</button>
+      <button class="tab" data-tab="logs">ログ</button>
+    </nav>
+
+    <main id="panels">
+      <section class="panel is-active" data-panel="claudeCode"></section>
+      <section class="panel" data-panel="codex"></section>
+      <section class="panel" data-panel="dictionary"></section>
+      <section class="panel" data-panel="engine"></section>
+      <section class="panel" data-panel="logs"></section>
+    </main>
+
+    <div id="toast" class="toast"></div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

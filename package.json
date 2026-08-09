@@ -1,0 +1,19 @@
+{
+  "name": "voicevox-coding",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code / Codex のイベントを VOICEVOX で読み上げる常駐デーモンと管理コンソール",
+  "type": "module",
+  "bin": {
+    "voicevox-coding": "src/daemon/main.js"
+  },
+  "scripts": {
+    "start": "node src/daemon/main.js",
+    "console": "node src/daemon/main.js --open",
+    "test": "node --test test/textfilter.test.mjs test/message-stream.test.mjs test/doctor.test.mjs test/queue.test.mjs test/codex-commentary-monitor.test.mjs",
+    "doctor": "node scripts/doctor.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
