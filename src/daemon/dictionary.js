@@ -68,10 +68,12 @@ export function validateEngineWord(w) {
  */
 export async function syncEngineDictionary(engine, engineWords = []) {
   const state = readState();
-  const owned = state.words ?? {};
+  // 作業用のコピー。外部 API が成功するたびにここを更新し、その都度 state へ書き戻す
+  const owned = { ...(state.words ?? {}) };
   const result = { added: 0, updated: 0, removed: 0, skipped: [] };
 
   const valid = [];
+  const seen = new Set();
   for (const w of engineWords) {
     if (w?.enabled === false) continue;
     const errors = validateEngineWord(w);
@@ -79,18 +81,24 @@ export async function syncEngineDictionary(engine, engineWords = []) {
       result.skipped.push({ surface: w?.surface ?? '(不明)', errors });
       continue;
     }
+    // 所有権は surface 単位で持つため、重複を通すと 2 件目以降の uuid が管理外になる
+    if (seen.has(w.surface)) {
+      result.skipped.push({ surface: w.surface, errors: ['表記が重複しています'] });
+      continue;
+    }
+    seen.add(w.surface);
     valid.push(w);
   }
 
-  // ENGINE 側に実在する uuid を確認しておく（手動削除との齟齬を解消する）
-  let existing = {};
+  // ENGINE 側に実在する uuid を確認しておく（手動削除との齟齬を解消する）。
+  // ここを空辞書で代用すると所有語をすべて未登録とみなして重複登録するので、同期ごと中止する
+  let existing;
   try {
     existing = await engine.userDict();
-  } catch {
-    existing = {};
+  } catch (err) {
+    throw new Error(`ユーザー辞書の一覧を取得できないため同期を中止しました: ${err.message}`);
   }
 
-  const nextOwned = {};
   for (const w of valid) {
     const payload = {
       surface: w.surface,
@@ -101,28 +109,35 @@ export async function syncEngineDictionary(engine, engineWords = []) {
     };
     const uuid = owned[w.surface];
     if (uuid && existing[uuid]) {
+      // uuid は変わらないので、途中で失敗しても所有は保たれる
       await engine.updateUserDictWord(uuid, payload);
-      nextOwned[w.surface] = uuid;
       result.updated += 1;
     } else {
       const newUuid = await engine.addUserDictWord(payload);
-      nextOwned[w.surface] = newUuid;
+      owned[w.surface] = newUuid;
+      // 追加のたびに保存する。以降の語で失敗しても、この uuid を後から更新、削除できる
+      writeState({ ...state, words: { ...owned } });
       result.added += 1;
     }
   }
 
   // 設定から消えた単語を ENGINE 側からも消す
-  for (const [surface, uuid] of Object.entries(owned)) {
-    if (nextOwned[surface]) continue;
-    if (!existing[uuid]) continue;
-    try {
-      await engine.deleteUserDictWord(uuid);
-      result.removed += 1;
-    } catch {
-      // 消せなくても致命ではない
+  for (const [surface, uuid] of Object.entries({ ...owned })) {
+    if (seen.has(surface)) continue;
+    if (existing[uuid]) {
+      try {
+        await engine.deleteUserDictWord(uuid);
+        result.removed += 1;
+      } catch {
+        // 消せなくても致命ではない。所有は残して次回の同期で消し直す
+        continue;
+      }
     }
+    delete owned[surface];
   }
 
-  writeState({ words: nextOwned });
+  // 削除結果をまとめて反映する。owned は既存の所有をコピーしたものなので、
+  // 途中で例外が出ても未処理分の uuid が state から消えることはない
+  writeState({ ...state, words: owned });
   return result;
 }
