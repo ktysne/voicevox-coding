@@ -5,7 +5,19 @@ const FENCED_CODE = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
 const INDENTED_CODE = /^(?: {4}|\t).+$/gm;
 const THINKING = /<(thinking|antml:thinking)>[\s\S]*?<\/\1>/gi;
 const HTML_TAG = /<\/?[a-zA-Z][^>]*>/g;
-const URL = /https?:\/\/\S+|\bwww\.\S+/g;
+// URL の末尾として扱わない文字（空白、日本語の句読点・括弧・引用符、CJK 文字全般）。
+// 日本語では URL の直後に空白を置かず句点や本文を続ける表記が一般的なため、
+// 空白だけを境界にすると後続の日本語文まで URL に取り込んでしまう。
+// ASCII の `!?()` 等は実在の URL に含まれ得るため除外しない。
+const URL_STOP_CHARS =
+  '\\s' + // 半角・全角空白
+  '\\u3000-\\u303F' + // CJK の記号・句読点（。、「」『』【】〈〉《》など）
+  '\\u3040-\\u309F' + // ひらがな
+  '\\u30A0-\\u30FF' + // カタカナ
+  '\\u3400-\\u4DBF\\u4E00-\\u9FFF' + // CJK 統合漢字（拡張 A・基本）
+  '\\uFF00-\\uFFEF' + // 全角英数記号・半角カナ（（）！？．，など）
+  '\\u2018-\\u201F'; // 引用符（“”‘’など）
+const URL = new RegExp(`https?://[^${URL_STOP_CHARS}]+|\\bwww\\.[^${URL_STOP_CHARS}]+`, 'g');
 const MD_LINK = /\[([^\]]*)\]\(([^)]*)\)/g;
 const MD_IMAGE = /!\[([^\]]*)\]\(([^)]*)\)/g;
 const TABLE_ROW = /^\s*\|.*\|\s*$/gm;

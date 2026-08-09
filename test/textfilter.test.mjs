@@ -27,6 +27,37 @@ test('URL は定型語に置き換わる', () => {
   assert.doesNotMatch(text, /example\.com/);
 });
 
+test('URL 直後に空白なしで句点と本文が続いても後続文は残る（AUD-07）', () => {
+  const { text } = filterText('詳細は https://example.com。次の文です。', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /次の文です/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
+test('URL 直後に読点や閉じ括弧が続いても巻き込まない', () => {
+  const { text } = filterText('参照先は https://example.com、後で確認してください', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /後で確認してください/);
+
+  const { text: text2 } = filterText('リンク「https://example.com」を開く', F);
+  assert.match(text2, /リンク/);
+  assert.match(text2, /を開く/);
+});
+
+test('括弧内の URL も括弧の外側の本文を巻き込まない', () => {
+  const { text } = filterText('（https://example.com/path）を参照', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /を参照/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
+test('空白区切りやクエリ付き URL は従来どおり丸ごと消える', () => {
+  const { text } = filterText('参照 https://example.com/path?a=1&b=2 です', F);
+  assert.match(text, /リンク/);
+  assert.match(text, /です/);
+  assert.doesNotMatch(text, /example\.com/);
+});
+
 test('ファイルパスはファイル名だけ残る（語頭を食わない）', () => {
   const { text } = filterText('src/daemon/queue.js を更新しました', { ...F, inlineCode: 'read' });
   assert.match(text, /^queue\.js を更新しました$/);
