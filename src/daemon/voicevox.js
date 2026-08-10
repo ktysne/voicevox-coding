@@ -77,7 +77,14 @@ export class VoicevoxEngine {
       method: 'POST',
       timeoutMs: 30000,
     });
+    // voiceParams のキーは ENGINE のクエリのフィールド名と同じ（catalog.js の VOICE_PARAMS）ため、
+    // 名前の対応表は要らずそのまま代入できる。
+    // 応答に無いフィールドは、その ENGINE が解釈できないフィールドなので送らない
+    // （/audio_query と /synthesis のクエリは同じ形）。未知フィールドを無視してくれる
+    // かどうかを ENGINE 側の寛容さに頼らずに済み、パラメータを増やしても
+    // 古い ENGINE で合成が 422 になったりしない。
     for (const [k, v] of Object.entries(voiceParams)) {
+      if (!Object.hasOwn(q, k)) continue;
       if (typeof v === 'number' && Number.isFinite(v)) q[k] = v;
     }
     return q;
