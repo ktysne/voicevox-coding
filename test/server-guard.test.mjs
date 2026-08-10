@@ -116,7 +116,7 @@ test('/api/* はトークンがあれば Content-Type 省略の POST を認め�
 
 // PowerShell は本文を省いた POST にこの Content-Type を付ける。
 // トークンがあっても通らないので、ps1 側は空 JSON を明示して送る必要がある (#31)。
-test('application/x-www-form-urlencoded はトークンがあっても拒否する', () => {
+test('/api/* は application/x-www-form-urlencoded をトークンがあっても拒否する', () => {
   const r = check('/api/shutdown', {
     'content-type': 'application/x-www-form-urlencoded',
     'x-voicevox-coding-token': TOKEN,
