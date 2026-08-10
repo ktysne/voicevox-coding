@@ -322,6 +322,15 @@ test('番号付きリストと入れ子の項目にも切れ目が付く (#15)',
   assert.equal(marked.split(LIST_BOUNDARY).length - 1, 2);
 });
 
+test('中身が残らなかった項目には間を置かない (#15)', () => {
+  // 絵文字だけの項目は読むものが無いので、そこに間を置いても無音が伸びるだけ。
+  // 空白をまとめる設定のあるなしで、間の数が変わらないこと。
+  const input = '- 項目1\n- 🎉\n- 項目3';
+  const count = (f) => filterText(input, f).marked.split(LIST_BOUNDARY).length - 1;
+  assert.equal(count(F), 1);
+  assert.equal(count({ ...F, collapseWhitespace: false }), 1);
+});
+
 test('全角スペース区切りの箇条書きにも切れ目が付く (#15)', () => {
   // 記号を外す LIST_MARKER は \s なので全角スペースも拾う。印の判定も揃える。
   const { marked, text } = filterText('-　項目1\n-　項目2', F);
@@ -347,6 +356,10 @@ test('切れ目の印を入れても読み上げるテキストは変わらな�
     '- 完了しました 🎉\n- 次の項目です',
     '- 項目1  \n- 項目2',
     '- 🎉\n- 完了',
+    // 中身が消える項目が続くと、先頭に残った印が trim を遮る
+    '- 🎉\n- 🎉\n- 項目',
+    '- 🎉\n- 🎉\n普通の文です。',
+    '- 項目1\n- 🎉\n- 項目3',
     '1. 一つ目 \n2. 二つ目',
     '本文です。\n- 項目1\n- 項目2\n続きの本文です。',
   ];
@@ -376,13 +389,20 @@ test('切れ目の印は辞書の置換ルールの当たり方を変えない (
   assert.match(applied, /アイテム/);
 });
 
-test('空白だけが続く行があっても整形が遅くならない (#15)', () => {
-  // 項目行の判定に先読みを埋め込むと、この形の入力で入力長の二乗に劣化する。
-  const input = `- 項目\n${' '.repeat(20000)}\n- 次の項目`;
-  const started = Date.now();
-  filterText(input, F);
-  const elapsed = Date.now() - started;
-  assert.ok(elapsed < 500, `整形に時間がかかりすぎです: ${elapsed}ms`);
+test('空白が長く続く入力でも整形が遅くならない (#15)', () => {
+  // 項目の判定・区切り線の判定・印を入れる位置のどれかに後戻りが残ると、
+  // この形の入力で入力長の二乗に劣化する（デーモンは 1 スレッドなので全体が止まる）。
+  const inputs = [
+    `- 項目\n${' '.repeat(20000)}\n- 次の項目`, // 空白だけの行
+    `- ${' '.repeat(20000)}x`, // 記号のあとに長い空白が続き、行末は空白でない
+    `-${' '.repeat(20000)}- -`, // 区切り線と紛らわしい形
+  ];
+  for (const input of inputs) {
+    const started = Date.now();
+    filterText(input, F);
+    const elapsed = Date.now() - started;
+    assert.ok(elapsed < 500, `整形に時間がかかりすぎです (${input.length} 文字): ${elapsed}ms`);
+  }
 });
 
 test('切れ目の印は最大文字数の数えかたも変えない (#15)', () => {

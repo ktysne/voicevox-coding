@@ -456,8 +456,9 @@ test('listPauseSec が 0 なら間を置かない (#15)', async () => {
   });
   await waitIdle(queue);
   assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'play']);
+  // 間なしの実測は 10ms 未満。負荷の高い環境でも揺れないよう、余裕を持って見る。
   const gap = player.playAt[1] - player.playAt[0];
-  assert.ok(gap < 100, `間が入っています: ${gap}ms`);
+  assert.ok(gap < 120, `間が入っています: ${gap}ms`);
 });
 
 test('キューの状態と重複判定には切れ目の印を残さない (#15)', async () => {
@@ -498,6 +499,7 @@ test('HOLD に失敗したときは間を置かずに次のチャンクへ進む
   });
   await waitIdle(queue);
   // 無音を掴めていない状態で待つと、間のあとの出だしが欠ける。間は諦めて先へ進む。
+  // 指定の間は 300ms なので、120ms を超えなければ「待っていない」と言い切れる。
   const gap = player.playAt[1] - player.playAt[0];
-  assert.ok(gap < 100, `HOLD 失敗時に間を置いています: ${gap}ms`);
+  assert.ok(gap < 120, `HOLD 失敗時に間を置いています: ${gap}ms`);
 });

@@ -128,7 +128,10 @@ const LIST_MARKER = /^\s*(?:[-*+]|\d{1,3}[.)])\s+/gm;
 // 区切りに全角スペースを使う書き方（`-　項目`）も、記号を外す LIST_MARKER の `\s` に合わせて拾う。
 const LIST_ITEM_LINE = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　]+.*$/gm;
 // `- - -` `* * *` のような区切り線。記号と空白しか残らないので項目とみなさない。
-const LIST_SYMBOL_ONLY = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　]+[-*_ \t　]*$/;
+// 記号のあとの区切りは 1 文字に固定する。`+` にすると後ろの `[-*_ \t　]*` と空白を取り合い、
+// 記号のあとに長い空白が続く行で後戻りが入力長の二乗に膨らむ。
+// この判定は LIST_ITEM_LINE に一致した行にしか使わないので、区切り 1 文字は保証されている。
+const LIST_SYMBOL_ONLY = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　][-*_ \t　]*$/;
 const BLOCKQUOTE = /^\s*>+\s?/gm;
 const HR = /^\s*(?:[-*_]\s*){3,}$/gm;
 const INLINE_CODE = /`([^`\n]+)`/g;
@@ -286,9 +289,26 @@ const LIST_BOUNDARY_RE = /\u0001/g;
 // 箇条書き項目の切れ目に置く無音の既定の長さ（秒）。
 export const DEFAULT_LIST_PAUSE_SEC = 0.3;
 
-/** 末尾の印と空白を落とす。末尾の印は続く項目が無いので意味を持たない。 */
-function trimTrailingBoundary(text) {
-  return text.replace(/(?:\u0001|\s)+$/, '');
+/**
+ * 行末の空白の手前へ印を入れる。
+ * 印を空白の後ろへ置くと、空白をまとめる処理と trim を印が遮り、印の有無で
+ * 読み上げるテキストが変わってしまう。
+ * 位置は末尾から数えて求める。`/([ \t　]*)$/` のような正規表現は、行末が空白で
+ * 終わらない行だと開始位置ごとに空白を数え直すため、入力長の二乗に膨らむ。
+ */
+function insertBoundaryBeforeTrailingSpace(line) {
+  let end = line.length;
+  while (end > 0 && (line[end - 1] === ' ' || line[end - 1] === '\t' || line[end - 1] === '　')) end -= 1;
+  return line.slice(0, end) + LIST_BOUNDARY + line.slice(end);
+}
+
+/**
+ * 先頭と末尾の印を空白ごと落とす。
+ * 先頭の印は直前に項目が無く、末尾の印は続く項目が無いので、どちらも間を持たない。
+ * 印は空白ではないので、残すと前後の trim を遮って印の有無で整形結果が変わってしまう。
+ */
+function trimBoundaryEdges(text) {
+  return text.replace(/^(?:\u0001|\s)+/, '').replace(/(?:\u0001|\s)+$/, '');
 }
 
 /** 項目の切れ目のマーカーを取り除く。 */
@@ -426,10 +446,8 @@ export function filterText(input, f = {}) {
   const listPauseSec = Number(f.listPauseSec ?? DEFAULT_LIST_PAUSE_SEC);
   const marksList = Number.isFinite(listPauseSec) && listPauseSec > 0;
   if (marksList) {
-    // 印は行末の空白より手前へ置く。空白の後ろへ置くと、空白をまとめる処理と trim を
-    // 印が遮ってしまい、印の有無で読み上げるテキストが変わる。
     t = t.replace(LIST_ITEM_LINE, (line) => (
-      LIST_SYMBOL_ONLY.test(line) ? line : line.replace(/([ \t　]*)$/, LIST_BOUNDARY + '$1')
+      LIST_SYMBOL_ONLY.test(line) ? line : insertBoundaryBeforeTrailingSpace(line)
     ));
   }
 
@@ -455,19 +473,21 @@ export function filterText(input, f = {}) {
     }
   }
   if (marksList) {
+    // 中身が残らなかった項目の印は、空白をまとめない設定でも落とす（空白と改行はそのまま）。
+    // 印を寄せる前なら、行頭に立っている印は「中身が空だった項目」だけを指す。
+    t = t.replace(/^([ \t　]*)\u0001/gm, '$1');
     // 印を「項目を終える改行の直後」へ寄せる。行末に居座らせると、整形後のテキストへ掛ける
     // 辞書の置換ルールや文の区切りの判定が、印の有無で変わってしまう。
     // CRLF の入力では改行が \r だけになって残ることがあるので、そちらも改行として扱う。
     t = t.replace(/\u0001(\s*[\r\n])/g, '$1\u0001');
   }
-  // 印は空白ではないので、末尾に残ると trim を遮る。空白ごとまとめて落とす。
-  t = trimTrailingBoundary(t).trim();
+  t = trimBoundaryEdges(t);
 
   const bySentence = limitSentences(t, f.maxSentences);
   const byChar = limitChars(bySentence.text, f.maxChars);
   const truncated = bySentence.truncated || byChar.truncated;
-  // 上限で切ったあとにも末尾へ印が残りうる（読み上げの終わりで間は置かない）。
-  let out = trimTrailingBoundary(byChar.text).trim();
+  // 上限で切ったあとにも端へ印が残りうる（読み上げの始めと終わりで間は置かない）。
+  let out = trimBoundaryEdges(byChar.text);
   if (truncated && f.truncationSuffix) out += `。${f.truncationSuffix}。`;
 
   return { text: stripListBoundaries(out), marked: out, truncated };
