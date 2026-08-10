@@ -19,7 +19,8 @@ function invokeDaemonCalls() {
   return source
     .split(/\r?\n/)
     .map((text, i) => ({ line: i + 1, text }))
-    .filter((row) => row.text.includes('Invoke-Daemon ') && !row.text.trimStart().startsWith('#'));
+    // 引数が続くものだけを拾う（function Invoke-Daemon { の定義行を混ぜない）。
+    .filter((row) => /Invoke-Daemon\s+['$]/.test(row.text) && !row.text.trimStart().startsWith('#'));
 }
 
 function exitHandlerBody() {
@@ -88,16 +89,25 @@ test('「終了」は停止 API の結果を確かめてから Stop-Tray する'
     '停止 API の呼び出しが成否を受け取っていない',
   );
 
-  // 無条件の Stop-Tray が 1 つでもあれば、失敗時にトレイだけ消えて停止手段が失われる。
-  const unguarded = body
+  // トレイを畳んでよいのは「停止 API が受理された」か「デーモンのプロセスがもう無い」
+  // と分かったときだけ。それ以外の Stop-Tray は、デーモンが生きているのに
+  // トレイだけ消える #35 そのものになる。
+  const folds = body
     .split(/\r?\n/)
-    .filter((line) => /\bStop-Tray\b/.test(line) && !line.trimStart().startsWith('#'))
-    .filter((line) => !line.includes('if ('));
+    .filter((line) => /\bStop-Tray\b/.test(line) && !line.trimStart().startsWith('#'));
+
+  const hint =
+    '\n（この検査は「if ($accepted) { Stop-Tray; return }」の 1 行書きを前提にしている。' +
+    '整形を変えるならこの検査も併せて見直すこと）';
+
+  assert.equal(folds.length, 2, `「終了」ハンドラ内の Stop-Tray は 2 か所のはず:\n${folds.join('\n')}${hint}`);
+
+  const misguarded = folds.filter((line) => !/if\s*\(\$(accepted|daemonGone)\)\s*\{[^}]*Stop-Tray/.test(line));
 
   assert.deepEqual(
-    unguarded,
+    misguarded,
     [],
-    `条件の付かない Stop-Tray がある。停止に失敗してもトレイだけ消えてしまう:\n${unguarded.join('\n')}`,
+    `$accepted / $daemonGone 以外で畳んでいる Stop-Tray がある。停止に失敗してもトレイだけ消えてしまう:\n${misguarded.join('\n')}${hint}`,
   );
 
   assert.match(body, /ShowBalloonTip/, '停止に失敗したことを利用者へ知らせる通知が無い');

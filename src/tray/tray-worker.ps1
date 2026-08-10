@@ -83,8 +83,10 @@ function Write-Stderr([string]$line) {
 # -Ok に [ref] を渡すと成否を受け取れる。戻り値では判定できない
 # （本文の無い成功応答も $null になり、失敗と区別が付かない）。
 # [ref] 型で宣言すると引数を省略できなくなるため、型は付けずに中で確かめる。
-# [CmdletBinding()] は必須。簡易関数のままだと、綴り違いの -Action が
-# エラーにならず $args に落ちて消え、通知だけが黙って失われる。
+# [CmdletBinding()] を付けると、綴り違いの -Action が $args に落ちて消えず、
+# 束縛エラーになる。ただし WinForms のイベントハンドラはスクリプトブロックの
+# 終了エラーを飲み込むので、これだけでは気づけない（その場でハンドラが止まるだけ）。
+# 綴り違いを実際に止めているのは test/tray-worker.test.mjs の静的検査。
 function Invoke-Daemon {
     [CmdletBinding()]
     param(
