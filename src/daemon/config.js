@@ -5,6 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { EVENTS, eventsForTarget, VOICE_PARAMS } from './catalog.js';
 
@@ -172,6 +173,17 @@ export class ConfigStore extends EventEmitter {
   constructor() {
     super();
     this.config = defaultConfig();
+    // メモリ上だけの単調増加リビジョン（ディスクへは保存しない）。
+    // 保存 (save/patch) と外部エディタでの直接編集のたびに増やす。
+    // UI が「自分が送った PUT の自己通知」と「他所からの更新」を
+    // 取り違えないようにするための識別子として使う。
+    this.revision = 0;
+    // プロセス起動ごとに変わる ID（メモリ上だけ、ディスクへは保存しない）。
+    // revision はデーモン再起動で 0 から数え直されるため、再起動をまたぐと
+    // revision の大小比較だけでは新旧を判定できない（偶然同じ値になること
+    // もある）。UI 側はこの bootId が変わったことをもって「別プロセスの
+    // revision なので数値の大小に関わらず新しい状態として扱う」と判定する。
+    this.bootId = crypto.randomUUID();
     this.watcher = null;
     this.suppressWatchUntil = 0;
   }
@@ -198,21 +210,30 @@ export class ConfigStore extends EventEmitter {
     return this.config;
   }
 
-  save(next = this.config) {
+  /**
+   * @param {object} [next] 保存する設定（省略時は現在の this.config を再保存）
+   * @param {string|null} [mutationId] 呼び出し元 (UI) が発行した保存要求の識別子。
+   *   change イベントへそのまま乗せて返すことで、UI 側が「自分がいま送った
+   *   保存の自己通知」を revision の到着順に依存せず確実に識別できるようにする。
+   *   外部要因（起動時の初期化、ファイル監視での再読み込みなど）による
+   *   保存では null のままでよい。
+   */
+  save(next = this.config, mutationId = null) {
     this.config = reconcileProfiles(deepMerge(defaultConfig(), next));
+    this.revision += 1;
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
     // 自分の書き込みでウォッチャーが発火してループしないよう短時間抑止する
     this.suppressWatchUntil = Date.now() + 500;
     const tmp = `${CONFIG_PATH}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(this.config, null, 2), 'utf8');
     fs.renameSync(tmp, CONFIG_PATH);
-    this.emit('change', this.config);
+    this.emit('change', this.config, this.revision, this.bootId, mutationId);
     return this.config;
   }
 
   /** パッチを深くマージして保存する。 */
-  patch(partial) {
-    return this.save(deepMerge(this.config, partial));
+  patch(partial, mutationId = null) {
+    return this.save(deepMerge(this.config, partial), mutationId);
   }
 
   watch() {
@@ -227,8 +248,9 @@ export class ConfigStore extends EventEmitter {
           try {
             const stored = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
             this.config = reconcileProfiles(deepMerge(defaultConfig(), stored));
-            this.emit('change', this.config);
-            this.emit('externalChange', this.config);
+            this.revision += 1;
+            this.emit('change', this.config, this.revision, this.bootId, null);
+            this.emit('externalChange', this.config, this.revision, this.bootId, null);
           } catch {
             // 編集途中の不正な JSON は無視して次の変更を待つ
           }
