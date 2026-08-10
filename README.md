@@ -314,11 +314,15 @@ Claude Code は `async: true` で待たないが、Codex は同期実行なの�
 
 ## アンインストール
 
+デーモンが動いている場合は、先にタスクトレイの「終了」で停止する。
+アンインストールのスクリプトはフックの登録とスタートアップ登録を取り除くだけで、動作中のデーモンは止めない。
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\uninstall.ps1
 ```
 
 `-RemoveConfig` を付けると、設定とキャッシュも消す。
+デーモンの動作中はログやキャッシュのファイルが使用中で消せないことがあるため、この点でも先に停止しておく。
 
 ---
 
