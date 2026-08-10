@@ -122,6 +122,16 @@ const TABLE_SEP = /^\s*\|?[\s:|-]{3,}\|?\s*$/gm;
 const HEADING_LINE = /^\s{0,3}#{1,6}\s+.*$/gm;
 const HEADING_MARK = /^\s{0,3}#{1,6}\s+/gm;
 const LIST_MARKER = /^\s*(?:[-*+]|\d{1,3}[.)])\s+/gm;
+// 箇条書き項目の 1 行。記号を外す前にどの行が項目だったかを控えるために使う。
+// 区切り線かどうかは LIST_SYMBOL_ONLY で別に判定する。この正規表現へ先読みとして
+// 埋め込むと、空白だけが続く行で後戻りのたびに行末まで走り、入力長の二乗で遅くなる。
+// 区切りに全角スペースを使う書き方（`-　項目`）も、記号を外す LIST_MARKER の `\s` に合わせて拾う。
+const LIST_ITEM_LINE = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　]+.*$/gm;
+// `- - -` `* * *` のような区切り線。記号と空白しか残らないので項目とみなさない。
+// 記号のあとの区切りは 1 文字に固定する。`+` にすると後ろの `[-*_ \t　]*` と空白を取り合い、
+// 記号のあとに長い空白が続く行で後戻りが入力長の二乗に膨らむ。
+// この判定は LIST_ITEM_LINE に一致した行にしか使わないので、区切り 1 文字は保証されている。
+const LIST_SYMBOL_ONLY = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　][-*_ \t　]*$/;
 const BLOCKQUOTE = /^\s*>+\s?/gm;
 const HR = /^\s*(?:[-*_]\s*){3,}$/gm;
 const INLINE_CODE = /`([^`\n]+)`/g;
@@ -267,6 +277,59 @@ const PARK_RE = /§(\d+)§/g;
 
 const SENTENCE_END = /(?<=[。．.!?！？])\s*/;
 
+// 箇条書き項目の切れ目を、整形後のテキスト上へ残しておくための内部マーカー。
+// 制御文字なので本文には現れず、空白とも扱われないため、後段の記号除去・空白の正規化・
+// trim をくぐり抜けて位置を保てる。読み上げ側 (発話キュー) はここでチャンクを割り、
+// 項目のあいだに無音の間を挟む。
+// 本文へ残ってはいけない文字なので、filterText は marked にだけ含めて返し、
+// 表示・ログに使う text からは必ず取り除く。
+export const LIST_BOUNDARY = '\u0001';
+const LIST_BOUNDARY_RE = /\u0001/g;
+
+// 箇条書き項目の切れ目に置く無音の既定の長さ（秒）。
+export const DEFAULT_LIST_PAUSE_SEC = 0.3;
+
+/**
+ * 行末の空白の手前へ印を入れる。
+ * 印を空白の後ろへ置くと、空白をまとめる処理と trim を印が遮り、印の有無で
+ * 読み上げるテキストが変わってしまう。
+ * 位置は末尾から数えて求める。`/([ \t　]*)$/` のような正規表現は、行末が空白で
+ * 終わらない行だと開始位置ごとに空白を数え直すため、入力長の二乗に膨らむ。
+ */
+function insertBoundaryBeforeTrailingSpace(line) {
+  let end = line.length;
+  while (end > 0 && (line[end - 1] === ' ' || line[end - 1] === '\t' || line[end - 1] === '　')) end -= 1;
+  return line.slice(0, end) + LIST_BOUNDARY + line.slice(end);
+}
+
+/**
+ * 先頭と末尾の印を空白ごと落とす。
+ * 先頭の印は直前に項目が無く、末尾の印は続く項目が無いので、どちらも間を持たない。
+ * 印は空白ではないので、残すと前後の trim を遮って印の有無で整形結果が変わってしまう。
+ */
+function trimBoundaryEdges(text) {
+  return text.replace(/^(?:\u0001|\s)+/, '').replace(/(?:\u0001|\s)+$/, '');
+}
+
+/** 項目の切れ目のマーカーを取り除く。 */
+export function stripListBoundaries(text) {
+  return typeof text === 'string' ? text.replace(LIST_BOUNDARY_RE, '') : '';
+}
+
+/**
+ * 項目の切れ目で区切って fn を掛け、切れ目を保ったまま繋ぎ直す。
+ * 辞書の置換ルールのように整形後のテキストへ正規表現を当てる処理は、印を挟んだまま
+ * 渡すと行頭・行末の判定が狂う。印を境に分けて掛ければ、行末に掛かるルールが印の有無に
+ * 関わらず同じ位置で一致する。
+ * 既知の限界：項目をまたぐルールは一致しなくなり、`^` を先頭に置いたルールは
+ * （分けた断片それぞれの先頭に当たるため）項目の先頭にも一致するようになる。
+ */
+export function mapListSegments(text, fn) {
+  if (typeof text !== 'string') return '';
+  if (!text.includes(LIST_BOUNDARY)) return fn(text);
+  return text.split(LIST_BOUNDARY).map(fn).join(LIST_BOUNDARY);
+}
+
 function applyCodeBlocks(text, mode, placeholder) {
   if (mode === 'read') return text;
   const rep = mode === 'placeholder' ? `。${placeholder}。` : ' ';
@@ -332,23 +395,33 @@ function applyTables(text, mode) {
 
 function limitSentences(text, max) {
   if (!max || max <= 0) return { text, truncated: false };
-  const sentences = text.split(SENTENCE_END).filter((s) => s.trim().length > 0);
+  // 項目の切れ目のマーカーは読み上げない文字なので、それだけの断片は文と数えない。
+  const sentences = text.split(SENTENCE_END).filter((s) => stripListBoundaries(s).trim().length > 0);
   if (sentences.length <= max) return { text, truncated: false };
   return { text: sentences.slice(0, max).join(''), truncated: true };
 }
 
 function limitChars(text, max) {
-  if (!max || max <= 0 || text.length <= max) return { text, truncated: false };
-  return { text: text.slice(0, max), truncated: true };
+  if (!max || max <= 0) return { text, truncated: false };
+  // 同じく、マーカーは文字数に数えない。設定した文字数と実際に読む長さをずらさないため。
+  let count = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === LIST_BOUNDARY) continue;
+    count += 1;
+    if (count > max) return { text: text.slice(0, i), truncated: true };
+  }
+  return { text, truncated: false };
 }
 
 /**
  * @param {string} input 生テキスト
  * @param {object} f     textFilter 設定
- * @returns {{ text: string, truncated: boolean }}
+ * @returns {{ text: string, marked: string, truncated: boolean }}
+ *   text は表示・ログ用（項目の切れ目のマーカーを含まない）、
+ *   marked は読み上げ用（マーカー入り。発話キューがここでチャンクを割る）。
  */
 export function filterText(input, f = {}) {
-  if (typeof input !== 'string') return { text: '', truncated: false };
+  if (typeof input !== 'string') return { text: '', marked: '', truncated: false };
   let t = input;
 
   if (f.thinkingBlocks !== false) t = t.replace(THINKING, ' ');
@@ -365,6 +438,19 @@ export function filterText(input, f = {}) {
   if (f.headings) t = t.replace(HEADING_LINE, ' ');
   else t = t.replace(HEADING_MARK, '');
 
+  // 箇条書き項目の切れ目に印を付ける。記号を外したあとでは、どの行が項目だったかを
+  // 判別できなくなるので、必ず LIST_MARKER の除去より先に行う。
+  // 間を置かない設定 (0 以下) のときは印そのものを付けず、今までと同じ経路に保つ。
+  // 既知の限界：コードブロックをそのまま読む設定では、コード中の `- ` 行にも印が付く。
+  // 記号を外す LIST_MARKER も同じ範囲を対象にしているので、扱いとしては一貫している。
+  const listPauseSec = Number(f.listPauseSec ?? DEFAULT_LIST_PAUSE_SEC);
+  const marksList = Number.isFinite(listPauseSec) && listPauseSec > 0;
+  if (marksList) {
+    t = t.replace(LIST_ITEM_LINE, (line) => (
+      LIST_SYMBOL_ONLY.test(line) ? line : insertBoundaryBeforeTrailingSpace(line)
+    ));
+  }
+
   if (f.listMarkers !== false) t = t.replace(LIST_MARKER, '');
 
   t = t.replace(HR, ' ').replace(BLOCKQUOTE, '');
@@ -379,16 +465,32 @@ export function filterText(input, f = {}) {
 
   if (f.collapseWhitespace !== false) {
     t = t.replace(/[ \t　]+/g, ' ').replace(/\s*\n\s*/g, '\n').replace(/\n{2,}/g, '\n');
+    if (marksList) {
+      // 絵文字や罫線の除去は印を付けたあとに走るので、印の手前へ空白が生まれることがある。
+      // 印は空白ではなく、畳み込みも trim も素通りさせてしまうため、ここで落とす。
+      // 中身が残らなかった項目（絵文字だけの行など）は、印ごと落として空行を作らない。
+      t = t.replace(/[ \t　]+(?=\u0001)/g, '').replace(/^\u0001\n?/gm, '');
+    }
   }
-  t = t.trim();
+  if (marksList) {
+    // 中身が残らなかった項目の印は、空白をまとめない設定でも落とす（空白と改行はそのまま）。
+    // 印を寄せる前なら、行頭に立っている印は「中身が空だった項目」だけを指す。
+    t = t.replace(/^([ \t　]*)\u0001/gm, '$1');
+    // 印を「項目を終える改行の直後」へ寄せる。行末に居座らせると、整形後のテキストへ掛ける
+    // 辞書の置換ルールや文の区切りの判定が、印の有無で変わってしまう。
+    // CRLF の入力では改行が \r だけになって残ることがあるので、そちらも改行として扱う。
+    t = t.replace(/\u0001(\s*[\r\n])/g, '$1\u0001');
+  }
+  t = trimBoundaryEdges(t);
 
   const bySentence = limitSentences(t, f.maxSentences);
   const byChar = limitChars(bySentence.text, f.maxChars);
   const truncated = bySentence.truncated || byChar.truncated;
-  let out = byChar.text.trim();
+  // 上限で切ったあとにも端へ印が残りうる（読み上げの始めと終わりで間は置かない）。
+  let out = trimBoundaryEdges(byChar.text);
   if (truncated && f.truncationSuffix) out += `。${f.truncationSuffix}。`;
 
-  return { text: out, truncated };
+  return { text: stripListBoundaries(out), marked: out, truncated };
 }
 
 /** テンプレート内の {field} をペイロードの値で置換する。 */

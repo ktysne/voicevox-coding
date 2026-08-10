@@ -4,7 +4,8 @@ import crypto from 'node:crypto';
 import { beforeEach, afterEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CACHE_DIR } from '../src/daemon/config.js';
-import { SpeechQueue } from '../src/daemon/queue.js';
+import { SpeechQueue, chunkText } from '../src/daemon/queue.js';
+import { LIST_BOUNDARY } from '../src/daemon/textfilter.js';
 
 // SpeechQueue は再生対象をキャッシュへ書くため、テストでは I/O だけ抑止する。
 // FakePlayer はパスを読む必要がないので、キューの状態遷移をそのまま検証できる。
@@ -43,10 +44,13 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 class FakePlayer {
   constructor() {
     this.calls = [];
+    // PLAY を受けた時刻。チャンク間に置く間の長さを測るのに使う。
+    this.playAt = [];
   }
 
   async play(file) {
     this.calls.push(['play', file]);
+    this.playAt.push(Date.now());
   }
 
   async hold() {
@@ -393,4 +397,109 @@ test('skip と clear は STOP を送る', async () => {
   } finally {
     cleanupCache(files, existing);
   }
+});
+
+// ---------------------------------------------------------------- 箇条書きの間 (#15)
+
+test('項目の切れ目をまたいでチャンクを結合しない (#15)', () => {
+  const text = `項目1${LIST_BOUNDARY}\n項目2${LIST_BOUNDARY}\n項目3${LIST_BOUNDARY}`;
+  const chunks = chunkText(text, 100);
+  // 3 項目が 1 つにまとまらず、印そのものはチャンクへ残らない
+  assert.deepEqual(chunks.map((c) => c.text), ['項目1', '項目2', '項目3']);
+  assert.ok(chunks.every((c) => !c.text.includes(LIST_BOUNDARY)));
+  // 間を置くのは項目のあいだだけ。発話の末尾では置かない
+  assert.deepEqual(chunks.map((c) => c.pauseAfter), [true, true, false]);
+});
+
+test('長い項目が途中で割れても切れ目の印は最後の断片に付く (#15)', () => {
+  const long = 'あ'.repeat(150);
+  const chunks = chunkText(`${long}${LIST_BOUNDARY}\n次の項目`, 100);
+  assert.ok(chunks.length >= 3);
+  assert.equal(chunks[chunks.length - 2].pauseAfter, true);
+  assert.equal(chunks[chunks.length - 1].text, '次の項目');
+});
+
+test('切れ目が無ければ従来どおり 1 チャンクにまとまる (#15)', () => {
+  assert.deepEqual(chunkText('一文目です。二文目です。', 100), [{ text: '一文目です。二文目です。', pauseAfter: false }]);
+});
+
+test('項目の切れ目では次のチャンクまで間を置く (#15)', async () => {
+  const player = new FakePlayer();
+  const queue = makeQueue(player, { chunkChars: 100, cacheEnabled: false });
+  queue.enqueue({
+    target: 'test',
+    event: 'test',
+    text: `項目1${LIST_BOUNDARY}\n項目2`,
+    speaker: 1,
+    voice: {},
+    queuePolicy: { policy: 'enqueue' },
+    listPauseSec: 0.15,
+  });
+  await waitIdle(queue);
+  // 間は HOLD (無音ループ) を掛けたまま待つ
+  assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'play']);
+  const gap = player.playAt[1] - player.playAt[0];
+  assert.ok(gap >= 120, `間が短すぎます: ${gap}ms`);
+});
+
+test('listPauseSec が 0 なら間を置かない (#15)', async () => {
+  const player = new FakePlayer();
+  const queue = makeQueue(player, { chunkChars: 100, cacheEnabled: false });
+  queue.enqueue({
+    target: 'test',
+    event: 'test',
+    text: `項目1${LIST_BOUNDARY}\n項目2`,
+    speaker: 1,
+    voice: {},
+    queuePolicy: { policy: 'enqueue' },
+    listPauseSec: 0,
+  });
+  await waitIdle(queue);
+  assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'play']);
+  // 間なしの実測は 10ms 未満。負荷の高い環境でも揺れないよう、余裕を持って見る。
+  const gap = player.playAt[1] - player.playAt[0];
+  assert.ok(gap < 120, `間が入っています: ${gap}ms`);
+});
+
+test('キューの状態と重複判定には切れ目の印を残さない (#15)', async () => {
+  const player = new FakePlayer();
+  const queue = makeQueue(player, { cacheEnabled: false });
+  queue.enqueue({
+    target: 'test',
+    event: 'test',
+    text: `項目1${LIST_BOUNDARY}\n項目2`,
+    speaker: 1,
+    voice: {},
+    queuePolicy: { policy: 'enqueue', dedupeWindowSec: 10 },
+  });
+  const shown = queue.state.current?.text ?? queue.state.queued[0]?.text;
+  assert.equal(shown, '項目1\n項目2');
+  for (const key of queue.recent.keys()) assert.ok(!key.includes(LIST_BOUNDARY));
+  // 読み上げが次のテストへまたいで走り続けないよう、ここで畳んでおく
+  await waitIdle(queue);
+});
+
+test('HOLD に失敗したときは間を置かずに次のチャンクへ進む (#15)', async () => {
+  class NoHoldPlayer extends FakePlayer {
+    async hold() {
+      this.calls.push(['hold']);
+      throw new Error('無音ループを開始できません');
+    }
+  }
+  const player = new NoHoldPlayer();
+  const queue = makeQueue(player, { chunkChars: 100, cacheEnabled: false });
+  queue.enqueue({
+    target: 'test',
+    event: 'test',
+    text: `項目1${LIST_BOUNDARY}\n項目2`,
+    speaker: 1,
+    voice: {},
+    queuePolicy: { policy: 'enqueue' },
+    listPauseSec: 0.3,
+  });
+  await waitIdle(queue);
+  // 無音を掴めていない状態で待つと、間のあとの出だしが欠ける。間は諦めて先へ進む。
+  // 指定の間は 300ms なので、120ms を超えなければ「待っていない」と言い切れる。
+  const gap = player.playAt[1] - player.playAt[0];
+  assert.ok(gap < 120, `HOLD 失敗時に間を置いています: ${gap}ms`);
 });

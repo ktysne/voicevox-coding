@@ -3,7 +3,7 @@
 
 import vm from 'node:vm';
 import { EVENT_BY_NAME } from './catalog.js';
-import { filterText, renderTemplate } from './textfilter.js';
+import { filterText, renderTemplate, stripListBoundaries, mapListSegments } from './textfilter.js';
 import { applyReplacements } from './dictionary.js';
 
 /** ツール名フィルタ。PreToolUse / PostToolUse / 許可待ちに適用する。 */
@@ -116,8 +116,9 @@ export function matchesIgnorePattern(text, patterns, problems = []) {
 
 /**
  * problems には無視パターンのうち使えなかったものの説明が入る。呼び出し側でログに出す。
+ * text は表示・ログ用、speechText は発話キューへ渡す読み上げ用（項目の切れ目の印つき）。
  * @returns {{ speak:false, reason:string, problems?:string[] }
- *   | { speak:true, text:string, event:string, problems:string[] }}
+ *   | { speak:true, text:string, speechText:string, event:string, problems:string[] }}
  */
 export function resolveUtterance({ eventName, payload, profile, dictionary }) {
   if (!profile) return { speak: false, reason: 'unknown-target' };
@@ -163,8 +164,12 @@ export function resolveUtterance({ eventName, payload, profile, dictionary }) {
   const filtered = filterText(raw, profile.textFilter);
   if (!filtered.text) return { speak: false, reason: 'filtered-out', problems };
 
-  const spoken = applyReplacements(filtered.text, dictionary?.replacements ?? []);
-  if (!spoken.trim()) return { speak: false, reason: 'filtered-out', problems };
+  // 置換は読み上げ用のテキスト（項目の切れ目の印つき）へ掛ける。印を挟んだまま渡すと
+  // 正規表現ルールの行頭・行末の判定が狂うので、切れ目で区切って掛ける。
+  // 表示・ログ用の text は印を外したもので、印は発話キューへ渡す speechText にだけ残す。
+  const spoken = mapListSegments(filtered.marked, (s) => applyReplacements(s, dictionary?.replacements ?? []));
+  const display = stripListBoundaries(spoken);
+  if (!display.trim()) return { speak: false, reason: 'filtered-out', problems };
 
-  return { speak: true, text: spoken, event: eventName, truncated: filtered.truncated, problems };
+  return { speak: true, text: display, speechText: spoken, event: eventName, truncated: filtered.truncated, problems };
 }
