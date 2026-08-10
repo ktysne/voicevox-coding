@@ -12,9 +12,6 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-# stderr はデーモンが utf8 として読むので、日本語が化けないよう揃える。
-# コンソールを持たない起動のされ方では設定できないことがあるため、失敗は無視する。
-try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -61,14 +58,27 @@ $Icons = @{
 
 # ---------------------------------------------------------------- HTTP
 
-# 直近の Invoke-Daemon が成功したか。呼び出し側が失敗を検知するために使う。
-# 戻り値では判定しない（本文の無い成功応答も $null になり、失敗と区別が付かない）。
-$script:lastDaemonCallOk = $false
+# デーモン（src/daemon/tray.js）は子プロセスの stderr を utf8 として読み、警告ログへ転送する。
+# [Console]::OutputEncoding の書き換えはコンソールのコードページに依存するので、
+# stderr のストリームへ直接 UTF-8（BOM 無し）で書く。
+$script:stderrWriter = $null
+function Write-Stderr([string]$line) {
+    if ($null -eq $script:stderrWriter) {
+        $script:stderrWriter = New-Object System.IO.StreamWriter -ArgumentList @(
+            [Console]::OpenStandardError(),
+            (New-Object System.Text.UTF8Encoding -ArgumentList $false)
+        )
+        $script:stderrWriter.AutoFlush = $true
+    }
+    $script:stderrWriter.WriteLine($line)
+}
 
 # $action には「発話のスキップ」のような操作名を渡す。失敗したときに stderr へ 1 行出す。
 # 省略した場合（既定の空文字）は失敗を通知しない。
-function Invoke-Daemon([string]$path, [string]$method = 'GET', $body = $null, [string]$action = '') {
-    $script:lastDaemonCallOk = $false
+# $ok に [ref] を渡すと成否を受け取れる。戻り値では判定できない
+# （本文の無い成功応答も $null になり、失敗と区別が付かない）。
+# [ref] 型で宣言すると省略できなくなるため、型は付けずに中で確かめる。
+function Invoke-Daemon([string]$path, [string]$method = 'GET', $body = $null, [string]$action = '', $ok = $null) {
     try {
         $params = @{ Uri = "$Base$path"; Method = $method; TimeoutSec = 3 }
         # 状態変更 API は起動ごとのトークンを要求する (AUD-01)
@@ -88,29 +98,26 @@ function Invoke-Daemon([string]$path, [string]$method = 'GET', $body = $null, [s
             $params['ContentType'] = 'application/json'
         }
         $result = Invoke-RestMethod @params
-        $script:lastDaemonCallOk = $true
+        if ($ok -is [ref]) { $ok.Value = $true }
         return $result
     }
     catch {
+        if ($ok -is [ref]) { $ok.Value = $false }
         # 失敗を黙って捨てると不具合が長く気づかれない（#31 の 415 がそうだった）。
         # stderr はデーモンの警告ログへ転送されるので、そこへ 1 行残す。
         # ただし 2 秒ごとのポーリング（/api/state）はデーモン停止中に鳴り続けるため、
         # $action を渡さない呼び出し（＝ユーザー操作起点でないもの）は黙って捨てる。
         if ($action) {
+            # Windows PowerShell 5.1 の Invoke-RestMethod は応答本文を ErrorDetails に載せない。
+            # 代わりに例外のメッセージを使う（HTTP エラーなら状態コードが含まれる。
+            # #31 の 415 なら「(415) Unsupported Media Type」まで分かる）。
             $reason = ($_.Exception.Message -replace '\s+', ' ').Trim()
+            if ($reason.Length -gt 200) { $reason = $reason.Substring(0, 200) }
             # ${} で囲まないと、後続の日本語まで変数名として読まれる
-            [Console]::Error.WriteLine("${action}に失敗しました: $reason")
+            Write-Stderr "${action}に失敗しました: $reason"
         }
         return $null
     }
-}
-
-# デーモン（このトレイの親プロセス）が生きているか。
-# ParentPid が渡されていない構成では判定できないので「生きている」側に倒す
-# （本当に落ちていれば、応答なしが続いたときの判定がいずれトレイを畳む）。
-function Test-DaemonAlive {
-    if ($ParentPid -le 0) { return $true }
-    return $null -ne (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)
 }
 
 # ---------------------------------------------------------------- メニュー
@@ -150,7 +157,7 @@ function Stop-Tray {
 $miOpen.Add_Click({ Start-Process $Base })
 $notify.Add_DoubleClick({ Start-Process $Base })
 $miSkip.Add_Click({ Invoke-Daemon '/api/skip' 'POST' -Action '発話のスキップ' | Out-Null })
-$miClear.Add_Click({ Invoke-Daemon '/api/clear' 'POST' -Action 'すべての停止' | Out-Null })
+$miClear.Add_Click({ Invoke-Daemon '/api/clear' 'POST' -Action '読み上げの全停止' | Out-Null })
 $miLog.Add_Click({ Start-Process explorer.exe $LogDir })
 
 $script:muted = $false
@@ -173,21 +180,28 @@ $miEngine.Add_Click({
 })
 
 $miExit.Add_Click({
-    Invoke-Daemon '/api/shutdown' 'POST' -Action 'デーモンの停止' | Out-Null
+    $accepted = $false
+    Invoke-Daemon '/api/shutdown' 'POST' -Action 'デーモンの停止' -Ok ([ref]$accepted) | Out-Null
 
     # 停止 API はデーモン自身を落とす前に応答を返す実装なので、
     # 応答が返った時点で「受理された」と見なしてよい。
-    if ($script:lastDaemonCallOk) { Stop-Tray; return }
+    if ($accepted) { Stop-Tray; return }
 
-    # 応答が無いのがデーモンの消滅によるものなら、常駐を続ける意味は無い。
-    if (-not (Test-DaemonAlive)) { Stop-Tray; return }
+    # 停止できなかったのがデーモン側の消滅・沈黙によるものなら、
+    # トレイを残しても停止手段にはならないので畳む。
+    # 判定は親 PID の有無ではなく応答性で行う（HTTP が詰まっている場合や
+    # PID が再利用された場合に「生きている」と誤判定しないため）。
+    # /api/config は外部プロセスに触らない一番軽い GET。
+    $responding = $false
+    Invoke-Daemon '/api/config' -Ok ([ref]$responding) | Out-Null
+    if (-not $responding) { Stop-Tray; return }
 
-    # デーモンは生きているのに停止できなかった場合だけトレイを残す。
+    # デーモンは応答しているのに停止だけ失敗した場合はトレイを残す。
     # ここで畳むと、利用者は GUI からの停止手段を失う (#35)。
     $notify.ShowBalloonTip(
         5000,
         'VOICEVOX Coding',
-        'デーモンを停止できませんでした。管理コンソールから状態を確認してください。',
+        'デーモンを停止できませんでした。もう一度お試しください。続くようなら管理コンソールのログを確認してください。',
         [System.Windows.Forms.ToolTipIcon]::Error
     )
 })
@@ -200,7 +214,10 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 2000
 $timer.Add_Tick({
     # 親（デーモン）が消えていたらトレイも畳む
-    if (-not (Test-DaemonAlive)) { Stop-Tray; return }
+    if ($ParentPid -gt 0) {
+        $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+        if (-not $parent) { Stop-Tray; return }
+    }
 
     $state = Invoke-Daemon '/api/state'
     if ($null -eq $state) {
