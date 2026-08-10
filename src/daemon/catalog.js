@@ -160,6 +160,10 @@ export function eventsForTarget(target) {
  * ただしこの印を付けたパラメータの default は後から変えてはならない。
  * 変えると、新しい既定値で合成したつもりの音声が、旧既定値で作られた
  * キャッシュと同じキーになってしまう。
+ * 同じ理由で、この配列の並び替えも避けること。キャッシュキーは voice を
+ * JSON 化して作るためキーの順序に依存しており、並べ替えると利用者の
+ * 既存キャッシュが丸ごと無効化される。逆に、上の印を付けたパラメータなら
+ * どの位置へ挿しても、キーから除いた後の並びは変わらないので影響しない。
  */
 export const VOICE_PARAMS = [
   { key: 'speedScale', label: '話す速さ', min: 0.5, max: 2.0, step: 0.05, default: 1.0, unit: '倍' },
@@ -169,7 +173,7 @@ export const VOICE_PARAMS = [
   { key: 'prePhonemeLength', label: '開始の無音', min: 0.0, max: 1.5, step: 0.05, default: 0.1, unit: '秒' },
   { key: 'postPhonemeLength', label: '終了の無音', min: 0.0, max: 1.5, step: 0.05, default: 0.1, unit: '秒' },
   // VOICEVOX アプリの「間の長さ」に相当する句読点前後の無音の倍率。範囲もアプリに合わせている。
-  // ENGINE 0.25 系で追加されたフィールド。未対応の古い ENGINE ではクエリに現れないので
+  // ENGINE 0.25.2 の /audio_query 応答で存在を確認したフィールド。持たない古い ENGINE ではクエリに現れないので
   // 送られず（voicevox.js の audioQuery を参照）、指定しても効かないだけで合成は通る。
   { key: 'pauseLengthScale', label: '間の長さ', min: 0.0, max: 2.0, step: 0.05, default: 1.0, unit: '倍', omitFromCacheKeyWhenDefault: true },
 ];

@@ -84,7 +84,7 @@ export class VoicevoxEngine {
     // かどうかを ENGINE 側の寛容さに頼らずに済み、パラメータを増やしても
     // 古い ENGINE で合成が 422 になったりしない。
     for (const [k, v] of Object.entries(voiceParams)) {
-      if (!(k in q)) continue;
+      if (!Object.hasOwn(q, k)) continue;
       if (typeof v === 'number' && Number.isFinite(v)) q[k] = v;
     }
     return q;
