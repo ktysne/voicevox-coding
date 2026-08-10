@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EVENTS, VOICE_PARAMS, TARGETS, eventsForTarget } from './catalog.js';
 import { resolveUtterance, matchesIgnorePattern, resetIgnoreMatchState } from './events.js';
-import { filterText, stripListBoundaries } from './textfilter.js';
+import { filterText, stripListBoundaries, mapListSegments } from './textfilter.js';
 import { applyReplacements, syncEngineDictionary, validateEngineWord } from './dictionary.js';
 import { CONFIG_PATH } from './config.js';
 import { detectEnginePath } from './engine-process.js';
@@ -413,9 +413,10 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           return;
         }
         const filtered = filterText(text ?? '', profile.textFilter);
-        // 置換の入力を実際の読み上げと同じ（項目の切れ目の印つき）に揃えてから印を外す。
-        // 揃えないと、切れ目をまたぐ正規表現の置換ルールでプレビューと発話がずれる。
-        const spoken = stripListBoundaries(applyReplacements(filtered.marked, store.config.dictionary?.replacements ?? []));
+        // 置換の入力を実際の読み上げと同じ（項目の切れ目で区切った印つき）に揃えてから印を外す。
+        // 揃えないと、行末に掛かる正規表現の置換ルールでプレビューと発話がずれる。
+        const replaced = mapListSegments(filtered.marked, (s) => applyReplacements(s, store.config.dictionary?.replacements ?? []));
+        const spoken = stripListBoundaries(replaced);
         json(res, 200, { text: spoken, truncated: filtered.truncated, chars: spoken.length, ignored: false });
         return;
       }
@@ -440,7 +441,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           }
           const filtered = filterText(spoken, profile.textFilter);
           // 試聴でも本番と同じ間で聞けるよう、項目の切れ目の印つきのまま渡す。
-          spoken = applyReplacements(filtered.marked, store.config.dictionary?.replacements ?? []);
+          spoken = mapListSegments(filtered.marked, (s) => applyReplacements(s, store.config.dictionary?.replacements ?? []));
         }
         const display = stripListBoundaries(spoken);
         if (!display.trim()) {

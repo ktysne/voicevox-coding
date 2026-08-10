@@ -3,7 +3,7 @@
 
 import vm from 'node:vm';
 import { EVENT_BY_NAME } from './catalog.js';
-import { filterText, renderTemplate, stripListBoundaries } from './textfilter.js';
+import { filterText, renderTemplate, stripListBoundaries, mapListSegments } from './textfilter.js';
 import { applyReplacements } from './dictionary.js';
 
 /** ツール名フィルタ。PreToolUse / PostToolUse / 許可待ちに適用する。 */
@@ -164,9 +164,10 @@ export function resolveUtterance({ eventName, payload, profile, dictionary }) {
   const filtered = filterText(raw, profile.textFilter);
   if (!filtered.text) return { speak: false, reason: 'filtered-out', problems };
 
-  // 置換は読み上げ用のテキスト（項目の切れ目の印つき）へ掛ける。
+  // 置換は読み上げ用のテキスト（項目の切れ目の印つき）へ掛ける。印を挟んだまま渡すと
+  // 正規表現ルールの行頭・行末の判定が狂うので、切れ目で区切って掛ける。
   // 表示・ログ用の text は印を外したもので、印は発話キューへ渡す speechText にだけ残す。
-  const spoken = applyReplacements(filtered.marked, dictionary?.replacements ?? []);
+  const spoken = mapListSegments(filtered.marked, (s) => applyReplacements(s, dictionary?.replacements ?? []));
   const display = stripListBoundaries(spoken);
   if (!display.trim()) return { speak: false, reason: 'filtered-out', problems };
 

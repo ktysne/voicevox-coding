@@ -1,7 +1,7 @@
 // node --test test/
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { filterText, renderTemplate, stripListBoundaries, LIST_BOUNDARY } from '../src/daemon/textfilter.js';
+import { filterText, renderTemplate, stripListBoundaries, mapListSegments, LIST_BOUNDARY } from '../src/daemon/textfilter.js';
 import { chunkText } from '../src/daemon/queue.js';
 import { applyReplacements, validateEngineWord } from '../src/daemon/dictionary.js';
 import { resolveUtterance, resetIgnoreMatchState, IGNORE_MATCH_BUDGET_MS, IGNORE_MATCH_PATTERN_MS } from '../src/daemon/events.js';
@@ -312,14 +312,14 @@ test('箇条書きの項目の切れ目が marked に残る (#15)', () => {
   // 読み上げ・表示に使う text には印を残さない
   assert.equal(text, '項目1\n項目2\n項目3');
   assert.doesNotMatch(text, new RegExp(LIST_BOUNDARY));
-  // 項目の切れ目は marked 側にだけ残る（末尾のぶんも含めて 3 つ）
-  assert.equal(marked.split(LIST_BOUNDARY).length - 1, 3);
+  // 項目の切れ目は marked 側にだけ残る。末尾には続く項目が無いので印は付かない
+  assert.equal(marked.split(LIST_BOUNDARY).length - 1, 2);
   assert.equal(stripListBoundaries(marked), text);
 });
 
 test('番号付きリストと入れ子の項目にも切れ目が付く (#15)', () => {
   const { marked } = filterText('1. 一つ目\n2. 二つ目\n  - 子項目', { ...F, codeBlock: 'read' });
-  assert.equal(marked.split(LIST_BOUNDARY).length - 1, 3);
+  assert.equal(marked.split(LIST_BOUNDARY).length - 1, 2);
 });
 
 test('箇条書き以外の行には切れ目が付かない (#15)', () => {
@@ -343,11 +343,39 @@ test('切れ目の印を入れても読み上げるテキストは変わらな�
     '1. 一つ目 \n2. 二つ目',
     '本文です。\n- 項目1\n- 項目2\n続きの本文です。',
   ];
+  // 空白をまとめない設定でも、文数の上限と併用しても変わらないこと
+  const variants = [F, { ...F, collapseWhitespace: false }, { ...F, maxSentences: 2 }];
   for (const input of inputs) {
-    const withPause = filterText(input, F);
-    const without = filterText(input, { ...F, listPauseSec: 0 });
-    assert.equal(withPause.text, without.text, `印の有無で整形結果が変わりました: ${JSON.stringify(input)}`);
+    for (const base of variants) {
+      const withPause = filterText(input, base);
+      const without = filterText(input, { ...base, listPauseSec: 0 });
+      assert.equal(withPause.text, without.text, `印の有無で整形結果が変わりました: ${JSON.stringify(input)}`);
+    }
   }
+});
+
+test('切れ目の印は辞書の置換ルールの当たり方を変えない (#15)', () => {
+  // 印が行末に居座ると `…$` のような正規表現ルールが一致しなくなる。
+  // 実際の読み上げと同じ経路（切れ目で区切ってから置換）で一致することを確かめる。
+  const rules = [
+    { pattern: '項目$', replacement: 'アイテム', regex: true, enabled: true },
+    { pattern: 'ました\\n', replacement: 'ました。', regex: true, enabled: true },
+  ];
+  const input = '- 完了しました\n- 次の項目';
+  const withPause = filterText(input, F);
+  const without = filterText(input, { ...F, listPauseSec: 0 });
+  const applied = stripListBoundaries(mapListSegments(withPause.marked, (s) => applyReplacements(s, rules)));
+  assert.equal(applied, applyReplacements(without.text, rules));
+  assert.match(applied, /アイテム/);
+});
+
+test('空白だけが続く行があっても整形が遅くならない (#15)', () => {
+  // 項目行の判定に先読みを埋め込むと、この形の入力で入力長の二乗に劣化する。
+  const input = `- 項目\n${' '.repeat(20000)}\n- 次の項目`;
+  const started = Date.now();
+  filterText(input, F);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 500, `整形に時間がかかりすぎです: ${elapsed}ms`);
 });
 
 test('切れ目の印は最大文字数の数えかたも変えない (#15)', () => {
