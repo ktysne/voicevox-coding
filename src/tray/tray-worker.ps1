@@ -12,6 +12,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# stderr はデーモンが utf8 として読むので、日本語が化けないよう揃える。
+# コンソールを持たない起動のされ方では設定できないことがあるため、失敗は無視する。
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -58,7 +61,14 @@ $Icons = @{
 
 # ---------------------------------------------------------------- HTTP
 
-function Invoke-Daemon([string]$path, [string]$method = 'GET', $body = $null) {
+# 直近の Invoke-Daemon が成功したか。呼び出し側が失敗を検知するために使う。
+# 戻り値では判定しない（本文の無い成功応答も $null になり、失敗と区別が付かない）。
+$script:lastDaemonCallOk = $false
+
+# $action には「発話のスキップ」のような操作名を渡す。失敗したときに stderr へ 1 行出す。
+# 省略した場合（既定の空文字）は失敗を通知しない。
+function Invoke-Daemon([string]$path, [string]$method = 'GET', $body = $null, [string]$action = '') {
+    $script:lastDaemonCallOk = $false
     try {
         $params = @{ Uri = "$Base$path"; Method = $method; TimeoutSec = 3 }
         # 状態変更 API は起動ごとのトークンを要求する (AUD-01)
@@ -77,11 +87,30 @@ function Invoke-Daemon([string]$path, [string]$method = 'GET', $body = $null) {
             $params['Body'] = '{}'
             $params['ContentType'] = 'application/json'
         }
-        return Invoke-RestMethod @params
+        $result = Invoke-RestMethod @params
+        $script:lastDaemonCallOk = $true
+        return $result
     }
     catch {
+        # 失敗を黙って捨てると不具合が長く気づかれない（#31 の 415 がそうだった）。
+        # stderr はデーモンの警告ログへ転送されるので、そこへ 1 行残す。
+        # ただし 2 秒ごとのポーリング（/api/state）はデーモン停止中に鳴り続けるため、
+        # $action を渡さない呼び出し（＝ユーザー操作起点でないもの）は黙って捨てる。
+        if ($action) {
+            $reason = ($_.Exception.Message -replace '\s+', ' ').Trim()
+            # ${} で囲まないと、後続の日本語まで変数名として読まれる
+            [Console]::Error.WriteLine("${action}に失敗しました: $reason")
+        }
         return $null
     }
+}
+
+# デーモン（このトレイの親プロセス）が生きているか。
+# ParentPid が渡されていない構成では判定できないので「生きている」側に倒す
+# （本当に落ちていれば、応答なしが続いたときの判定がいずれトレイを畳む）。
+function Test-DaemonAlive {
+    if ($ParentPid -le 0) { return $true }
+    return $null -ne (Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)
 }
 
 # ---------------------------------------------------------------- メニュー
@@ -120,31 +149,47 @@ function Stop-Tray {
 
 $miOpen.Add_Click({ Start-Process $Base })
 $notify.Add_DoubleClick({ Start-Process $Base })
-$miSkip.Add_Click({ Invoke-Daemon '/api/skip' 'POST' | Out-Null })
-$miClear.Add_Click({ Invoke-Daemon '/api/clear' 'POST' | Out-Null })
+$miSkip.Add_Click({ Invoke-Daemon '/api/skip' 'POST' -Action '発話のスキップ' | Out-Null })
+$miClear.Add_Click({ Invoke-Daemon '/api/clear' 'POST' -Action 'すべての停止' | Out-Null })
 $miLog.Add_Click({ Start-Process explorer.exe $LogDir })
 
 $script:muted = $false
 $miMute.Add_Click({
     $next = -not $script:muted
-    Invoke-Daemon '/api/mute' 'POST' @{ muted = $next } | Out-Null
+    $label = if ($next) { '読み上げの一時停止' } else { '読み上げの再開' }
+    Invoke-Daemon '/api/mute' 'POST' @{ muted = $next } -Action $label | Out-Null
 })
 
 $script:engineUp = $false
 $miEngine.Add_Click({
     if ($script:engineUp) {
         $notify.Text = 'VOICEVOX Coding — エンジンを停止しています'
-        Invoke-Daemon '/api/engine/stop' 'POST' | Out-Null
+        Invoke-Daemon '/api/engine/stop' 'POST' -Action 'エンジンの停止' | Out-Null
     } else {
         $notify.Text = 'VOICEVOX Coding — エンジンを起動しています'
         $notify.ShowBalloonTip(4000, 'VOICEVOX Coding', 'エンジンを起動しています。初回はモデル読み込みに時間がかかります。', [System.Windows.Forms.ToolTipIcon]::Info)
-        Invoke-Daemon '/api/engine/start' 'POST' | Out-Null
+        Invoke-Daemon '/api/engine/start' 'POST' -Action 'エンジンの起動' | Out-Null
     }
 })
 
 $miExit.Add_Click({
-    Invoke-Daemon '/api/shutdown' 'POST' | Out-Null
-    Stop-Tray
+    Invoke-Daemon '/api/shutdown' 'POST' -Action 'デーモンの停止' | Out-Null
+
+    # 停止 API はデーモン自身を落とす前に応答を返す実装なので、
+    # 応答が返った時点で「受理された」と見なしてよい。
+    if ($script:lastDaemonCallOk) { Stop-Tray; return }
+
+    # 応答が無いのがデーモンの消滅によるものなら、常駐を続ける意味は無い。
+    if (-not (Test-DaemonAlive)) { Stop-Tray; return }
+
+    # デーモンは生きているのに停止できなかった場合だけトレイを残す。
+    # ここで畳むと、利用者は GUI からの停止手段を失う (#35)。
+    $notify.ShowBalloonTip(
+        5000,
+        'VOICEVOX Coding',
+        'デーモンを停止できませんでした。管理コンソールから状態を確認してください。',
+        [System.Windows.Forms.ToolTipIcon]::Error
+    )
 })
 
 # ---------------------------------------------------------------- 状態の反映
@@ -155,10 +200,7 @@ $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 2000
 $timer.Add_Tick({
     # 親（デーモン）が消えていたらトレイも畳む
-    if ($ParentPid -gt 0) {
-        $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
-        if (-not $parent) { Stop-Tray; return }
-    }
+    if (-not (Test-DaemonAlive)) { Stop-Tray; return }
 
     $state = Invoke-Daemon '/api/state'
     if ($null -eq $state) {
