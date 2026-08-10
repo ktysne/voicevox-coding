@@ -322,6 +322,13 @@ test('番号付きリストと入れ子の項目にも切れ目が付く (#15)',
   assert.equal(marked.split(LIST_BOUNDARY).length - 1, 2);
 });
 
+test('全角スペース区切りの箇条書きにも切れ目が付く (#15)', () => {
+  // 記号を外す LIST_MARKER は \s なので全角スペースも拾う。印の判定も揃える。
+  const { marked, text } = filterText('-　項目1\n-　項目2', F);
+  assert.equal(marked.split(LIST_BOUNDARY).length - 1, 1);
+  assert.equal(text, '項目1\n項目2');
+});
+
 test('箇条書き以外の行には切れ目が付かない (#15)', () => {
   const { marked } = filterText('普通の文です。\n次の行です。\n---', F);
   assert.equal(marked.includes(LIST_BOUNDARY), false);

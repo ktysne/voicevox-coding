@@ -460,7 +460,7 @@ test('listPauseSec が 0 なら間を置かない (#15)', async () => {
   assert.ok(gap < 100, `間が入っています: ${gap}ms`);
 });
 
-test('キューの状態と重複判定には切れ目の印を残さない (#15)', () => {
+test('キューの状態と重複判定には切れ目の印を残さない (#15)', async () => {
   const player = new FakePlayer();
   const queue = makeQueue(player, { cacheEnabled: false });
   queue.enqueue({
@@ -474,4 +474,30 @@ test('キューの状態と重複判定には切れ目の印を残さない (#15
   const shown = queue.state.current?.text ?? queue.state.queued[0]?.text;
   assert.equal(shown, '項目1\n項目2');
   for (const key of queue.recent.keys()) assert.ok(!key.includes(LIST_BOUNDARY));
+  // 読み上げが次のテストへまたいで走り続けないよう、ここで畳んでおく
+  await waitIdle(queue);
+});
+
+test('HOLD に失敗したときは間を置かずに次のチャンクへ進む (#15)', async () => {
+  class NoHoldPlayer extends FakePlayer {
+    async hold() {
+      this.calls.push(['hold']);
+      throw new Error('無音ループを開始できません');
+    }
+  }
+  const player = new NoHoldPlayer();
+  const queue = makeQueue(player, { chunkChars: 100, cacheEnabled: false });
+  queue.enqueue({
+    target: 'test',
+    event: 'test',
+    text: `項目1${LIST_BOUNDARY}\n項目2`,
+    speaker: 1,
+    voice: {},
+    queuePolicy: { policy: 'enqueue' },
+    listPauseSec: 0.3,
+  });
+  await waitIdle(queue);
+  // 無音を掴めていない状態で待つと、間のあとの出だしが欠ける。間は諦めて先へ進む。
+  const gap = player.playAt[1] - player.playAt[0];
+  assert.ok(gap < 100, `HOLD 失敗時に間を置いています: ${gap}ms`);
 });

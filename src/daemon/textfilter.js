@@ -125,9 +125,10 @@ const LIST_MARKER = /^\s*(?:[-*+]|\d{1,3}[.)])\s+/gm;
 // 箇条書き項目の 1 行。記号を外す前にどの行が項目だったかを控えるために使う。
 // 区切り線かどうかは LIST_SYMBOL_ONLY で別に判定する。この正規表現へ先読みとして
 // 埋め込むと、空白だけが続く行で後戻りのたびに行末まで走り、入力長の二乗で遅くなる。
-const LIST_ITEM_LINE = /^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+.*$/gm;
+// 区切りに全角スペースを使う書き方（`-　項目`）も、記号を外す LIST_MARKER の `\s` に合わせて拾う。
+const LIST_ITEM_LINE = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　]+.*$/gm;
 // `- - -` `* * *` のような区切り線。記号と空白しか残らないので項目とみなさない。
-const LIST_SYMBOL_ONLY = /^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+[-*_ \t]*$/;
+const LIST_SYMBOL_ONLY = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　]+[-*_ \t　]*$/;
 const BLOCKQUOTE = /^\s*>+\s?/gm;
 const HR = /^\s*(?:[-*_]\s*){3,}$/gm;
 const INLINE_CODE = /`([^`\n]+)`/g;
@@ -428,7 +429,7 @@ export function filterText(input, f = {}) {
     // 印は行末の空白より手前へ置く。空白の後ろへ置くと、空白をまとめる処理と trim を
     // 印が遮ってしまい、印の有無で読み上げるテキストが変わる。
     t = t.replace(LIST_ITEM_LINE, (line) => (
-      LIST_SYMBOL_ONLY.test(line) ? line : line.replace(/([ \t]*)$/, LIST_BOUNDARY + '$1')
+      LIST_SYMBOL_ONLY.test(line) ? line : line.replace(/([ \t　]*)$/, LIST_BOUNDARY + '$1')
     ));
   }
 
@@ -456,7 +457,8 @@ export function filterText(input, f = {}) {
   if (marksList) {
     // 印を「項目を終える改行の直後」へ寄せる。行末に居座らせると、整形後のテキストへ掛ける
     // 辞書の置換ルールや文の区切りの判定が、印の有無で変わってしまう。
-    t = t.replace(/\u0001(\s*\n)/g, '$1\u0001');
+    // CRLF の入力では改行が \r だけになって残ることがあるので、そちらも改行として扱う。
+    t = t.replace(/\u0001(\s*[\r\n])/g, '$1\u0001');
   }
   // 印は空白ではないので、末尾に残ると trim を遮る。空白ごとまとめて落とす。
   t = trimTrailingBoundary(t).trim();
