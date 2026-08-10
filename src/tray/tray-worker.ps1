@@ -67,7 +67,8 @@ function Invoke-Daemon([string]$path, [string]$method = 'GET', $body = $null) {
         }
         # 状態変更 API は Content-Type: application/json しか受け付けない (AUD-01)。
         # 本文を省いた POST には PowerShell が application/x-www-form-urlencoded を付けてしまい
-        # 415 で弾かれるため、本文が無くても空 JSON を明示して送る。GET には付けない。
+        # 415 で弾かれるため、本文が無くても空 JSON を明示して送る。
+        # Content-Type を付けないのは、そもそも本文を持たない GET だけ。
         if ($null -ne $body) {
             $params['Body'] = ($body | ConvertTo-Json -Depth 5 -Compress)
             $params['ContentType'] = 'application/json'

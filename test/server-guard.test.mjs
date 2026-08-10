@@ -109,7 +109,18 @@ test('/hook は Content-Type の省略を認めない', () => {
   assert.equal(r.status, 415);
 });
 
-test('/api/* はトークンがあれば Content-Type 省略の POST (トレイの skip 等) を認める', () => {
+test('/api/* はトークンがあれば Content-Type 省略の POST を認める', () => {
   const r = check('/api/skip', { 'x-voicevox-coding-token': TOKEN });
   assert.equal(r.ok, true);
+});
+
+// PowerShell は本文を省いた POST にこの Content-Type を付ける。
+// トークンがあっても通らないので、ps1 側は空 JSON を明示して送る必要がある (#31)。
+test('application/x-www-form-urlencoded はトークンがあっても拒否する', () => {
+  const r = check('/api/shutdown', {
+    'content-type': 'application/x-www-form-urlencoded',
+    'x-voicevox-coding-token': TOKEN,
+  });
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 415);
 });
