@@ -353,22 +353,26 @@ test('後から追加した音声パラメータを動かすとキャッシュ�
   const player = new FakePlayer();
   const queue = makeQueue(player, { cacheEnabled: true });
   const text = 'キャッシュキーの分岐テスト。';
+  const voice = { ...LEGACY_VOICE, pauseLengthScale: 1.5 };
+  // 既定値以外はキーに残るので、voice をそのまま JSON 化したキーになる。
   const [legacyFile] = cacheFilesFor([text], 1, LEGACY_VOICE);
-  const existing = new Set([legacyFile].filter((file) => fs.existsSync(file)));
+  const [tunedFile] = cacheFilesFor([text], 1, voice);
+  const files = [legacyFile, tunedFile];
+  const existing = new Set(files.filter((file) => fs.existsSync(file)));
   try {
     queue.enqueue({
       target: 'test',
       event: 'test',
       text,
       speaker: 1,
-      voice: { ...LEGACY_VOICE, pauseLengthScale: 1.5 },
+      voice,
       queuePolicy: { policy: 'enqueue' },
     });
     await waitIdle(queue);
-    assert.equal(player.calls.length, 1);
-    assert.notEqual(player.calls[0][1], legacyFile);
+    assert.notEqual(tunedFile, legacyFile);
+    assert.deepEqual(player.calls, [['play', tunedFile]]);
   } finally {
-    cleanupCache([legacyFile, player.calls[0]?.[1]].filter(Boolean), existing);
+    cleanupCache(files, existing);
   }
 });
 

@@ -169,6 +169,7 @@ export const VOICE_PARAMS = [
   { key: 'prePhonemeLength', label: '開始の無音', min: 0.0, max: 1.5, step: 0.05, default: 0.1, unit: '秒' },
   { key: 'postPhonemeLength', label: '終了の無音', min: 0.0, max: 1.5, step: 0.05, default: 0.1, unit: '秒' },
   // VOICEVOX アプリの「間の長さ」に相当する句読点前後の無音の倍率。範囲もアプリに合わせている。
-  // ENGINE 0.25 系で追加されたフィールドで、未対応の古い ENGINE では未知フィールドとして無視される。
+  // ENGINE 0.25 系で追加されたフィールド。未対応の古い ENGINE ではクエリに現れないので
+  // 送られず（voicevox.js の audioQuery を参照）、指定しても効かないだけで合成は通る。
   { key: 'pauseLengthScale', label: '間の長さ', min: 0.0, max: 2.0, step: 0.05, default: 1.0, unit: '倍', omitFromCacheKeyWhenDefault: true },
 ];

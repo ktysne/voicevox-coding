@@ -60,17 +60,19 @@ test('audioQuery は音声パラメータをクエリへ上書きする', async 
   assert.equal(query.volumeScale, 1.0);
 });
 
-test('pauseLengthScale を持たない古い ENGINE の応答にもフィールドを足す', async () => {
+test('pauseLengthScale を持たない古い ENGINE には送らない', async () => {
   const engine = makeEngine();
   const old = audioQueryBody();
   delete old.pauseLength;
   delete old.pauseLengthScale;
   const query = await withFetch(
     async () => jsonResponse(old),
-    () => engine.audioQuery('てすと', 3, { pauseLengthScale: 0.8 }),
+    () => engine.audioQuery('てすと', 3, { pauseLengthScale: 0.8, speedScale: 1.2 }),
   );
-  // 古い ENGINE は未知フィールドとして無視するので、付けて送っても壊れない。
-  assert.equal(query.pauseLengthScale, 0.8);
+  // 解釈できないフィールドを足さないので、古い ENGINE でも合成が通る。
+  assert.equal('pauseLengthScale' in query, false);
+  // 対応しているパラメータの上書きは従来どおり効く。
+  assert.equal(query.speedScale, 1.2);
 });
 
 test('VOICE_PARAMS のキーはそのままクエリの項目名として使える', async () => {
@@ -95,6 +97,47 @@ test('数値でない値はクエリを書き換えない', async () => {
   assert.equal(query.pauseLengthScale, 1.0);
   assert.equal(query.speedScale, 1.0);
   assert.equal(query.volumeScale, 1.0);
+});
+
+test('ENGINE のエラー応答は status 付きの EngineError になる', async () => {
+  const engine = makeEngine();
+  await assert.rejects(
+    () => withFetch(
+      async () => ({
+        ok: false,
+        status: 500,
+        json: async () => ({}),
+        text: async () => 'internal error',
+        arrayBuffer: async () => new ArrayBuffer(0),
+      }),
+      () => engine.audioQuery('てすと', 3, {}),
+    ),
+    (err) => {
+      assert.equal(err.name, 'EngineError');
+      assert.equal(err.status, 500);
+      assert.match(err.message, /audio_query/);
+      return true;
+    },
+  );
+});
+
+test('応答が来ないまま中断されたらタイムアウトの EngineError になる', async () => {
+  const engine = makeEngine();
+  await assert.rejects(
+    () => withFetch(
+      async () => {
+        const err = new Error('The operation was aborted');
+        err.name = 'AbortError';
+        throw err;
+      },
+      () => engine.audioQuery('てすと', 3, {}),
+    ),
+    (err) => {
+      assert.equal(err.name, 'EngineError');
+      assert.match(err.message, /タイムアウト/);
+      return true;
+    },
+  );
 });
 
 test('synthesize は上書き済みのクエリを /synthesis へ渡す', async () => {
