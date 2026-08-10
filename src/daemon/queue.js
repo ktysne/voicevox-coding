@@ -11,8 +11,14 @@ import { EventEmitter } from 'node:events';
 import { CACHE_DIR } from './config.js';
 import { VOICE_PARAMS } from './catalog.js';
 import { wavDurationMs } from './player.js';
+import { LIST_BOUNDARY, DEFAULT_LIST_PAUSE_SEC, stripListBoundaries } from './textfilter.js';
 
 const SENTENCE_SPLIT = /(?<=[。．！？!?\n])/;
+
+// 項目の切れ目に置ける間の上限（秒）。設定ファイルを手編集して極端な値を入れても、
+// 読み上げが止まったように見えるほどキューを詰まらせない。
+// 管理コンソールの入力欄の上限（src/ui/app.js の listPauseSec）と同じ値にしてある。
+const MAX_LIST_PAUSE_SEC = 10;
 
 /** 既定値のときはキャッシュキーから外すパラメータ（key -> 既定値）。catalog.js の解説を参照。 */
 const CACHE_KEY_OMITTABLE = new Map(
@@ -36,12 +42,13 @@ function voiceForCacheKey(voice) {
   return out;
 }
 
-/** 文の切れ目を優先しつつ、maxChars 以下のチャンクに割る。 */
-export function chunkText(text, maxChars = 100) {
-  if (!text) return [];
-  if (maxChars <= 0 || text.length <= maxChars) return [text];
+/** 文の切れ目を優先しつつ、maxChars 以下の断片に割る。 */
+function splitBySentence(text, maxChars) {
+  const trimmed = text.trim();
+  if (!trimmed) return [];
+  if (maxChars <= 0 || trimmed.length <= maxChars) return [trimmed];
 
-  const sentences = text.split(SENTENCE_SPLIT).filter((s) => s.length > 0);
+  const sentences = trimmed.split(SENTENCE_SPLIT).filter((s) => s.length > 0);
   const chunks = [];
   let cur = '';
 
@@ -70,6 +77,35 @@ export function chunkText(text, maxChars = 100) {
   }
   pushCur();
   return chunks.filter(Boolean);
+}
+
+/**
+ * 文の切れ目を優先しつつ、maxChars 以下のチャンクに割る。
+ * 箇条書き項目の切れ目 (LIST_BOUNDARY) をまたぐチャンクは作らず、切れ目の手前の
+ * チャンクへ pauseAfter を立てる。読み上げ側はそこで無音の間を置く。
+ * マーカーはチャンクのテキストには残さない（合成にも表示にも渡らない）。
+ * @returns {{ text: string, pauseAfter: boolean }[]}
+ */
+export function chunkText(text, maxChars = 100) {
+  if (!text) return [];
+
+  const items = text.split(LIST_BOUNDARY);
+  const chunks = [];
+  for (let i = 0; i < items.length; i += 1) {
+    for (const s of splitBySentence(items[i], maxChars)) chunks.push({ text: s, pauseAfter: false });
+    // 最後の断片の後ろに切れ目は無い。中身が空の項目では直前の印をそのまま残す。
+    if (i < items.length - 1 && chunks.length) chunks[chunks.length - 1].pauseAfter = true;
+  }
+  // 発話の末尾で間を置いても意味が無いので落とす。
+  if (chunks.length) chunks[chunks.length - 1].pauseAfter = false;
+  return chunks;
+}
+
+/** 項目の切れ目に置く間（ミリ秒）。手編集で数値以外が入っても読み上げを止めない。 */
+function listPauseMs(sec) {
+  const v = Number(sec ?? DEFAULT_LIST_PAUSE_SEC);
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  return Math.min(v, MAX_LIST_PAUSE_SEC) * 1000;
 }
 
 export class SpeechQueue extends EventEmitter {
@@ -133,8 +169,12 @@ export class SpeechQueue extends EventEmitter {
    * 発話を投入する。
    * @returns {{accepted:boolean, reason?:string, id?:number}}
    */
-  enqueue({ target, event, text, speaker, voice, queuePolicy }) {
-    if (!text || !text.trim()) return { accepted: false, reason: 'empty' };
+  enqueue({ target, event, text, speaker, voice, queuePolicy, listPauseSec }) {
+    // text には項目の切れ目のマーカーが入りうる。チャンク分割にだけ使い、
+    // 重複判定・状態通知・キャッシュキーには印を外したテキストを使う。
+    const marked = typeof text === 'string' ? text : '';
+    const spoken = stripListBoundaries(marked);
+    if (!spoken.trim()) return { accepted: false, reason: 'empty' };
 
     const policy = queuePolicy?.policy ?? 'replace';
     const maxQueue = queuePolicy?.maxQueue ?? 5;
@@ -142,12 +182,13 @@ export class SpeechQueue extends EventEmitter {
       id: ++this.seq,
       target,
       event,
-      text,
+      text: spoken,
       speaker,
       voice,
-      chunks: chunkText(text, this.getConfig().daemon?.chunkChars ?? 100),
+      chunks: chunkText(marked, this.getConfig().daemon?.chunkChars ?? 100),
       chunkIndex: 0,
       prefetch: null,
+      pauseMs: listPauseMs(listPauseSec),
     };
 
     if (this.#isDuplicate(utterance, queuePolicy?.dedupeWindowSec)) {
@@ -186,7 +227,7 @@ export class SpeechQueue extends EventEmitter {
   }
 
   async #synthesizeChunk(utterance, index) {
-    const text = utterance.chunks[index];
+    const text = utterance.chunks[index]?.text;
     if (!text) return null;
     const cfg = this.getConfig();
     const useCache = cfg.daemon?.cacheEnabled !== false;
@@ -352,7 +393,7 @@ export class SpeechQueue extends EventEmitter {
             break;
           }
 
-          await this.#waitPlayback(audio.durationMs ?? 1500);
+          await this.#wait(audio.durationMs ?? 1500);
           this.#discardAudio(audio);
 
           // 次チャンクまたは次発話がある間だけ、再生完了直後から無音をループする。
@@ -368,6 +409,13 @@ export class SpeechQueue extends EventEmitter {
               // HOLD がワーカー側で実行されてから応答に失敗した可能性もあるため、
               // 次の PLAY までの残留を防ぐ。停止待ちで読み上げを詰まらせない。
               this.player.stop().catch(() => {});
+            }
+
+            // 箇条書き項目の切れ目では、次のチャンクへ移る前に少しだけ待って間を作る。
+            // 直前に HOLD を掛けてあるので、この間はワーカーの無音ループが流れる
+            // （音声デバイスを掴んだままなので、間のあとの出だしが欠けない）。
+            if (utterance.pauseMs > 0 && utterance.chunks[i].pauseAfter) {
+              await this.#wait(utterance.pauseMs);
             }
           }
         }
@@ -386,8 +434,8 @@ export class SpeechQueue extends EventEmitter {
     }
   }
 
-  /** 再生時間ぶん待つ。途中でスキップされたら即座に抜ける。 */
-  #waitPlayback(durationMs) {
+  /** 指定時間だけ待つ（再生時間ぶん、または項目の切れ目の間）。途中でスキップされたら即座に抜ける。 */
+  #wait(durationMs) {
     return new Promise((resolve) => {
       const deadline = Date.now() + durationMs;
       const tick = () => {

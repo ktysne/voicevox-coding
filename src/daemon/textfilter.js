@@ -122,6 +122,9 @@ const TABLE_SEP = /^\s*\|?[\s:|-]{3,}\|?\s*$/gm;
 const HEADING_LINE = /^\s{0,3}#{1,6}\s+.*$/gm;
 const HEADING_MARK = /^\s{0,3}#{1,6}\s+/gm;
 const LIST_MARKER = /^\s*(?:[-*+]|\d{1,3}[.)])\s+/gm;
+// 箇条書き項目の 1 行。記号を外す前にどの行が項目だったかを控えるために使う。
+// `- - -` `* * *` のような区切り線は、記号と空白しか残らないので項目とみなさない。
+const LIST_ITEM_LINE = /^[ \t]*(?:[-*+]|\d{1,3}[.)])[ \t]+(?![-*_ \t]*$).*$/gm;
 const BLOCKQUOTE = /^\s*>+\s?/gm;
 const HR = /^\s*(?:[-*_]\s*){3,}$/gm;
 const INLINE_CODE = /`([^`\n]+)`/g;
@@ -267,6 +270,23 @@ const PARK_RE = /§(\d+)§/g;
 
 const SENTENCE_END = /(?<=[。．.!?！？])\s*/;
 
+// 箇条書き項目の切れ目を、整形後のテキスト上へ残しておくための内部マーカー。
+// 制御文字なので本文には現れず、空白とも扱われないため、後段の記号除去・空白の正規化・
+// trim をくぐり抜けて位置を保てる。読み上げ側 (発話キュー) はここでチャンクを割り、
+// 項目のあいだに無音の間を挟む。
+// 本文へ残ってはいけない文字なので、filterText は marked にだけ含めて返し、
+// 表示・ログに使う text からは必ず取り除く。
+export const LIST_BOUNDARY = '\u0001';
+const LIST_BOUNDARY_RE = /\u0001/g;
+
+// 箇条書き項目の切れ目に置く無音の既定の長さ（秒）。
+export const DEFAULT_LIST_PAUSE_SEC = 0.3;
+
+/** 項目の切れ目のマーカーを取り除く。 */
+export function stripListBoundaries(text) {
+  return typeof text === 'string' ? text.replace(LIST_BOUNDARY_RE, '') : '';
+}
+
 function applyCodeBlocks(text, mode, placeholder) {
   if (mode === 'read') return text;
   const rep = mode === 'placeholder' ? `。${placeholder}。` : ' ';
@@ -332,23 +352,33 @@ function applyTables(text, mode) {
 
 function limitSentences(text, max) {
   if (!max || max <= 0) return { text, truncated: false };
-  const sentences = text.split(SENTENCE_END).filter((s) => s.trim().length > 0);
+  // 項目の切れ目のマーカーは読み上げない文字なので、それだけの断片は文と数えない。
+  const sentences = text.split(SENTENCE_END).filter((s) => stripListBoundaries(s).trim().length > 0);
   if (sentences.length <= max) return { text, truncated: false };
   return { text: sentences.slice(0, max).join(''), truncated: true };
 }
 
 function limitChars(text, max) {
-  if (!max || max <= 0 || text.length <= max) return { text, truncated: false };
-  return { text: text.slice(0, max), truncated: true };
+  if (!max || max <= 0) return { text, truncated: false };
+  // 同じく、マーカーは文字数に数えない。設定した文字数と実際に読む長さをずらさないため。
+  let count = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === LIST_BOUNDARY) continue;
+    count += 1;
+    if (count > max) return { text: text.slice(0, i), truncated: true };
+  }
+  return { text, truncated: false };
 }
 
 /**
  * @param {string} input 生テキスト
  * @param {object} f     textFilter 設定
- * @returns {{ text: string, truncated: boolean }}
+ * @returns {{ text: string, marked: string, truncated: boolean }}
+ *   text は表示・ログ用（項目の切れ目のマーカーを含まない）、
+ *   marked は読み上げ用（マーカー入り。発話キューがここでチャンクを割る）。
  */
 export function filterText(input, f = {}) {
-  if (typeof input !== 'string') return { text: '', truncated: false };
+  if (typeof input !== 'string') return { text: '', marked: '', truncated: false };
   let t = input;
 
   if (f.thinkingBlocks !== false) t = t.replace(THINKING, ' ');
@@ -364,6 +394,14 @@ export function filterText(input, f = {}) {
 
   if (f.headings) t = t.replace(HEADING_LINE, ' ');
   else t = t.replace(HEADING_MARK, '');
+
+  // 箇条書き項目の切れ目に印を付ける。記号を外したあとでは、どの行が項目だったかを
+  // 判別できなくなるので、必ず LIST_MARKER の除去より先に行う。
+  // 間を置かない設定 (0 以下) のときは印そのものを付けず、今までと同じ経路に保つ。
+  const listPauseSec = Number(f.listPauseSec ?? DEFAULT_LIST_PAUSE_SEC);
+  if (Number.isFinite(listPauseSec) && listPauseSec > 0) {
+    t = t.replace(LIST_ITEM_LINE, (line) => line + LIST_BOUNDARY);
+  }
 
   if (f.listMarkers !== false) t = t.replace(LIST_MARKER, '');
 
@@ -388,7 +426,7 @@ export function filterText(input, f = {}) {
   let out = byChar.text.trim();
   if (truncated && f.truncationSuffix) out += `。${f.truncationSuffix}。`;
 
-  return { text: out, truncated };
+  return { text: stripListBoundaries(out), marked: out, truncated };
 }
 
 /** テンプレート内の {field} をペイロードの値で置換する。 */

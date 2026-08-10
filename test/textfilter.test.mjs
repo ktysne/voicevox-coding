@@ -1,7 +1,7 @@
 // node --test test/
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { filterText, renderTemplate } from '../src/daemon/textfilter.js';
+import { filterText, renderTemplate, stripListBoundaries, LIST_BOUNDARY } from '../src/daemon/textfilter.js';
 import { chunkText } from '../src/daemon/queue.js';
 import { applyReplacements, validateEngineWord } from '../src/daemon/dictionary.js';
 import { resolveUtterance, resetIgnoreMatchState, IGNORE_MATCH_BUDGET_MS, IGNORE_MATCH_PATTERN_MS } from '../src/daemon/events.js';
@@ -307,6 +307,39 @@ test('箇条書きの記号と強調記号が外れる', () => {
   assert.equal(text, '重要 な項目');
 });
 
+test('箇条書きの項目の切れ目が marked に残る (#15)', () => {
+  const { text, marked } = filterText('- 項目1\n- 項目2\n- 項目3', F);
+  // 読み上げ・表示に使う text には印を残さない
+  assert.equal(text, '項目1\n項目2\n項目3');
+  assert.doesNotMatch(text, new RegExp(LIST_BOUNDARY));
+  // 項目の切れ目は marked 側にだけ残る（末尾のぶんも含めて 3 つ）
+  assert.equal(marked.split(LIST_BOUNDARY).length - 1, 3);
+  assert.equal(stripListBoundaries(marked), text);
+});
+
+test('番号付きリストと入れ子の項目にも切れ目が付く (#15)', () => {
+  const { marked } = filterText('1. 一つ目\n2. 二つ目\n  - 子項目', { ...F, codeBlock: 'read' });
+  assert.equal(marked.split(LIST_BOUNDARY).length - 1, 3);
+});
+
+test('箇条書き以外の行には切れ目が付かない (#15)', () => {
+  const { marked } = filterText('普通の文です。\n次の行です。\n---', F);
+  assert.equal(marked.includes(LIST_BOUNDARY), false);
+});
+
+test('listPauseSec が 0 なら切れ目を付けない (#15)', () => {
+  const { text, marked } = filterText('- 項目1\n- 項目2', { ...F, listPauseSec: 0 });
+  assert.equal(marked.includes(LIST_BOUNDARY), false);
+  assert.equal(marked, text);
+});
+
+test('項目の切れ目は最大文字数に数えない (#15)', () => {
+  const withList = filterText('- あああああ\n- いいいいい', { ...F, maxChars: 11 });
+  // 「あああああ\nいいいいい」の 11 文字ちょうど。印のぶん短く切られていないこと
+  assert.equal(stripListBoundaries(withList.marked), 'あああああ\nいいいいい');
+  assert.equal(withList.truncated, false);
+});
+
 test('絵文字が外れる', () => {
   const { text } = filterText('完了しました 🎉', F);
   assert.equal(text.trim(), '完了しました');
@@ -374,8 +407,8 @@ test('ユーザー辞書の読みはカタカナのみ許可', () => {
 test('長文は文の切れ目でチャンクに割れる', () => {
   const chunks = chunkText('一文目です。二文目です。三文目です。', 12);
   assert.ok(chunks.length >= 2);
-  assert.ok(chunks.every((c) => c.length <= 14));
-  assert.equal(chunks.join(''), '一文目です。二文目です。三文目です。');
+  assert.ok(chunks.every((c) => c.text.length <= 14));
+  assert.equal(chunks.map((c) => c.text).join(''), '一文目です。二文目です。三文目です。');
 });
 
 test('1 文が長すぎる場合は読点で割る', () => {
@@ -384,7 +417,7 @@ test('1 文が長すぎる場合は読点で割る', () => {
 });
 
 test('短い文は割らない', () => {
-  assert.deepEqual(chunkText('短い文です。', 100), ['短い文です。']);
+  assert.deepEqual(chunkText('短い文です。', 100), [{ text: '短い文です。', pauseAfter: false }]);
 });
 
 test('無効なイベントは読み上げない', () => {

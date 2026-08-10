@@ -7,7 +7,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EVENTS, VOICE_PARAMS, TARGETS, eventsForTarget } from './catalog.js';
 import { resolveUtterance, matchesIgnorePattern, resetIgnoreMatchState } from './events.js';
-import { filterText } from './textfilter.js';
+import { filterText, stripListBoundaries } from './textfilter.js';
 import { applyReplacements, syncEngineDictionary, validateEngineWord } from './dictionary.js';
 import { CONFIG_PATH } from './config.js';
 import { detectEnginePath } from './engine-process.js';
@@ -192,10 +192,11 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     const result = queue.enqueue({
       target,
       event: eventName,
-      text: decision.text,
+      text: decision.speechText ?? decision.text,
       speaker: profile.speaker,
       voice: profile.voice,
       queuePolicy: profile.queue,
+      listPauseSec: profile.textFilter?.listPauseSec,
     });
     log.info(
       `[${target}] ${eventName}: ${result.accepted ? '読み上げ' : `見送り(${result.reason})`}`
@@ -436,9 +437,11 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
             return;
           }
           const filtered = filterText(spoken, profile.textFilter);
-          spoken = applyReplacements(filtered.text, store.config.dictionary?.replacements ?? []);
+          // 試聴でも本番と同じ間で聞けるよう、項目の切れ目の印つきのまま渡す。
+          spoken = applyReplacements(filtered.marked, store.config.dictionary?.replacements ?? []);
         }
-        if (!spoken.trim()) {
+        const display = stripListBoundaries(spoken);
+        if (!display.trim()) {
           json(res, 200, { spoken: false, reason: 'empty' });
           return;
         }
@@ -449,8 +452,9 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           speaker: profile.speaker,
           voice: profile.voice,
           queuePolicy: { ...profile.queue, dedupeWindowSec: 0 },
+          listPauseSec: profile.textFilter?.listPauseSec,
         });
-        json(res, 200, { spoken: result.accepted, reason: result.reason ?? null, text: spoken });
+        json(res, 200, { spoken: result.accepted, reason: result.reason ?? null, text: display });
         return;
       }
 

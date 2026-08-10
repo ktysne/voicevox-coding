@@ -45,6 +45,8 @@ function defaultTextFilter() {
     // 以下は true で除去
     markdownSymbols: true,
     listMarkers: true,
+    // 箇条書き項目の切れ目に置く無音の間（秒）。0 で無効
+    listPauseSec: 0.3,
     headings: false, // true にすると見出し行ごと削除
     emoji: true,
     thinkingBlocks: true,
