@@ -158,7 +158,9 @@ if ($wasRunning) {
 
     $shutdownAccepted = $false
     try {
-        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/shutdown" -Method Post -Headers $headers -TimeoutSec 5
+        # 本文を省くと PowerShell が Content-Type: application/x-www-form-urlencoded を付けてしまい、
+        # 状態変更 API の Content-Type 検証 (AUD-01) に 415 で弾かれる。空 JSON を明示して送る。
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/shutdown" -Method Post -Headers $headers -Body '{}' -ContentType 'application/json' -TimeoutSec 5
         $shutdownAccepted = $true
     } catch {
         Write-Warn2 "停止 API の呼び出しに失敗しました: $($_.Exception.Message)"
