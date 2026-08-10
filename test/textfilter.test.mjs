@@ -333,6 +333,31 @@ test('listPauseSec が 0 なら切れ目を付けない (#15)', () => {
   assert.equal(marked, text);
 });
 
+test('切れ目の印を入れても読み上げるテキストは変わらない (#15)', () => {
+  // 印は空白ではないので、対策しないと行末の空白の畳み込みと trim を素通りさせてしまう。
+  // 行末の絵文字・Markdown の 2 スペース改行・中身が全部消える項目が実例。
+  const inputs = [
+    '- 完了しました 🎉\n- 次の項目です',
+    '- 項目1  \n- 項目2',
+    '- 🎉\n- 完了',
+    '1. 一つ目 \n2. 二つ目',
+    '本文です。\n- 項目1\n- 項目2\n続きの本文です。',
+  ];
+  for (const input of inputs) {
+    const withPause = filterText(input, F);
+    const without = filterText(input, { ...F, listPauseSec: 0 });
+    assert.equal(withPause.text, without.text, `印の有無で整形結果が変わりました: ${JSON.stringify(input)}`);
+  }
+});
+
+test('切れ目の印は最大文字数の数えかたも変えない (#15)', () => {
+  const input = '- 完了 🎉\n- 次の項目';
+  const withPause = filterText(input, { ...F, maxChars: 6 });
+  const without = filterText(input, { ...F, maxChars: 6, listPauseSec: 0 });
+  assert.equal(withPause.text, without.text);
+  assert.equal(withPause.truncated, without.truncated);
+});
+
 test('項目の切れ目は最大文字数に数えない (#15)', () => {
   const withList = filterText('- あああああ\n- いいいいい', { ...F, maxChars: 11 });
   // 「あああああ\nいいいいい」の 11 文字ちょうど。印のぶん短く切られていないこと
@@ -442,6 +467,20 @@ test('Stop は本文を読み上げる', () => {
   });
   assert.equal(r.speak, true);
   assert.match(r.text, /作業が終わりました/);
+});
+
+test('表示用の text には印を残さず、発話用の speechText にだけ残す (#15)', () => {
+  const profile = defaultConfig().targets.claudeCode;
+  const r = resolveUtterance({
+    eventName: 'Stop',
+    payload: { hook_event_name: 'Stop', last_assistant_message: '- 項目1\n- 項目2' },
+    profile,
+    dictionary: { replacements: [] },
+  });
+  assert.equal(r.speak, true);
+  assert.equal(r.text, '項目1\n項目2');
+  assert.equal(r.speechText.includes(LIST_BOUNDARY), true);
+  assert.equal(stripListBoundaries(r.speechText), r.text);
 });
 
 /** Stop イベントの本文を渡して判定させる（無視パターンのテスト用）。 */

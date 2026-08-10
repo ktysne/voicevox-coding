@@ -417,6 +417,10 @@ export function filterText(input, f = {}) {
 
   if (f.collapseWhitespace !== false) {
     t = t.replace(/[ \t　]+/g, ' ').replace(/\s*\n\s*/g, '\n').replace(/\n{2,}/g, '\n');
+    // 印は空白ではないので、行末の空白を畳み込む上の処理と trim() を素通りさせてしまう。
+    // 印の有無で読み上げるテキストが変わらないよう、印の手前の空白をここで落とす。
+    // 絵文字だけの項目のように中身が残らなかった行は、印ごと落として空行を作らない。
+    t = t.replace(/[ \t　]+(?=\u0001)/g, '').replace(/^\u0001\n?/gm, '');
   }
   t = t.trim();
 

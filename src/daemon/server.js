@@ -413,7 +413,9 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           return;
         }
         const filtered = filterText(text ?? '', profile.textFilter);
-        const spoken = applyReplacements(filtered.text, store.config.dictionary?.replacements ?? []);
+        // 置換の入力を実際の読み上げと同じ（項目の切れ目の印つき）に揃えてから印を外す。
+        // 揃えないと、切れ目をまたぐ正規表現の置換ルールでプレビューと発話がずれる。
+        const spoken = stripListBoundaries(applyReplacements(filtered.marked, store.config.dictionary?.replacements ?? []));
         json(res, 200, { text: spoken, truncated: filtered.truncated, chars: spoken.length, ignored: false });
         return;
       }

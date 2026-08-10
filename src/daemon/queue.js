@@ -400,9 +400,11 @@ export class SpeechQueue extends EventEmitter {
           // skip/clear 後は STOP 済みなので HOLD を開始しない。
           const hasNext = i + 1 < utterance.chunks.length || this.queue.length > 0;
           if (!this.skipRequested && hasNext) {
+            let holdStarted = false;
             try {
               await this.player.hold();
               holding = true;
+              holdStarted = true;
             } catch (err) {
               // keep-alive は補助機能。失敗しても読み上げ自体は続ける。
               this.log?.warn(`無音 keep-alive を開始できませんでした: ${err.message}`);
@@ -412,9 +414,10 @@ export class SpeechQueue extends EventEmitter {
             }
 
             // 箇条書き項目の切れ目では、次のチャンクへ移る前に少しだけ待って間を作る。
-            // 直前に HOLD を掛けてあるので、この間はワーカーの無音ループが流れる
-            // （音声デバイスを掴んだままなので、間のあとの出だしが欠けない）。
-            if (utterance.pauseMs > 0 && utterance.chunks[i].pauseAfter) {
+            // HOLD の無音ループが流れている状態でだけ待つ（音声デバイスを掴んだままなので
+            // 間のあとの出だしが欠けない）。HOLD に失敗したときは黙って待たず、
+            // 間を諦めて次のチャンクへ進む。
+            if (holdStarted && utterance.pauseMs > 0 && utterance.chunks[i].pauseAfter) {
               await this.#wait(utterance.pauseMs);
             }
           }

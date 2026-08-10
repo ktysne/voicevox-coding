@@ -678,7 +678,7 @@ function renderTextFilterCard(base) {
         checkboxRow('連続する空白・改行をまとめる', `${f}.collapseWhitespace`),
       )),
     h('div', { style: 'margin-top:14px;border-top:1px solid var(--border);padding-top:14px' },
-      numberRow('箇条書きの間', `${f}.listPauseSec`, { min: 0, max: 5, step: 0.1, hint: '秒。箇条書きの項目のあいだに置く無音の長さ（0 で無効）' }),
+      numberRow('箇条書きの間（ま）', `${f}.listPauseSec`, { min: 0, max: 10, step: 0.1, hint: '秒。箇条書きの項目のあいだに置く無音の長さ（0 で無効）' }),
       numberRow('最大文字数', `${f}.maxChars`, { min: 0, max: 100000, hint: '0 で無制限（全文読み上げ）' }),
       numberRow('最大文数', `${f}.maxSentences`, { min: 0, max: 500, hint: '0 で無制限。先頭から数文だけ読みたいときに' }),
       textRow('省略時に付ける語', `${f}.truncationSuffix`, { width: '200px' })),

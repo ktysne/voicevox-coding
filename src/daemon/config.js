@@ -8,6 +8,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { EVENTS, eventsForTarget, VOICE_PARAMS } from './catalog.js';
+import { DEFAULT_LIST_PAUSE_SEC } from './textfilter.js';
 
 export const CONFIG_DIR = path.join(os.homedir(), '.voicevox-coding');
 export const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
@@ -46,7 +47,7 @@ function defaultTextFilter() {
     markdownSymbols: true,
     listMarkers: true,
     // 箇条書き項目の切れ目に置く無音の間（秒）。0 で無効
-    listPauseSec: 0.3,
+    listPauseSec: DEFAULT_LIST_PAUSE_SEC,
     headings: false, // true にすると見出し行ごと削除
     emoji: true,
     thinkingBlocks: true,
