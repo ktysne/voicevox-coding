@@ -9,9 +9,32 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { CACHE_DIR } from './config.js';
+import { VOICE_PARAMS } from './catalog.js';
 import { wavDurationMs } from './player.js';
 
 const SENTENCE_SPLIT = /(?<=[。．！？!?\n])/;
+
+/** 既定値のときはキャッシュキーから外すパラメータ（key -> 既定値）。catalog.js の解説を参照。 */
+const CACHE_KEY_OMITTABLE = new Map(
+  VOICE_PARAMS.filter((p) => p.omitFromCacheKeyWhenDefault).map((p) => [p.key, p.default]),
+);
+
+/**
+ * キャッシュキー用に voice を整える。
+ * 後から追加したパラメータが既定値のままなら取り除き、そのパラメータを知らなかった
+ * 頃に作られたキャッシュと同じキーになるようにする。
+ */
+function voiceForCacheKey(voice) {
+  if (!voice || typeof voice !== 'object' || Array.isArray(voice)) return voice;
+  const out = {};
+  for (const [key, value] of Object.entries(voice)) {
+    // スライダー経由の値は浮動小数の誤差を含みうるので、厳密比較にはしない
+    if (CACHE_KEY_OMITTABLE.has(key) && typeof value === 'number'
+      && Math.abs(value - CACHE_KEY_OMITTABLE.get(key)) < 1e-9) continue;
+    out[key] = value;
+  }
+  return out;
+}
 
 /** 文の切れ目を優先しつつ、maxChars 以下のチャンクに割る。 */
 export function chunkText(text, maxChars = 100) {
@@ -90,7 +113,7 @@ export class SpeechQueue extends EventEmitter {
   #cacheKey(text, speaker, voice) {
     return crypto
       .createHash('sha1')
-      .update(`${speaker}|${JSON.stringify(voice)}|${text}`)
+      .update(`${speaker}|${JSON.stringify(voiceForCacheKey(voice))}|${text}`)
       .digest('hex');
   }
 

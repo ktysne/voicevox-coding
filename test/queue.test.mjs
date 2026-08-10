@@ -312,6 +312,62 @@ test('スキップで先読み失敗が消費されなくても unhandledRejecti
   assert.equal(unhandled.length, 0);
 });
 
+// pauseLengthScale を足す前（v0.1.0）の voice。この 6 つはキャッシュキーに常に含まれる。
+const LEGACY_VOICE = {
+  speedScale: 1.0,
+  pitchScale: 0.0,
+  intonationScale: 1.0,
+  volumeScale: 1.0,
+  prePhonemeLength: 0.1,
+  postPhonemeLength: 0.1,
+};
+
+test('後から追加した音声パラメータが既定値ならキャッシュキーは変わらない', async () => {
+  const player = new FakePlayer();
+  const queue = makeQueue(player, { cacheEnabled: true });
+  const text = 'キャッシュキーの回帰テスト。';
+  // パラメータ追加前のキー。既定値のままなら合成結果は同じなので、これと一致してほしい。
+  const [legacyFile] = cacheFilesFor([text], 1, LEGACY_VOICE);
+  const existing = new Set([legacyFile].filter((file) => fs.existsSync(file)));
+  try {
+    queue.enqueue({
+      target: 'test',
+      event: 'test',
+      text,
+      speaker: 1,
+      voice: { ...LEGACY_VOICE, pauseLengthScale: 1.0 },
+      queuePolicy: { policy: 'enqueue' },
+    });
+    await waitIdle(queue);
+    assert.deepEqual(player.calls, [['play', legacyFile]]);
+  } finally {
+    cleanupCache([legacyFile], existing);
+  }
+});
+
+test('後から追加した音声パラメータを動かすとキャッシュキーが変わる', async () => {
+  const player = new FakePlayer();
+  const queue = makeQueue(player, { cacheEnabled: true });
+  const text = 'キャッシュキーの分岐テスト。';
+  const [legacyFile] = cacheFilesFor([text], 1, LEGACY_VOICE);
+  const existing = new Set([legacyFile].filter((file) => fs.existsSync(file)));
+  try {
+    queue.enqueue({
+      target: 'test',
+      event: 'test',
+      text,
+      speaker: 1,
+      voice: { ...LEGACY_VOICE, pauseLengthScale: 1.5 },
+      queuePolicy: { policy: 'enqueue' },
+    });
+    await waitIdle(queue);
+    assert.equal(player.calls.length, 1);
+    assert.notEqual(player.calls[0][1], legacyFile);
+  } finally {
+    cleanupCache([legacyFile, player.calls[0]?.[1]].filter(Boolean), existing);
+  }
+});
+
 test('skip と clear は STOP を送る', async () => {
   const player = new FakePlayer();
   const queue = makeQueue(player);
