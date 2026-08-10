@@ -323,6 +323,9 @@ const LEGACY_VOICE = {
 };
 
 test('後から追加した音声パラメータが既定値ならキャッシュキーは変わらない', async () => {
+  // キャッシュ有効の経路は #pruneCache を通るので、実際のキャッシュディレクトリを
+  // 走査・削除しないよう読み取りを空にしておく。
+  mock.method(fs, 'readdirSync', () => []);
   const player = new FakePlayer();
   const queue = makeQueue(player, { cacheEnabled: true });
   const text = 'キャッシュキーの回帰テスト。';
@@ -346,6 +349,7 @@ test('後から追加した音声パラメータが既定値ならキャッシ�
 });
 
 test('後から追加した音声パラメータを動かすとキャッシュキーが変わる', async () => {
+  mock.method(fs, 'readdirSync', () => []);
   const player = new FakePlayer();
   const queue = makeQueue(player, { cacheEnabled: true });
   const text = 'キャッシュキーの分岐テスト。';
