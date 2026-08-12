@@ -59,13 +59,25 @@ async function checkDaemon(port) {
   }
 }
 
+/**
+ * コマンド文字列が「我々が登録したフック」かどうか。'hook-client.js' の部分一致では
+ * 他製品の similar-hook-client.js まで自分のものと誤認するため、配置先の絶対パスで
+ * 厳密に識別する。Windows のパスは大文字小文字を区別せず / と \ の揺れもあり得る
+ * ため、正規化してから比較する。
+ */
+export function isOurHookCommand(command, hookClientPath = HOOK_CLIENT) {
+  if (typeof command !== 'string' || command === '') return false;
+  const normalize = (s) => s.replace(/\//g, '\\').toLowerCase();
+  return normalize(command).includes(normalize(hookClientPath));
+}
+
 function countOurHooks(root) {
   const events = [];
   for (const [ev, groups] of Object.entries(root?.hooks ?? {})) {
     for (const g of groups ?? []) {
       for (const hk of g?.hooks ?? []) {
         const command = String(hk?.command ?? '');
-        if (command.includes('hook-client.js')) {
+        if (isOurHookCommand(command)) {
           events.push({ ev, command, async: hk.async === true, timeout: hk.timeout });
         }
       }
@@ -415,7 +427,7 @@ async function main() {
           `app-server の CODEX_HOME (${listed.codexHome}) が doctor の期待値 (${CODEX_HOME}) と異なるため、判定不能（通常PowerShellで実行）`,
         );
       } else {
-        const mine = (listed.hooks ?? []).filter((h) => String(h.command).includes('hook-client.js'));
+        const mine = (listed.hooks ?? []).filter((h) => isOurHookCommand(String(h.command)));
         if (mine.length === 0) {
           fail('Codex 読み込み', 'フックが 1 件も読み込まれていません');
         } else {

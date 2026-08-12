@@ -5,6 +5,7 @@ import {
   missingToolEvents,
   normalizeInstallManifest,
   extraToolEvents,
+  isOurHookCommand,
   normalizePathForComparison,
   parseCodexInitializeResult,
   resolveTargetPlan,
@@ -128,4 +129,15 @@ test('extraToolEvents: 期待どおり（有効・または manifest なし）�
   assert.deepEqual(extraToolEvents({ includeToolEvents: true }, [{ ev: 'PreToolUse' }]), []);
   assert.deepEqual(extraToolEvents(null, [{ ev: 'PreToolUse' }]), []);
   assert.deepEqual(extraToolEvents({ includeToolEvents: false }, [{ ev: 'Stop' }]), []);
+});
+
+test('isOurHookCommand: 配置先の絶対パスで厳密に識別し、類似名を誤認しない', () => {
+  const hook = 'C:\\Users\\taro\\.voicevox-coding\\hook-client.js';
+  assert.equal(isOurHookCommand(`node "${hook}" claudeCode`, hook), true);
+  // 大文字小文字・区切り文字（/ と \）の揺れは吸収する
+  assert.equal(isOurHookCommand('node "C:/USERS/TARO/.VOICEVOX-CODING/HOOK-CLIENT.JS" codex', hook), true);
+  // 類似名・パス無しの hook-client.js は自分のものと誤認しない
+  assert.equal(isOurHookCommand('node "C:\\other\\their-hook-client.js" x', hook), false);
+  assert.equal(isOurHookCommand('node hook-client.js claudeCode', hook), false);
+  assert.equal(isOurHookCommand('', hook), false);
 });

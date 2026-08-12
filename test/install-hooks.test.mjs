@@ -50,6 +50,7 @@ function runHarness(scriptFile, functionNames, harnessBody) {
     "$ErrorActionPreference = 'Stop'",
     'function Write-Ok($msg)    { Write-Host "ok: $msg" }',
     'function Write-Warn2($msg) { Write-Host "warn: $msg" }',
+    'function Write-Skip($msg)  { Write-Host "skip: $msg" }',
     `$WORK = '${dir.replace(/'/g, "''")}'`,
     // Remove-AllOurHooks / Test-OurHookCommand が参照する配置先パス
     "$HookScript = Join-Path $WORK 'hook-client.js'",
@@ -134,7 +135,7 @@ Set-Content -LiteralPath $target -Value ($root2 | ConvertTo-Json -Depth 10) -Enc
   assert.ok(commands.some((c) => c.includes(oursPath)), '対象外イベントの自分のフックまで消えた');
 });
 
-test('Read-InstallManifest は不完全・未知バージョンの manifest を無効扱いにする', { skip: !pwshOk }, () => {
+test('Read-InstallManifest は「無い」と「無効」を区別し、無効なら中断する', { skip: !pwshOk }, () => {
   const { stdout } = runHarness('update.ps1', ['Read-InstallManifest'], `
 $full = '{"schemaVersion":1,"savedAt":"x","includeToolEvents":false,"skipClaude":false,"skipCodex":true,"registerStartup":true}'
 $incomplete = '{"schemaVersion":1,"skipCodex":true}'
@@ -143,12 +144,37 @@ $stringBool = '{"schemaVersion":1,"includeToolEvents":false,"skipClaude":false,"
 foreach ($case in @(@('full', $full), @('incomplete', $incomplete), @('unknown', $unknown), @('stringBool', $stringBool))) {
   $p = Join-Path $WORK ($case[0] + '.json')
   Set-Content -LiteralPath $p -Value $case[1] -Encoding UTF8
-  $m = Read-InstallManifest $p
-  Write-Output ($case[0] + '=' + ($(if ($null -eq $m) { 'null' } else { 'valid' })))
+  $result = 'valid'
+  try {
+    $m = Read-InstallManifest $p
+    if ($null -eq $m) { $result = 'null' }
+  } catch { $result = 'abort' }
+  Write-Output ($case[0] + '=' + $result)
 }
+# ファイルが無い場合だけ null（現状からの推定に切り替えてよい）
+$m2 = Read-InstallManifest (Join-Path $WORK 'missing.json')
+Write-Output ('missing=' + $(if ($null -eq $m2) { 'null' } else { 'valid' }))
 `);
   assert.match(stdout, /full=valid/);
-  assert.match(stdout, /incomplete=null/);
-  assert.match(stdout, /unknown=null/);
-  assert.match(stdout, /stringBool=null/);
+  // 存在するのに無効な manifest は、一時的なフック欠落を Skip として固定したり
+  // 未知バージョンを v1 で上書きしたりしないよう、推定へ流さず中断する
+  assert.match(stdout, /incomplete=abort/);
+  assert.match(stdout, /unknown=abort/);
+  assert.match(stdout, /stringBool=abort/);
+  assert.match(stdout, /missing=null/);
+});
+
+test('uninstall の解除も似た名前の他製品フックを巻き込まない', { skip: !pwshOk }, () => {
+  const { dir } = runHarness(
+    'uninstall.ps1',
+    ['Test-OurHookCommand', 'Remove-OldBackups', 'Remove-OurHooks'],
+    `${BUILD_SAMPLE}
+Remove-OurHooks $target
+`,
+  );
+  const result = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+  const commands = collectCommands(result);
+  assert.ok(!commands.some((c) => c.includes(path.join(dir, 'hook-client.js'))), '自分のフックが残っている');
+  assert.ok(commands.some((c) => c.includes('their-hook-client.js')), '他製品の similar-hook-client.js を巻き込んで削除した');
+  assert.ok(commands.some((c) => c.includes('codegraph.js')), '無関係のフックを巻き込んで削除した');
 });

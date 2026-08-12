@@ -131,25 +131,28 @@ function Confirm-DaemonProcess([int]$ownerPid, $runtime) {
 #>
 function Read-InstallManifest([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
+    # 「存在するが無効」を現状推定へ流すと、一時的に欠けたフックを意図的な Skip として
+    # 固定したり、未知バージョンの manifest を v1 で上書きしたりする。中断して案内する
+    $stop = { throw "install.json が壊れているか未知の形式のため更新を中断しました。修復するか、ファイルを削除して現状からの推定に任せるか、オプションを明示指定して再実行してください: $path" }
     try {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        if ([string]::IsNullOrWhiteSpace($raw)) { & $stop }
         $m = $raw | ConvertFrom-Json
         # 形式が不正・不完全なら無効扱いにして現状推定へ戻す。"false" のような文字列は
         # bool として true 相当に化けるので、型まで確かめる。schemaVersion は 1 だけを
         # 受理し（未知バージョンを現行形式として処理しない）、schemaVersion 1 では
         # 4 項目すべてを必須の boolean とする（欠落を既定値へ倒すと、意図しない
         # 再登録やツールイベントの解除が起きる）
-        if (-not (Get-Member -InputObject $m -Name 'schemaVersion' -ErrorAction SilentlyContinue)) { return $null }
-        if ($m.schemaVersion -isnot [int] -and $m.schemaVersion -isnot [long]) { return $null }
-        if ($m.schemaVersion -ne 1) { return $null }
+        if (-not (Get-Member -InputObject $m -Name 'schemaVersion' -ErrorAction SilentlyContinue)) { & $stop }
+        if ($m.schemaVersion -isnot [int] -and $m.schemaVersion -isnot [long]) { & $stop }
+        if ($m.schemaVersion -ne 1) { & $stop }
         foreach ($key in 'includeToolEvents', 'skipClaude', 'skipCodex', 'registerStartup') {
-            if (-not (Get-Member -InputObject $m -Name $key -ErrorAction SilentlyContinue)) { return $null }
-            if ($m.$key -isnot [bool]) { return $null }
+            if (-not (Get-Member -InputObject $m -Name $key -ErrorAction SilentlyContinue)) { & $stop }
+            if ($m.$key -isnot [bool]) { & $stop }
         }
         return $m
     } catch {
-        return $null
+        & $stop
     }
 }
 
