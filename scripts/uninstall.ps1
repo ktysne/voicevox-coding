@@ -39,8 +39,39 @@ $InstallDir = Join-Path $env:USERPROFILE '.voicevox-coding'
 $ClaudeDir  = Join-Path $env:USERPROFILE '.claude'
 $CodexDir   = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 
-function Write-Ok($msg)  { Write-Host "  OK   $msg" -ForegroundColor Green }
-function Write-Skip($msg){ Write-Host "  --   $msg" -ForegroundColor DarkGray }
+function Write-Ok($msg)    { Write-Host "  OK   $msg" -ForegroundColor Green }
+function Write-Skip($msg)  { Write-Host "  --   $msg" -ForegroundColor DarkGray }
+function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow }
+
+<#
+  対象ファイルのバックアップ世代を整理する。
+  「<ファイル名>.bak-yyyyMMdd-HHmmss」に完全一致するものだけを対象にし、
+  新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
+  削除に失敗しても uninstall 全体は失敗させず、警告だけ出して続行する。
+  install.ps1 の同名関数と同じロジックだが、モジュール共有はせずそれぞれに持たせている。
+#>
+function Remove-OldBackups([string]$path, [int]$Keep = 5) {
+    $dir  = Split-Path -Parent $path
+    $name = Split-Path -Leaf $path
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+
+    $pattern = '^' + [regex]::Escape($name) + '\.bak-\d{8}-\d{6}$'
+    $backups = @(
+        Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $pattern } |
+            Sort-Object Name -Descending
+    )
+
+    if ($backups.Count -le $Keep) { return }
+
+    foreach ($old in $backups[$Keep..($backups.Count - 1)]) {
+        try {
+            Remove-Item -LiteralPath $old.FullName -Force
+        } catch {
+            Write-Warn2 "古いバックアップを削除できませんでした: $($old.FullName) ($($_.Exception.Message))"
+        }
+    }
+}
 
 function Remove-OurHooks([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) {
@@ -56,6 +87,7 @@ function Remove-OurHooks([string]$path) {
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
     Copy-Item -LiteralPath $path -Destination "$path.bak-$stamp" -Force
     Write-Ok "バックアップ: $path.bak-$stamp"
+    Remove-OldBackups $path
 
     $removed = 0
     $hooks = $root['hooks']

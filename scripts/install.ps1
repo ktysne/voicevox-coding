@@ -94,6 +94,35 @@ function Backup-File([string]$path) {
     return $backup
 }
 
+<#
+  対象ファイルのバックアップ世代を整理する。
+  「<ファイル名>.bak-yyyyMMdd-HHmmss」に完全一致するものだけを対象にし、
+  新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
+  削除に失敗しても install 全体は失敗させず、警告だけ出して続行する。
+#>
+function Remove-OldBackups([string]$path, [int]$Keep = 5) {
+    $dir  = Split-Path -Parent $path
+    $name = Split-Path -Leaf $path
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+
+    $pattern = '^' + [regex]::Escape($name) + '\.bak-\d{8}-\d{6}$'
+    $backups = @(
+        Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $pattern } |
+            Sort-Object Name -Descending
+    )
+
+    if ($backups.Count -le $Keep) { return }
+
+    foreach ($old in $backups[$Keep..($backups.Count - 1)]) {
+        try {
+            Remove-Item -LiteralPath $old.FullName -Force
+        } catch {
+            Write-Warn2 "古いバックアップを削除できませんでした: $($old.FullName) ($($_.Exception.Message))"
+        }
+    }
+}
+
 function Read-JsonFile([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return @{} }
     $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
@@ -101,10 +130,18 @@ function Read-JsonFile([string]$path) {
     return $raw | ConvertFrom-Json -AsHashtable
 }
 
-function Write-JsonFile([string]$path, $obj) {
+function ConvertTo-JsonText($obj) {
+    return $obj | ConvertTo-Json -Depth 30
+}
+
+function Get-RawFileContent([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    return Get-Content -LiteralPath $path -Raw -Encoding UTF8
+}
+
+function Write-JsonFile([string]$path, [string]$json) {
     $dir = Split-Path -Parent $path
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $json = $obj | ConvertTo-Json -Depth 30
     # ConvertTo-Json は BOM なし UTF-8 で書く（既定の Set-Content が pwsh7 では BOM なし）
     Set-Content -LiteralPath $path -Value $json -Encoding UTF8 -NoNewline
 }
@@ -189,8 +226,6 @@ if ($IncludeToolEvents) {
 if (-not $SkipClaude) {
     Write-Step 'Claude Code に登録します'
     $settingsPath = Join-Path $ClaudeDir 'settings.json'
-    $backup = Backup-File $settingsPath
-    if ($backup) { Write-Ok "バックアップ: $backup" }
 
     $settings = Read-JsonFile $settingsPath
     $cmd = New-ClaudeHookCommand $node 'claudeCode'
@@ -200,8 +235,21 @@ if (-not $SkipClaude) {
         $matcher = if ($ev -in @('PreToolUse', 'PostToolUse')) { '*' } else { $null }
         $settings = Merge-Hook -Root $settings -EventName $ev -Command $cmd -Matcher $matcher -Async -TimeoutSec 10
     }
-    Write-JsonFile $settingsPath $settings
-    Write-Ok "$settingsPath ($($claudeEvents.Count) イベント)"
+
+    # 書き込む内容が既存ファイルと完全一致するなら、バックアップも書き込みも行わない。
+    # これにより定例の update ではバックアップ世代がそもそも増えない。
+    $newJson     = ConvertTo-JsonText $settings
+    $existingRaw = Get-RawFileContent $settingsPath
+    if ($existingRaw -ceq $newJson) {
+        Write-Ok "変更はありません: $settingsPath"
+    } else {
+        $backup = Backup-File $settingsPath
+        if ($backup) { Write-Ok "バックアップ: $backup" }
+        Write-JsonFile $settingsPath $newJson
+        Write-Ok "$settingsPath ($($claudeEvents.Count) イベント)"
+        # 世代整理は新しい設定の書き込みが成功した後に行う（今回のバックアップは必ず残る）
+        if ($backup) { Remove-OldBackups $settingsPath }
+    }
 } else {
     Write-Warn2 'Claude Code はスキップしました'
 }
@@ -210,8 +258,6 @@ if (-not $SkipClaude) {
 if (-not $SkipCodex) {
     Write-Step 'Codex に登録します'
     $hooksPath = Join-Path $CodexDir 'hooks.json'
-    $backup = Backup-File $hooksPath
-    if ($backup) { Write-Ok "バックアップ: $backup" }
 
     $codexHooks = Read-JsonFile $hooksPath
     $cmd = New-CodexHookCommand 'codex'
@@ -223,8 +269,20 @@ if (-not $SkipCodex) {
         $timeout = if ($ev -eq 'SessionEnd') { 3 } else { 5 }
         $codexHooks = Merge-Hook -Root $codexHooks -EventName $ev -Command $cmd -Matcher $matcher -TimeoutSec $timeout
     }
-    Write-JsonFile $hooksPath $codexHooks
-    Write-Ok "$hooksPath ($($codexEvents.Count) イベント)"
+
+    # 書き込む内容が既存ファイルと完全一致するなら、バックアップも書き込みも行わない。
+    $newJson     = ConvertTo-JsonText $codexHooks
+    $existingRaw = Get-RawFileContent $hooksPath
+    if ($existingRaw -ceq $newJson) {
+        Write-Ok "変更はありません: $hooksPath"
+    } else {
+        $backup = Backup-File $hooksPath
+        if ($backup) { Write-Ok "バックアップ: $backup" }
+        Write-JsonFile $hooksPath $newJson
+        Write-Ok "$hooksPath ($($codexEvents.Count) イベント)"
+        # 世代整理は新しい設定の書き込みが成功した後に行う（今回のバックアップは必ず残る）
+        if ($backup) { Remove-OldBackups $hooksPath }
+    }
 
     # 素の `node` で起動するため、実際に名前だけで解決できるか確かめる
     $resolved = & cmd.exe /c 'node --version' 2>$null
