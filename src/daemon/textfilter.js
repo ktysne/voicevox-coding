@@ -275,6 +275,30 @@ const PARK_OPEN = '§';
 const PARK_CLOSE = '§';
 const PARK_RE = /§(\d+)§/g;
 
+/**
+ * text 中の URL を §n§ の目印へ一時退避する。復元は unparkUrls で行う。
+ * URL 走査 (scanUrlLength) は空白と日本語句読点まで進むため、URL の直後に
+ * 隙間なく続く Markdown の装飾記号（`**強調**` の閉じなど）を URL の一部として
+ * 巻き込んでしまう。巻き込んだまま退避すると装飾記号が記号除去を免れて本文へ
+ * 残るので、末尾に連なる装飾記号は退避せず本文側へ置いていく
+ * （従来どおり記号除去で消える）。
+ */
+function parkUrls(text) {
+  const parked = [];
+  const guarded = replaceUrls(text, (m) => {
+    const trail = (m.match(/[*_~`]+$/) ?? [''])[0];
+    const core = trail ? m.slice(0, -trail.length) : m;
+    parked.push(core);
+    return PARK_OPEN + (parked.length - 1) + PARK_CLOSE + trail;
+  });
+  return { guarded, parked };
+}
+
+/** parkUrls が置いた目印を元の URL に戻す。 */
+function unparkUrls(text, parked) {
+  return text.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
+}
+
 const SENTENCE_END = /(?<=[。．.!?！？])\s*/;
 
 // 箇条書き項目の切れ目を、整形後のテキスト上へ残しておくための内部マーカー。
@@ -388,27 +412,26 @@ function applyFilePaths(text, mode) {
 // SCREAMING_SNAKE_CASE の定数名。`_` 連結のトークンだけを対象にする。
 // HTTP や JSON のような単独の大文字語はスペルアウトが正しい読みであることが多いため、
 // 意図的に対象外にする。
-const CONSTANT_CASE = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g;
+// `_FOO_BAR_` のような `_` による Markdown 強調に接する形は、`\b` だと先行の `_` が
+// 語文字扱いになって検出できない。そこで語頭・語尾の `_`（強調記号、`__` まで）ごと
+// 一致させ、変換時に外す。lookbehind / lookahead からは `_` も除外しているので、
+// error_CODE のような小文字混じりの識別子の一部にまでは一致しない。
+const CONSTANT_CASE = /(?<![0-9A-Za-z_])_{0,2}[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+_{0,2}(?![0-9A-Za-z_])/g;
 
 /**
  * MOVEFILE_REPLACE_EXISTING のような定数名を「movefile replace existing」のように
  * 小文字化・空白区切りへ変換する。1 文字ずつのスペル読みになって聞き取れないのを避ける。
  * URL をそのまま読む設定 (url: 'read') では本文中に URL が残るため、URL パス中の
- * 大文字（https://example.com/API_DOC 等）を巻き込まないよう applyFilePaths と同じ
- * 退避方式で一時的に除外してから変換する。
+ * 大文字（https://example.com/API_DOC 等）を巻き込まないよう一時的に退避してから変換する。
  */
 function applyConstantCase(text, mode) {
   if (mode !== 'split') return text;
-
-  const parked = [];
-  const guarded = replaceUrls(text, (m) => {
-    parked.push(m);
-    return PARK_OPEN + (parked.length - 1) + PARK_CLOSE;
-  });
-
-  const replaced = guarded.replace(CONSTANT_CASE, (m) => m.toLowerCase().replace(/_/g, ' '));
-
-  return replaced.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
+  const { guarded, parked } = parkUrls(text);
+  const replaced = guarded.replace(CONSTANT_CASE, (m) => (
+    // 語頭・語尾に付いてきた強調記号の `_` は読み上げ対象ではないので外す
+    m.replace(/^_+|_+$/g, '').toLowerCase().replace(/_/g, ' ')
+  ));
+  return unparkUrls(replaced, parked);
 }
 
 function applyTables(text, mode) {
@@ -495,14 +518,10 @@ export function filterText(input, f = {}) {
     // （例: https://example.com/API_DOC が https://example.com/APIDOC になる）。
     // 他のモードでは URL 自体が既に短縮・置換済みで本文中に残らないため、
     // ここでの退避は基本的に空振りする（replaceUrls は該当が無ければ即 return する）。
-    const parked = [];
-    t = replaceUrls(t, (m) => {
-      parked.push(m);
-      return PARK_OPEN + (parked.length - 1) + PARK_CLOSE;
-    });
-    t = t.replace(MD_EMPHASIS, '$2');
+    const { guarded, parked } = parkUrls(t);
+    t = guarded.replace(MD_EMPHASIS, '$2');
     t = t.replace(/[*_`~>|#]/g, '');
-    t = t.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
+    t = unparkUrls(t, parked);
   }
 
   if (f.emoji !== false) t = t.replace(EMOJI, ' ');

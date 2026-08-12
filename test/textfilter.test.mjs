@@ -322,6 +322,32 @@ test('URL を read にしても URL 中の大文字は壊さない（#50）', ()
   assert.match(text, /https:\/\/example\.com\/API_DOC/);
 });
 
+test('強調記号で囲まれた URL は装飾だけ外れて URL は壊れない（#50）', () => {
+  const bold = filterText('**https://example.com/API_DOC** を参照。', { ...F, url: 'read' });
+  assert.match(bold.text, /https:\/\/example\.com\/API_DOC/);
+  assert.doesNotMatch(bold.text, /\*/);
+  const italic = filterText('_https://example.com/API_DOC_ を参照。', { ...F, url: 'read' });
+  assert.match(italic.text, /https:\/\/example\.com\/API_DOC/);
+  assert.doesNotMatch(italic.text, /API_DOC_/);
+  const strike = filterText('~~https://example.com/API_DOC~~ を参照。', { ...F, url: 'read' });
+  assert.match(strike.text, /https:\/\/example\.com\/API_DOC/);
+  assert.doesNotMatch(strike.text, /~/);
+});
+
+test('_ 強調で囲まれた定数名も単語に分けて読む（#50）', () => {
+  const single = filterText('_MOVEFILE_REPLACE_EXISTING_ を指定します。', F);
+  assert.match(single.text, /movefile replace existing/);
+  assert.doesNotMatch(single.text, /MOVEFILE/);
+  const double = filterText('__MOVEFILE_REPLACE_EXISTING__ を指定します。', F);
+  assert.match(double.text, /movefile replace existing/);
+  assert.doesNotMatch(double.text, /MOVEFILE/);
+});
+
+test('小文字混じりの識別子の大文字部分は変換しない（#50）', () => {
+  const { text } = filterText('error_CODE_X は対象外。', { ...F, markdownSymbols: false });
+  assert.match(text, /error_CODE_X/);
+});
+
 test('表の行は落ちる', () => {
   const { text } = filterText('前\n| 項目 | 値 |\n| --- | --- |\n| a | b |\n後', F);
   assert.doesNotMatch(text, /項目/);
