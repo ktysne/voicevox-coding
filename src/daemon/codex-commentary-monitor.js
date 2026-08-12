@@ -138,7 +138,11 @@ export class AppServerTransport extends EventEmitter {
     const forceKill = setTimeout(() => {
       if (child.exitCode !== null || child.killed) return;
       if (process.platform === 'win32' && child.pid) {
-        execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {});
+        execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, (err) => {
+          // 失敗を黙らせない（プロセスが既に終了していた場合も err になるが、
+          // その場合は実害がないので debug 相当の扱いでよい）
+          if (err) this.log?.debug?.(`Codex app-server の強制終了に失敗しました: ${err.message}`);
+        });
       } else {
         child.kill();
       }
