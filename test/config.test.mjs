@@ -192,3 +192,19 @@ test('watch() は自分の保存直後 (suppressWatchUntil 内) の発火を無�
   watchCallback('change', 'config.json');
   assert.equal(store.revision, 2);
 });
+
+test('close() は保留中の再読み込みタイマーも取り消す (#41)', async () => {
+  const store = new ConfigStore();
+  store.load();
+  const changes = [];
+  store.on('change', () => changes.push('change'));
+  // 外部編集の debounce 待ち（保留中の再読み込み）を模す
+  store._reloadTimer = setTimeout(() => {
+    store.revision += 1;
+    store.emit('change', store.config, store.revision, store.bootId, null);
+  }, 30);
+  store.close();
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  // 終了処理の後に change が発火して、停止済みのコンポーネントを起こし直さない
+  assert.deepEqual(changes, []);
+});

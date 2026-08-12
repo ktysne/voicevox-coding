@@ -14,7 +14,7 @@ import { SpeechQueue } from './queue.js';
 import { Tray } from './tray.js';
 import { createServer } from './server.js';
 import { syncEngineDictionary } from './dictionary.js';
-import { CodexCommentaryMonitor } from './codex-commentary-monitor.js';
+import { CodexCommentaryMonitor, commentaryEnabled } from './codex-commentary-monitor.js';
 
 const args = process.argv.slice(2);
 const shouldOpen = args.includes('--open');
@@ -56,6 +56,22 @@ async function initialDictionarySync() {
     for (const f of r.failed) log.warn(`ユーザー辞書「${f.surface}」: ${f.errors.join(' / ')}`);
   } catch (err) {
     log.warn(`ユーザー辞書の同期を見送りました: ${err.message}`);
+  }
+}
+
+/**
+ * 設定に合わせて Codex 途中経過監視の起動/停止を切り替える。
+ * 「途中経過（Codex）」または Codex ターゲット自体がオフなら、読み上げだけでなく
+ * app-server の起動とポーリングそのものを止める。
+ */
+function syncCommentaryMonitor() {
+  // 終了処理が始まった後の設定変更（保留中の再読込タイマーなど）で
+  // 停止済みの監視を起動し直さない
+  if (shuttingDown) return;
+  if (commentaryEnabled(store.config)) {
+    commentaryMonitor.start();
+  } else {
+    commentaryMonitor.stop();
   }
 }
 
@@ -137,7 +153,7 @@ server.listen(port, '127.0.0.1', async () => {
   // 二重起動した後発プロセスが、稼働中デーモンの再生待ちファイルを消してしまわないため。
   queue.cleanupEphemeral();
   writeRuntimeFile(port);
-  commentaryMonitor.start();
+  syncCommentaryMonitor();
 
   if (store.config.daemon?.tray !== false && !noTray) {
     tray = new Tray(port, log, apiToken);
@@ -169,6 +185,7 @@ server.listen(port, '127.0.0.1', async () => {
 });
 
 store.on('change', () => startHealthCheck());
+store.on('change', () => syncCommentaryMonitor());
 
 async function shutdown() {
   if (shuttingDown) return;
