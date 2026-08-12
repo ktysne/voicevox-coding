@@ -135,14 +135,17 @@ function Read-InstallManifest([string]$path) {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
         if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
         $m = $raw | ConvertFrom-Json
-        # 形式が不正なら無効扱いにして現状推定へ戻す。"false" のような文字列は
-        # bool として true 相当に化けるので、型まで確かめる
+        # 形式が不正・不完全なら無効扱いにして現状推定へ戻す。"false" のような文字列は
+        # bool として true 相当に化けるので、型まで確かめる。schemaVersion は 1 だけを
+        # 受理し（未知バージョンを現行形式として処理しない）、schemaVersion 1 では
+        # 4 項目すべてを必須の boolean とする（欠落を既定値へ倒すと、意図しない
+        # 再登録やツールイベントの解除が起きる）
         if (-not (Get-Member -InputObject $m -Name 'schemaVersion' -ErrorAction SilentlyContinue)) { return $null }
         if ($m.schemaVersion -isnot [int] -and $m.schemaVersion -isnot [long]) { return $null }
+        if ($m.schemaVersion -ne 1) { return $null }
         foreach ($key in 'includeToolEvents', 'skipClaude', 'skipCodex', 'registerStartup') {
-            if (Get-Member -InputObject $m -Name $key -ErrorAction SilentlyContinue) {
-                if ($m.$key -isnot [bool]) { return $null }
-            }
+            if (-not (Get-Member -InputObject $m -Name $key -ErrorAction SilentlyContinue)) { return $null }
+            if ($m.$key -isnot [bool]) { return $null }
         }
         return $m
     } catch {
@@ -191,7 +194,11 @@ function Get-OurHookEvents($root) {
             if (-not $g) { continue }
             foreach ($hk in @($g.hooks)) {
                 if (-not $hk) { continue }
-                if ([string]$hk.command -like '*hook-client.js*') { $events += $prop.Name }
+                # 他製品の similar-hook-client.js を我々のものと誤認しないよう、
+                # 配置先の絶対パスで厳密に識別する
+                $cmdText = [string]$hk.command
+                $hookScript = Join-Path (Join-Path $env:USERPROFILE '.voicevox-coding') 'hook-client.js'
+                if ($cmdText.IndexOf($hookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $events += $prop.Name }
             }
         }
     }

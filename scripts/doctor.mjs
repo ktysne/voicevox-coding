@@ -138,9 +138,14 @@ export function parseCodexInitializeResult(message) {
  */
 export function normalizeInstallManifest(obj) {
   if (!obj || typeof obj !== 'object') return null;
-  if (!Number.isInteger(obj.schemaVersion) || obj.schemaVersion < 1) return null;
+  // schemaVersion 1 だけを受理する。未知のバージョンを現行形式として
+  // 処理すると、将来の項目変更で誤判定するため
+  if (obj.schemaVersion !== 1) return null;
+  // schemaVersion 1 では 4 項目すべてが必須の boolean。欠けた項目を既定値へ
+  // 倒すと、意図しない再登録やツールイベントの解除が起きるため、不完全な
+  // manifest は無効扱いにして現状推定へ戻す
   for (const key of ['includeToolEvents', 'skipClaude', 'skipCodex', 'registerStartup']) {
-    if (key in obj && typeof obj[key] !== 'boolean') return null;
+    if (typeof obj[key] !== 'boolean') return null;
   }
   return obj;
 }

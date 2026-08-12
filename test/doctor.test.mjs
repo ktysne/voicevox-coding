@@ -104,10 +104,15 @@ test('normalizeInstallManifest: 正しい形式はそのまま返す', () => {
   assert.equal(normalizeInstallManifest(m), m);
 });
 
-test('normalizeInstallManifest: 型が不正なら無効扱い（null）にする', () => {
+test('normalizeInstallManifest: 型が不正・不完全・未知バージョンは無効扱い（null）にする', () => {
+  const full = { schemaVersion: 1, includeToolEvents: false, skipClaude: false, registerStartup: true };
   // "false" のような文字列 bool は truthy に化けて検査を誤って省略するため弾く
-  assert.equal(normalizeInstallManifest({ schemaVersion: 1, skipCodex: 'false' }), null);
-  assert.equal(normalizeInstallManifest({ schemaVersion: '1', skipCodex: false }), null);
+  assert.equal(normalizeInstallManifest({ ...full, skipCodex: 'false' }), null);
+  assert.equal(normalizeInstallManifest({ ...full, schemaVersion: '1', skipCodex: false }), null);
+  // 欠落キーを既定値へ倒すと意図しない再登録が起きるため、不完全な manifest は弾く
+  assert.equal(normalizeInstallManifest({ schemaVersion: 1, skipCodex: true }), null);
+  // 未知の schemaVersion を現行形式として処理しない
+  assert.equal(normalizeInstallManifest({ ...full, schemaVersion: 2, skipCodex: false }), null);
   assert.equal(normalizeInstallManifest({ skipCodex: false }), null); // schemaVersion 無し
   assert.equal(normalizeInstallManifest(null), null);
   assert.equal(normalizeInstallManifest('text'), null);

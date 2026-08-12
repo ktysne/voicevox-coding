@@ -68,6 +68,17 @@ function Write-Step($msg)  { Write-Host "  $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "  OK   $msg" -ForegroundColor Green }
 function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow }
 
+<#
+  コマンド文字列が「我々が登録したフック」かどうかの判定。
+  'hook-client.js' の部分一致だけでは、他製品の similar-hook-client.js のような
+  フックまで巻き込んで削除しかねないため、我々が配置した絶対パスで厳密に識別する
+  （Windows のパスは大文字小文字を区別しないので OrdinalIgnoreCase で比較する）。
+#>
+function Test-OurHookCommand([string]$command) {
+    if ([string]::IsNullOrEmpty($command)) { return $false }
+    return $command.IndexOf($HookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
 function Get-NodePath {
     $cmd = Get-Command node.exe -ErrorAction SilentlyContinue
     if (-not $cmd) { throw 'node.exe が PATH に見つかりません。Node.js をインストールしてください。' }
@@ -204,7 +215,7 @@ function Merge-Hook {
         foreach ($hk in @($g.hooks)) {
             if ($null -eq $hk) { continue }
             $cmdText = [string]$hk.command
-            if ($cmdText -like '*hook-client.js*') { continue }   # 我々のもの → 捨てて再登録
+            if (Test-OurHookCommand $cmdText) { continue }   # 我々のもの → 捨てて再登録
             $inner += $hk
         }
         if ($inner.Count -gt 0) {
@@ -240,7 +251,7 @@ function Remove-OurHook {
         $inner = @()
         foreach ($hk in @($g.hooks)) {
             if ($null -eq $hk) { continue }
-            if ([string]$hk.command -like '*hook-client.js*') { continue }
+            if (Test-OurHookCommand ([string]$hk.command)) { continue }
             $inner += $hk
         }
         if ($inner.Count -gt 0) {
@@ -308,7 +319,7 @@ function Remove-AllOurHooks([string]$path, [string]$label) {
             $inner = @()
             foreach ($hk in @($g.hooks)) {
                 if ($null -eq $hk) { continue }
-                if ([string]$hk.command -like '*hook-client.js*') { $removed++; continue }
+                if (Test-OurHookCommand ([string]$hk.command)) { $removed++; continue }
                 $inner += $hk
             }
             if ($inner.Count -gt 0) {
