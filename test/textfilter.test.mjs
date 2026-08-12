@@ -684,6 +684,21 @@ function measure(fn) {
   return { value, ms: performance.now() - started };
 }
 
+/**
+ * fn を複数回実行して最短の所要時間を返す。
+ * vm の timeout やイベントループのジッタは上振れ方向にしか出ないので、
+ * 「短い時間で打ち切られていること」の検証は最短値で見るのが安定する
+ * （単発の計測は CI の低速ランナーで上振れしてフレークする）。
+ */
+function measureMin(fn, times = 5) {
+  let best = null;
+  for (let i = 0; i < times; i += 1) {
+    const r = measure(fn);
+    if (best === null || r.ms < best.ms) best = r;
+  }
+  return best;
+}
+
 test('照合が終わらないパターンは時間で打ち切る', () => {
   // 素の RegExp では終わらない書き方。打ち切って読み上げに進むこと。
   // (a+)+$ は繰り返しの入れ子、a*a*X はグループ無しでも計算量が跳ねる例。
@@ -736,8 +751,9 @@ test('時間切れになったパターンは次から短い時間で試す', ()
   assert.match(first.value.problems[0], /時間内に終わりません/);
   assert.ok(first.ms >= IGNORE_MATCH_PATTERN_MS / 2, `${first.ms}ms しかかかっていない`);
 
-  // 2 回目は短い時間で打ち切る。絶対値ではなく初回との比で見る（実行環境の速さに左右されないように）
-  const second = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  // 2 回目は短い時間で打ち切る。絶対値ではなく初回との比で見る（実行環境の速さに左右されないように）。
+  // 単発の計測は CI の低速ランナーで上振れしてフレークするため、最短値で見る
+  const second = measureMin(() => resolveStop(LONG_TEXT, [pattern]));
   assert.equal(second.value.speak, true);
   assert.match(second.value.problems[0], /時間内に終わりません/);
   assert.ok(second.ms < first.ms / 2, `初回 ${first.ms}ms に対して 2 回目が ${second.ms}ms`);
@@ -749,7 +765,7 @@ test('時間切れになったパターンは次から短い時間で試す', ()
   assert.deepEqual(short.problems, []);
 
   // 短い本文で間に合っても枠は戻さない。長短が交互に来ても毎回止まらないこと
-  const third = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  const third = measureMin(() => resolveStop(LONG_TEXT, [pattern]));
   assert.equal(third.value.speak, true);
   assert.ok(third.ms < first.ms / 2, `${third.ms}ms かかった`);
 });
@@ -758,7 +774,8 @@ test('記録を捨てると時間切れのパターンをまた測り直す', ()
   resetIgnoreMatchState();
   const pattern = heavy(12);
   assert.match(resolveStop(LONG_TEXT, [pattern]).problems[0], /時間内に終わりません/);
-  const shortLeash = measure(() => resolveStop(LONG_TEXT, [pattern]));
+  // 短い枠側の計測はジッタで上振れしやすいので最短値で見る
+  const shortLeash = measureMin(() => resolveStop(LONG_TEXT, [pattern]));
 
   resetIgnoreMatchState();
   const again = measure(() => resolveStop(LONG_TEXT, [pattern]));
