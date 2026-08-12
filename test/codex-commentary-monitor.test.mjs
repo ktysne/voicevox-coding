@@ -339,6 +339,45 @@ test('CLI 不在: 3 回連続で失敗したら低頻度の再試行へ切り替
   }
 });
 
+test('初回走査だけ失敗しても、後続のポーリングで完走すれば接続成功と記録される', async () => {
+  const warns = [];
+  const log = { warn: (msg) => warns.push(msg), info: () => {}, debug: () => {} };
+  let listCalls = 0;
+
+  class FirstScanFailsTransport extends EventEmitter {
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        listCalls += 1;
+        if (listCalls === 1) throw new Error('初回だけ失敗');
+        return { data: [] };
+      }
+      return { data: [] };
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    log,
+    transportFactory: () => new FirstScanFailsTransport(),
+  });
+
+  try {
+    monitor.start();
+    // 初回走査は失敗するが、後続のポーリングの走査が完走した時点で接続成功になる。
+    // これが無いと、この後の切断 + 失敗 3 回で低頻度モードへ誤って入る。
+    await waitFor(() => monitor.everConnected);
+    assert.equal(monitor.slowRetry, false);
+    assert.equal(monitor.consecutiveFailures, 0);
+  } finally {
+    monitor.dispose();
+  }
+});
+
 test('低頻度の再試行中に接続が回復したら通常の監視へ戻る', async () => {
   const warns = [];
   const infos = [];

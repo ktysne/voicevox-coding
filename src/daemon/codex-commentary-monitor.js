@@ -204,16 +204,10 @@ export class CodexCommentaryMonitor extends EventEmitter {
       // 初回走査の待機中に切断や停止が起きていることがあるため、
       // タイマーを作る直前にも接続世代を確認する。古い世代はここで手を引く。
       if (!this.running || transport !== this.transport) return;
-      // initialize が完了し、初回 scan も（内部で失敗を握り潰さず）完走した。
-      // これ以降の切断は「一時的な不調」として扱い、低頻度再試行への切替判定からは外す。
-      if (this.baselineComplete) {
-        this.everConnected = true;
-        this.consecutiveFailures = 0;
-        if (this.slowRetry) {
-          this.slowRetry = false;
-          this.log?.info?.('Codex の途中経過監視が接続を回復しました');
-        }
-      }
+      // initialize が完了し、初回 scan も完走していれば接続成功を記録する。
+      // 初回 scan が失敗しても、後続のポーリングの scan が完走した時点で
+      // 記録される（scan 側の #noteConnected 参照）。
+      if (this.baselineComplete) this.#noteConnected();
       this.backoffMs = this.restartDelayMs;
       timer = setInterval(() => {
         // 解除漏れへの保険。世代が古くなっていれば走査せず自分自身を止める。
@@ -231,6 +225,19 @@ export class CodexCommentaryMonitor extends EventEmitter {
       transport.dispose?.();
       this.transport = null;
       this.#handleConnectFailure();
+    }
+  }
+
+  /**
+   * 走査の完走 = 接続成功として記録する。これ以降の切断は「一時的な不調」として扱い、
+   * 低頻度再試行への切替判定からは外す。低頻度モード中だったなら回復を 1 回だけ知らせる。
+   */
+  #noteConnected() {
+    this.everConnected = true;
+    this.consecutiveFailures = 0;
+    if (this.slowRetry) {
+      this.slowRetry = false;
+      this.log?.info?.('Codex の途中経過監視が接続を回復しました');
     }
   }
 
@@ -301,6 +308,10 @@ export class CodexCommentaryMonitor extends EventEmitter {
         }
       }
       this.baselineComplete = true;
+      // 走査が完走した = 接続に成功している。初回走査だけが失敗して後続の
+      // ポーリングで回復したケースでも、ここで接続成功が記録される
+      // （#connect 直後の判定だけだと、その後の切断で低頻度モードへ誤って入る）。
+      this.#noteConnected();
     } catch (err) {
       this.log?.warn?.(`Codex の途中経過を取得できません: ${err.message}`);
     } finally {
