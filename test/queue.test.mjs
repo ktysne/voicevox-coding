@@ -582,8 +582,6 @@ test('dedupeWindowSec が数値でなくても読み上げを止めず保持期�
   const bad = { policy: 'enqueue', dedupeWindowSec: 'abc' };
   assert.equal(queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: bad }).accepted, true);
   assert.equal(queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: bad }).accepted, true);
-  // NaN で保持期間 (maxWindowMs) が汚染されると掃除が永久に効かなくなる
-  assert.equal(Number.isFinite(queue.maxWindowMs), true);
 
   // その後の正常な窓では従来どおり重複判定が効く
   const good = { policy: 'enqueue', dedupeWindowSec: 120 };
@@ -593,6 +591,56 @@ test('dedupeWindowSec が数値でなくても読み上げを止めず保持期�
   const dup = queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: good });
   assert.equal(dup.accepted, false);
   assert.equal(dup.reason, 'duplicate');
+
+  await waitIdle(queue);
+});
+
+test('極端に大きい窓は上限でクランプされ、保持期間を汚染しない (#39)', async () => {
+  const player = new FakePlayer();
+  const queue = makeDedupeQueue(player);
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const policy = { policy: 'enqueue', dedupeWindowSec: 1e12 };
+  const text = '重複抑止の窓テスト（巨大値）。';
+
+  assert.equal(queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: policy }).accepted, true);
+
+  now = 100_000; // クランプ後の窓 (120 秒) 内なので重複
+  const r2 = queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: policy });
+  assert.equal(r2.reason, 'duplicate');
+
+  now = 230_000; // クランプ後の窓を過ぎれば受理される（保持も 120 秒で頭打ち）
+  const r3 = queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: policy });
+  assert.equal(r3.accepted, true);
+
+  await waitIdle(queue);
+});
+
+test('drop ポリシーで busy と見送られた文は重複履歴に載らない (#39)', async () => {
+  const player = new FakePlayer();
+  const queue = makeDedupeQueue(player);
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const text = '重複抑止の窓テスト（busy）。';
+
+  // drain を止めた状態でキューへ 1 件積み、busy を作る
+  queue.running = true;
+  assert.equal(queue.enqueue({
+    target: 'test', event: 'test', text: '先客。', speaker: 1, voice: {},
+    queuePolicy: { policy: 'enqueue', dedupeWindowSec: 120 },
+  }).accepted, true);
+
+  const drop = { policy: 'drop', dedupeWindowSec: 120 };
+  const busy = queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: drop });
+  assert.equal(busy.accepted, false);
+  assert.equal(busy.reason, 'busy');
+
+  // キューが空いたら、busy で見送られただけの文は duplicate にならず受理される
+  queue.queue.length = 0;
+  queue.running = false;
+  now = 10_000;
+  const retry = queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: drop });
+  assert.equal(retry.accepted, true);
 
   await waitIdle(queue);
 });

@@ -20,11 +20,19 @@ const SENTENCE_SPLIT = /(?<=[。．！？!?\n])/;
 // 管理コンソールの入力欄の上限（src/ui/app.js の listPauseSec）と同じ値にしてある。
 const MAX_LIST_PAUSE_SEC = 10;
 
-// 管理コンソールが許容する最大の抑止時間（秒）。
-// src/ui/app.js の dedupeWindowSec 入力欄の max と同じ値にしてある。
-// 重複判定の記録はこの時間を下限に保持する。窓を小さくして掃除された後に
-// また広げても、UI で設定できる範囲なら履歴が残っているようにするため。
+// 同一文の抑止時間の上限（秒）。管理コンソールの入力欄の上限
+// （src/ui/app.js の dedupeWindowSec）と同じ値にしてある。
+// 手編集で極端な値を入れても、この値でクランプする（listPauseMs と同じ扱い）。
+// 記録の保持期間もこの値で固定なので、窓を小さくして掃除された後に広げ直しても
+// UI で設定できる範囲なら履歴が残っており、極端な値で保持期間が汚染されることもない。
 const MAX_DEDUPE_WINDOW_SEC = 120;
+
+/** 同一文の抑止時間（ミリ秒）。手編集で数値以外や極端な値が入っても読み上げを止めない。 */
+function dedupeWindowMs(sec) {
+  const v = Number(sec);
+  if (!Number.isFinite(v) || v <= 0) return 0;
+  return Math.min(v, MAX_DEDUPE_WINDOW_SEC) * 1000;
+}
 
 /** 既定値のときはキャッシュキーから外すパラメータ（key -> 既定値）。catalog.js の解説を参照。 */
 const CACHE_KEY_OMITTABLE = new Map(
@@ -131,10 +139,7 @@ export class SpeechQueue extends EventEmitter {
     this.current = null;
     this.running = false;
     this.skipRequested = false;
-    this.recent = new Map(); // dedupe 用: key -> timestamp
-    // recent の掃除間隔（ミリ秒）。管理コンソールが許容する最大の抑止時間を下限とし、
-    // 手編集などでそれより大きい窓を見たらそこまで伸びる（詳細は #isDuplicate 参照）。
-    this.maxWindowMs = MAX_DEDUPE_WINDOW_SEC * 1000;
+    this.recent = new Map(); // dedupe 用: key -> 最後に受理した時刻
     this.seq = 0;
   }
 
@@ -162,28 +167,33 @@ export class SpeechQueue extends EventEmitter {
       .digest('hex');
   }
 
+  #dedupeKey(utterance) {
+    return `${utterance.target}:${utterance.text}`;
+  }
+
+  /**
+   * 重複かどうかの判定だけを行い、履歴には触れない。
+   * 履歴への記録は、発話が実際に受理されたときに #recordRecent で行う。
+   * 判定と記録を分けるのは、drop ポリシーで busy と判定された（一度も読まれていない）
+   * 文が履歴に載り、キューが空いた後も duplicate として失われるのを防ぐため。
+   */
   #isDuplicate(utterance, windowSec) {
-    // 手編集や API 経由で数値以外が入っても読み上げを止めず、NaN で保持期間を
-    // 汚染しない（NaN は比較が常に偽になり、掃除が永久に効かなくなる）
-    const windowMs = Number(windowSec) * 1000;
-    if (!Number.isFinite(windowMs) || windowMs <= 0) return false;
-    // 記録は「UI が許容する最大の抑止時間」と「これまでに指定された窓の最大値」の
-    // 大きい方まで保持しておく。エントリごとに個別の有効期限を持たせるのではなく、
-    // 十分長く時刻を保持したうえで判定は常に「今回の」windowMs で行う方式なので、
-    // UI の範囲では、窓を広げても縮めても新しい設定がその場でそのまま効く。
-    // 手編集で UI 上限より大きい窓を使う場合は、その値を初めて見た時点から保持が伸びる。
-    // 設定を後から小さくしても保持期間はここでは縮めない。記録が少し長く残るだけで、
-    // 判定自体は現在の windowMs で行うため誤検知にはならない。
-    this.maxWindowMs = Math.max(this.maxWindowMs, windowMs);
-    const key = `${utterance.target}:${utterance.text}`;
-    const last = this.recent.get(key);
+    const windowMs = dedupeWindowMs(windowSec);
+    if (windowMs <= 0) return false;
     const now = Date.now();
-    // 古い記録を掃除しておく
-    for (const [k, t] of this.recent) if (now - t > this.maxWindowMs) this.recent.delete(k);
+    // 古い記録を掃除しておく。保持期間は窓の上限（クランプ後の最大値）と同じ固定値なので、
+    // エントリごとに個別の有効期限を持たなくても、窓を広げても縮めても
+    // 新しい設定がその場でそのまま効く。
+    for (const [k, t] of this.recent) if (now - t > MAX_DEDUPE_WINDOW_SEC * 1000) this.recent.delete(k);
+    const last = this.recent.get(this.#dedupeKey(utterance));
     // last === 0 (テストの偽時計など) を未登録と誤判定しないよう undefined 判定にする
-    if (last !== undefined && now - last < windowMs) return true;
-    this.recent.set(key, now);
-    return false;
+    return last !== undefined && now - last < windowMs;
+  }
+
+  /** 受理した発話を重複判定の履歴へ記録する（窓は「最後に受理した時刻」から数える）。 */
+  #recordRecent(utterance, windowSec) {
+    if (dedupeWindowMs(windowSec) <= 0) return;
+    this.recent.set(this.#dedupeKey(utterance), Date.now());
   }
 
   /**
@@ -219,6 +229,10 @@ export class SpeechQueue extends EventEmitter {
     if (policy === 'drop' && (this.current || this.queue.length > 0)) {
       return { accepted: false, reason: 'busy' };
     }
+
+    // ここから先は必ず受理される。busy で見送った文を履歴に載せないよう、
+    // 記録は受理が確定してから行う。
+    this.#recordRecent(utterance, queuePolicy?.dedupeWindowSec);
 
     if (policy === 'replace') {
       this.queue.length = 0;
