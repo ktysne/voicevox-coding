@@ -1,7 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { CodexCommentaryMonitor, extractCommentaryItems } from '../src/daemon/codex-commentary-monitor.js';
+import { CodexCommentaryMonitor, extractCommentaryItems, commentaryEnabled } from '../src/daemon/codex-commentary-monitor.js';
+
+test('commentaryEnabled: 既定は有効、Codex ターゲットか Commentary イベントを明示的に無効化したときだけ false', () => {
+  assert.equal(commentaryEnabled({}), true);
+  assert.equal(commentaryEnabled({ targets: {} }), true);
+  assert.equal(commentaryEnabled({ targets: { codex: {} } }), true);
+  assert.equal(commentaryEnabled({ targets: { codex: { enabled: true } } }), true);
+  assert.equal(commentaryEnabled({ targets: { codex: { enabled: false } } }), false);
+  assert.equal(
+    commentaryEnabled({ targets: { codex: { enabled: true, events: { Commentary: { enabled: false } } } } }),
+    false,
+  );
+  assert.equal(
+    commentaryEnabled({ targets: { codex: { events: { Commentary: { enabled: true } } } } }),
+    true,
+  );
+});
 
 test('agentMessage の commentary かつ空でない本文だけを抽出する', () => {
   assert.deepEqual(extractCommentaryItems({ items: [
@@ -217,5 +233,140 @@ test('dispose() 後は再接続もポーリングも起こらない', async () =
     assert.equal(timers.active, 0);
   } finally {
     timers.restore();
+  }
+});
+
+/** 単一スレッド固定で、その時点の state.items を commentary として返す制御可能な transport。 */
+class ControllableThreadTransport extends EventEmitter {
+  constructor(state) { super(); this.state = state; }
+  start() {}
+  notify() {}
+  async request(method) {
+    if (method === 'initialize') return {};
+    if (method === 'thread/list') return { data: [{ id: 'th' }] };
+    if (method === 'thread/turns/list') {
+      const items = this.state.items.map((id) => ({ id, type: 'agentMessage', phase: 'commentary', text: id }));
+      return { data: [{ id: 'turn', items }] };
+    }
+    return { data: [] };
+  }
+  dispose() {}
+}
+
+test('stop() 後の start() は baseline を取り直し、無効化中に増えた item をまとめて読み上げない', async () => {
+  const state = { items: ['A'] };
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    transportFactory: () => new ControllableThreadTransport(state),
+  });
+  const received = [];
+  monitor.on('commentary', (event) => received.push(event.itemId));
+
+  try {
+    // 1 回目の start: A が baseline に入り、読み上げられない。
+    monitor.start();
+    await waitFor(() => monitor.baselineComplete);
+    assert.deepEqual(received, []);
+
+    // baseline 確定後に増えた B は読み上げる。
+    state.items = ['A', 'B'];
+    await waitFor(() => received.includes('B'));
+    assert.deepEqual(received, ['B']);
+
+    // 無効化（stop）している間に C が増える。
+    monitor.stop();
+    state.items = ['A', 'B', 'C'];
+
+    // 2 回目の start: baseline を取り直すので、既にある C はまとめて読み上げない。
+    monitor.start();
+    await waitFor(() => monitor.baselineComplete);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(received, ['B']);
+
+    // 新しい baseline 確定後に増えた D は読み上げる。
+    state.items = ['A', 'B', 'C', 'D'];
+    await waitFor(() => received.includes('D'));
+    assert.deepEqual(received, ['B', 'D']);
+  } finally {
+    monitor.dispose();
+  }
+});
+
+test('CLI 不在: 一度も接続に成功しないまま 3 回連続で失敗したら自動再接続をやめ、warn は 1 回だけ出す', async () => {
+  const warns = [];
+  const log = { warn: (msg) => warns.push(msg), debug: () => {} };
+  let factoryCalls = 0;
+
+  class AlwaysFailTransport extends EventEmitter {
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') throw new Error('codex コマンドが見つかりません');
+      return { data: [] };
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    log,
+    transportFactory: () => {
+      factoryCalls += 1;
+      return new AlwaysFailTransport();
+    },
+  });
+
+  monitor.start();
+  await waitFor(() => factoryCalls >= 3);
+  // 打ち切り後にさらに再接続が予約されていないことを、少し待って確認する。
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  assert.equal(factoryCalls, 3);
+  assert.equal(monitor.running, false);
+  const giveUpWarns = warns.filter((m) => m.includes('途中経過監視を停止しました'));
+  assert.equal(giveUpWarns.length, 1);
+});
+
+test('一度接続に成功していれば、その後何度切断されても打ち切らずに再接続を続ける', async () => {
+  const warns = [];
+  const log = { warn: (msg) => warns.push(msg), debug: () => {} };
+  let generation = 0;
+
+  class FlakyTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.gen = ++generation;
+      // 接続のたびにすぐ切断する（CLI 不在ではなく、app-server 側の一時的な不調を模す）。
+      this.closeTimer = setTimeout(() => this.emit('close', new Error('一時切断')), 15);
+    }
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      return { data: [] };
+    }
+    dispose() { clearTimeout(this.closeTimer); }
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    log,
+    transportFactory: () => new FlakyTransport(),
+  });
+
+  try {
+    monitor.start();
+    await waitFor(() => monitor.everConnected);
+    // everConnected になった後、打ち切り閾値（3 回）を超えて再接続が続くことを確認する。
+    await waitFor(() => generation >= 6);
+
+    assert.equal(monitor.running, true);
+    const giveUpWarns = warns.filter((m) => m.includes('途中経過監視を停止しました'));
+    assert.equal(giveUpWarns.length, 0);
+  } finally {
+    monitor.dispose();
   }
 });

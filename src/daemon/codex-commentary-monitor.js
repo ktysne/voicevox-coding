@@ -4,6 +4,16 @@ import readline from 'node:readline';
 
 const DEFAULT_POLL_MS = 2000;
 const DEFAULT_TIMEOUT_MS = 10000;
+const DEFAULT_RESTART_DELAY_MS = 1000;
+// 一度も接続に成功しないまま、この回数だけ連続で失敗したら自動再接続をあきらめる。
+// codex CLI が存在しない環境で spawn → 即終了 → 再接続を永遠に繰り返さないための上限。
+const MAX_CONNECT_FAILURES_BEFORE_GIVE_UP = 3;
+
+/** 設定から、Codex の途中経過監視を動かすべきかどうかを判定する。 */
+export function commentaryEnabled(cfg) {
+  return cfg?.targets?.codex?.enabled !== false
+    && cfg?.targets?.codex?.events?.Commentary?.enabled !== false;
+}
 
 /** app-server の turn から、読み上げ対象の途中経過だけを取り出す。 */
 export function extractCommentaryItems(turn) {
@@ -112,9 +122,16 @@ class AppServerTransport extends EventEmitter {
 }
 
 export class CodexCommentaryMonitor extends EventEmitter {
-  constructor({ pollMs = DEFAULT_POLL_MS, timeoutMs = DEFAULT_TIMEOUT_MS, log, transportFactory } = {}) {
+  constructor({
+    pollMs = DEFAULT_POLL_MS,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    restartDelayMs = DEFAULT_RESTART_DELAY_MS,
+    log,
+    transportFactory,
+  } = {}) {
     super();
     this.pollMs = pollMs;
+    this.restartDelayMs = restartDelayMs;
     this.log = log;
     this.transportFactory = transportFactory ?? (() => new AppServerTransport({ timeoutMs, log }));
     this.transport = null;
@@ -124,12 +141,24 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.polling = false;
     this.baselineComplete = false;
     this.seenItems = new Set();
-    this.backoffMs = 1000;
+    this.backoffMs = restartDelayMs;
+    // 一度でも initialize + 初回 scan まで到達したか。true になった後の切断は
+    // 一時的な app-server の不調とみなし、従来どおり無限にバックオフ再接続する。
+    this.everConnected = false;
+    // everConnected に達しないまま連続した接続失敗の回数。CLI 不在の打ち切り判定に使う。
+    this.consecutiveFailures = 0;
   }
 
   start() {
     if (this.running) return;
     this.running = true;
+    // 無効化されていた間に溜まった途中経過を、再有効化した瞬間にまとめて読み上げないよう、
+    // baseline や既知 item、バックオフ・失敗カウンタを含めて「まっさらな状態」からやり直す。
+    this.baselineComplete = false;
+    this.seenItems.clear();
+    this.backoffMs = this.restartDelayMs;
+    this.everConnected = false;
+    this.consecutiveFailures = 0;
     this.#connect();
   }
 
@@ -152,7 +181,7 @@ export class CodexCommentaryMonitor extends EventEmitter {
       if (transport !== this.transport || !this.running) return;
       this.log?.warn?.(err?.message ?? 'Codex app-server との接続が切れました');
       this.transport = null;
-      this.#scheduleRestart();
+      this.#handleConnectFailure();
     });
     try {
       transport.start?.();
@@ -166,7 +195,13 @@ export class CodexCommentaryMonitor extends EventEmitter {
       // 初回走査の待機中に切断や停止が起きていることがあるため、
       // タイマーを作る直前にも接続世代を確認する。古い世代はここで手を引く。
       if (!this.running || transport !== this.transport) return;
-      this.backoffMs = 1000;
+      // initialize が完了し、初回 scan も（内部で失敗を握り潰さず）完走した。
+      // これ以降の切断は「一時的な不調」として扱い、CLI 不在の打ち切り判定からは外す。
+      if (this.baselineComplete) {
+        this.everConnected = true;
+        this.consecutiveFailures = 0;
+      }
+      this.backoffMs = this.restartDelayMs;
       timer = setInterval(() => {
         // 解除漏れへの保険。世代が古くなっていれば走査せず自分自身を止める。
         if (!this.running || transport !== this.transport) {
@@ -182,8 +217,32 @@ export class CodexCommentaryMonitor extends EventEmitter {
       this.log?.warn?.(`Codex の途中経過監視を開始できません: ${err.message}`);
       transport.dispose?.();
       this.transport = null;
-      this.#scheduleRestart();
+      this.#handleConnectFailure();
     }
+  }
+
+  /**
+   * 接続失敗（close または #connect の catch）のたびに呼ぶ。
+   * 一度も接続に成功していない状態が MAX_CONNECT_FAILURES_BEFORE_GIVE_UP 回連続したら、
+   * それ以上の自動再接続をあきらめる（codex CLI 不在などで永久ループしないようにする）。
+   * 一度でも接続に成功していれば（everConnected）、このカウンタは使わず従来どおり再接続を続ける。
+   */
+  #handleConnectFailure() {
+    if (!this.running) return;
+    if (!this.everConnected) {
+      this.consecutiveFailures += 1;
+      if (this.consecutiveFailures >= MAX_CONNECT_FAILURES_BEFORE_GIVE_UP) {
+        this.log?.warn?.(
+          'Codex の途中経過監視を停止しました（codex CLI が見つからないか app-server を起動できません）。'
+          + '設定を変更すると再試行します',
+        );
+        // stop() と同じ後片付けをしたうえで running を落とす。設定変更で syncCommentaryMonitor が
+        // 改めて start() を呼べば、そこで失敗カウンタごとリセットされて再試行する。
+        this.dispose();
+        return;
+      }
+    }
+    this.#scheduleRestart();
   }
 
   #scheduleRestart() {
