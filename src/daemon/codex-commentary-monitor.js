@@ -158,7 +158,13 @@ export class CodexCommentaryMonitor extends EventEmitter {
   }
 
   start() {
-    if (this.running) return;
+    if (this.running) {
+      // 稼働中は何もしない。ただし低頻度の再試行待ちなら、設定変更を契機に
+      // 直ちに試し直す（warn の「設定を変更すると直ちに再試行します」を実態にする）。
+      // 低頻度モードは一度も接続に成功していない状態なので、取り直しで失うものはない。
+      if (!this.slowRetry) return;
+      this.dispose();
+    }
     this.running = true;
     // 無効化されていた間に溜まった途中経過を、再有効化した瞬間にまとめて読み上げないよう、
     // baseline や既知 item、バックオフ・失敗カウンタを含めて「まっさらな状態」からやり直す。

@@ -378,6 +378,43 @@ test('初回走査だけ失敗しても、後続のポーリングで完走す�
   }
 });
 
+test('低頻度の再試行待ちでも、start()（設定変更）で直ちに試し直す', async () => {
+  const log = { warn: () => {}, info: () => {}, debug: () => {} };
+  let factoryCalls = 0;
+
+  class AlwaysFailTransport extends EventEmitter {
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') throw new Error('起動できない');
+      return { data: [] };
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    slowRetryDelayMs: 60_000, // 自然な再試行はテスト中に来ない長さにする
+    log,
+    transportFactory: () => {
+      factoryCalls += 1;
+      return new AlwaysFailTransport();
+    },
+  });
+
+  try {
+    monitor.start();
+    await waitFor(() => monitor.slowRetry);
+    const before = factoryCalls;
+    // 設定変更 → syncCommentaryMonitor → start() の経路。長いタイマーを待たずに試し直す
+    monitor.start();
+    await waitFor(() => factoryCalls > before);
+  } finally {
+    monitor.dispose();
+  }
+});
+
 test('低頻度の再試行中に接続が回復したら通常の監視へ戻る', async () => {
   const warns = [];
   const infos = [];

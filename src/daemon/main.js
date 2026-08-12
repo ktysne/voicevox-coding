@@ -64,6 +64,9 @@ async function initialDictionarySync() {
  * app-server の起動とポーリングそのものを止める。
  */
 function syncCommentaryMonitor() {
+  // 終了処理が始まった後の設定変更（保留中の再読込タイマーなど）で
+  // 停止済みの監視を起動し直さない
+  if (shuttingDown) return;
   if (commentaryEnabled(store.config)) {
     commentaryMonitor.start();
   } else {
