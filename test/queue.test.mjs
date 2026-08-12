@@ -91,6 +91,61 @@ function cleanupCache(files, existing) {
   }
 }
 
+/**
+ * WAV キャッシュ索引 (#42) のテスト専用ヘルパー。実ディスクの代わりに
+ * メモリ上の Map で CACHE_DIR の中身を模し、readdirSync / statSync /
+ * existsSync / readFileSync / unlinkSync / utimes をその Map だけで完結させる。
+ * renameSync は beforeEach で no-op にされているため、ここでだけ実体を反映する
+ * 実装に差し替える（.mock.restore() で一旦戻してから付け直す。同じメソッドへ
+ * mock.method を二重に適用すると afterEach の restoreAll() 後に元へ戻らない
+ * ことがあるため、必ず restore してから付け直す）。
+ * 呼び出し元は Date.now を自前でモックして時刻を進めること。
+ */
+function mockCacheDisk() {
+  const disk = new Map(); // ファイルパス -> mtimeMs
+  const unlinked = [];
+  const readdirCalls = [];
+  const utimesCalls = [];
+  const enoent = (p) => Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
+
+  fs.renameSync.mock.restore();
+  mock.method(fs, 'renameSync', (_tmp, file) => {
+    disk.set(file, Date.now());
+  });
+  mock.method(fs, 'existsSync', (p) => disk.has(p));
+  mock.method(fs, 'readFileSync', (p) => {
+    if (!disk.has(p)) throw enoent(p);
+    return WAV;
+  });
+  mock.method(fs, 'readdirSync', (dir) => {
+    readdirCalls.push(dir);
+    return [...disk.keys()].map((p) => path.basename(p));
+  });
+  mock.method(fs, 'statSync', (p) => {
+    if (!disk.has(p)) throw enoent(p);
+    return { mtimeMs: disk.get(p) };
+  });
+  mock.method(fs, 'unlinkSync', (p) => {
+    if (!disk.has(p)) throw enoent(p);
+    unlinked.push(p);
+    disk.delete(p);
+  });
+  mock.method(fs, 'utimes', (p, atime, mtime, cb) => {
+    utimesCalls.push({ p, atime, mtime });
+    if (disk.has(p)) disk.set(p, Date.now());
+    cb?.(null);
+  });
+
+  return { disk, unlinked, readdirCalls, utimesCalls };
+}
+
+/** キャッシュ有効・上限指定ありの SpeechQueue を作る（#42 のキャッシュ索引テスト用）。 */
+function makeCacheQueue(player, { maxEntries = 300, chunkChars = 100 } = {}) {
+  const engine = { synthesize: async () => ({ wav: WAV }) };
+  const config = () => ({ daemon: { chunkChars, cacheEnabled: true, cacheMaxEntries: maxEntries } });
+  return new SpeechQueue(engine, player, config, { warn() {} });
+}
+
 test('連続チャンクではチャンク間に HOLD を入れる', async () => {
   const player = new FakePlayer();
   const queue = makeQueue(player, { chunkChars: 100 });
@@ -691,4 +746,130 @@ test('HOLD に失敗したときは間を置かずに次のチャンクへ進む
   // 指定の間は 300ms なので、120ms を超えなければ「待っていない」と言い切れる。
   const gap = player.playAt[1] - player.playAt[0];
   assert.ok(gap < 120, `HOLD 失敗時に間を置いています: ${gap}ms`);
+});
+
+// ---------------------------------------------------------------- WAV キャッシュの整理 (#42)
+
+test('ヒットで利用時刻が更新された項目は残り、更新されなかった項目から削除される (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, unlinked } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 2 });
+  const [fileA, fileB, fileC] = cacheFilesFor(['Aの発話。', 'Bの発話。', 'Cの発話。']);
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  now = 100;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // A をヒットさせて利用時刻を更新する（実ファイルの mtime はキャッシュヒットでは
+  // 更新されないので、A が「作成が古い順」で最初に消えるのが旧実装のバグだった）。
+  now = 200;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 上限 2 を超える 3 件目を書き込む。削除されるべきは、ヒットで更新されなかった B。
+  now = 300;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Cの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.deepEqual(unlinked, [fileB]);
+  assert.ok(disk.has(fileA), 'ヒットした A は残るべき');
+  assert.ok(!disk.has(fileB), 'ヒットしなかった B が削除されるべき');
+  assert.ok(disk.has(fileC), '直近に書いた C は残るべき');
+});
+
+test('索引の構築後は書き込みのたびに CACHE_DIR を全走査しない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { readdirCalls } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 1000 });
+
+  const texts = ['1番目の発話。', '2番目の発話。', '3番目の発話。', '4番目の発話。'];
+  for (const text of texts) {
+    now += 10;
+    queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    await waitIdle(queue);
+  }
+
+  // 索引がまだ無い最初の書き込みで 1 回だけ全走査し、以降の書き込みでは走査しない
+  assert.equal(readdirCalls.length, 1);
+});
+
+test('上限を超えなければ削除されない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { unlinked } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 5 });
+
+  for (const text of ['aの発話。', 'bの発話。', 'cの発話。']) {
+    now += 10;
+    queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    await waitIdle(queue);
+  }
+
+  assert.deepEqual(unlinked, []);
+});
+
+test('索引の外で実ファイルが消えていても、10 分経過後の整理で再同期して追随する (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, unlinked } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 1 });
+  const [fileA] = cacheFilesFor(['Aの発話。']);
+  const [fileB] = cacheFilesFor(['Bの発話。']);
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  assert.ok(disk.has(fileA));
+
+  // 索引の外（他プロセスや手動操作）でファイル本体だけが消える。索引はまだ A を覚えている。
+  disk.delete(fileA);
+
+  // 10 分 (再同期の間隔) を超えてから、上限を超える書き込みを行う。
+  now = 11 * 60 * 1000;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 再同期によって実体の無い A は索引からも落ち、実在する B だけで上限 (1) 以内と
+  // 評価されるので、B は削除されない。ENOENT を踏んでもエラーにはならない。
+  assert.deepEqual(unlinked, []);
+  assert.ok(!disk.has(fileA));
+  assert.ok(disk.has(fileB));
+});
+
+test('キャッシュヒットのたびに touch せず、5 分間隔で間引いて mtime を更新する (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { utimesCalls } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 1000 });
+  const text = 'touch のテスト。';
+  const [file] = cacheFilesFor([text]);
+
+  queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue); // 書き込みは touch 対象ではない
+
+  now = 60_000; // 1 分後: 間引き間隔 (5 分) 以内なので touch しない
+  queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  assert.equal(utimesCalls.length, 0);
+
+  now = 6 * 60_000; // 6 分後: 間引き間隔を超えたので touch する
+  queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  assert.equal(utimesCalls.length, 1);
+  assert.equal(utimesCalls[0].p, file);
+  // number 型の atime/mtime は「秒」単位で解釈される (fs.utimes の仕様)。
+  // ミリ秒をそのまま渡すと極端に未来の日付になるバグを防ぐための確認。
+  assert.equal(utimesCalls[0].atime, now / 1000);
+  assert.equal(utimesCalls[0].mtime, now / 1000);
 });

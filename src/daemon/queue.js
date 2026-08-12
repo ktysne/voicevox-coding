@@ -27,6 +27,14 @@ const MAX_LIST_PAUSE_SEC = 10;
 // UI で設定できる範囲なら履歴が残っており、極端な値で保持期間が汚染されることもない。
 const MAX_DEDUPE_WINDOW_SEC = 120;
 
+// WAV キャッシュの索引（cacheIndex）をディスクと作り直す間隔。外部からの削除や
+// 上限の縮小などで索引が実体とずれても、ここで再同期される（ヒステリシス）。
+const CACHE_INDEX_RESYNC_MS = 10 * 60 * 1000;
+
+// キャッシュヒット時、ディスクの mtime を touch する最短間隔。毎ヒットで
+// utimes を呼ぶと I/O が増えるので、間引いて「おおまかに」利用時刻を残す。
+const CACHE_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+
 /** 同一文の抑止時間（ミリ秒）。手編集で数値以外や極端な値が入っても読み上げを止めない。 */
 function dedupeWindowMs(sec) {
   const v = Number(sec);
@@ -141,6 +149,12 @@ export class SpeechQueue extends EventEmitter {
     this.skipRequested = false;
     this.recent = new Map(); // dedupe 用: key -> 最後に受理した時刻
     this.seq = 0;
+    // WAV キャッシュの索引。key はファイルパス、value は { lastUsedMs, touchedAt }。
+    // lastUsedMs は削除順の判定に使う「実際に使われた時刻」、touchedAt は
+    // ディスクの mtime を最後に touch した時刻（間引き判定用）。
+    // null の間は #ensureCacheIndex() が初回の全走査で組み立てる。
+    this.cacheIndex = null;
+    this.cacheIndexScannedAt = 0;
   }
 
   get state() {
@@ -276,6 +290,7 @@ export class SpeechQueue extends EventEmitter {
     if (useCache && fs.existsSync(file)) {
       try {
         const buf = fs.readFileSync(file);
+        this.#recordCacheHit(file);
         return { file, durationMs: wavDurationMs(buf) };
       } catch {
         // キャッシュが壊れていたら作り直す
@@ -295,7 +310,10 @@ export class SpeechQueue extends EventEmitter {
       } catch {}
       throw err;
     }
-    if (useCache) this.#pruneCache(cfg.daemon?.cacheMaxEntries ?? 300);
+    if (useCache) {
+      this.#recordCacheWrite(file);
+      this.#maybePruneCache(cfg.daemon?.cacheMaxEntries ?? 300);
+    }
     return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache };
   }
 
@@ -338,23 +356,102 @@ export class SpeechQueue extends EventEmitter {
     }
   }
 
-  #pruneCache(maxEntries) {
+  /**
+   * CACHE_DIR を全走査し、有効な（tmp- でない）.wav の mtime を集める。
+   * 索引の構築・再同期の両方で使う唯一の全走査経路。
+   */
+  #scanDiskCacheFiles() {
+    const map = new Map();
+    let files;
     try {
-      const files = fs
-        .readdirSync(CACHE_DIR)
-        .filter((f) => f.endsWith('.wav'))
-        .map((f) => {
-          const p = path.join(CACHE_DIR, f);
-          return { p, mtime: fs.statSync(p).mtimeMs };
-        });
-      if (files.length <= maxEntries) return;
-      files.sort((a, b) => a.mtime - b.mtime);
-      for (const f of files.slice(0, files.length - maxEntries)) {
-        try {
-          fs.unlinkSync(f.p);
-        } catch {}
+      files = fs.readdirSync(CACHE_DIR);
+    } catch {
+      return map; // CACHE_DIR がまだ無いのは正常
+    }
+    for (const f of files) {
+      if (!f.endsWith('.wav') || f.startsWith('tmp-')) continue;
+      const p = path.join(CACHE_DIR, f);
+      try {
+        map.set(p, fs.statSync(p).mtimeMs);
+      } catch {
+        // 列挙後に消えていたら無視
       }
-    } catch {}
+    }
+    return map;
+  }
+
+  /** 索引が未構築なら、ディスクの mtime を初期値として組み立てる。 */
+  #ensureCacheIndex() {
+    if (this.cacheIndex) return this.cacheIndex;
+    const index = new Map();
+    for (const [file, mtimeMs] of this.#scanDiskCacheFiles()) {
+      index.set(file, { lastUsedMs: mtimeMs, touchedAt: 0 });
+    }
+    this.cacheIndex = index;
+    this.cacheIndexScannedAt = Date.now();
+    return this.cacheIndex;
+  }
+
+  /**
+   * 索引をディスクと作り直す。ただし、既に索引にあるエントリの lastUsedMs
+   * （プロセス内で覚えた利用順）は保持し、実体に無いものを除去、
+   * 索引に無い実体ファイルだけを mtime で追加する。
+   */
+  #resyncCacheIndex() {
+    const disk = this.#scanDiskCacheFiles();
+    const merged = new Map();
+    for (const [file, mtimeMs] of disk) {
+      merged.set(file, this.cacheIndex?.get(file) ?? { lastUsedMs: mtimeMs, touchedAt: 0 });
+    }
+    this.cacheIndex = merged;
+    this.cacheIndexScannedAt = Date.now();
+  }
+
+  /** キャッシュヒット時に呼ぶ。利用時刻を索引へ反映し、間引きつつディスクの mtime も touch する。 */
+  #recordCacheHit(file) {
+    const index = this.#ensureCacheIndex();
+    const now = Date.now();
+    const prevTouchedAt = index.get(file)?.touchedAt ?? 0;
+    const shouldTouch = now - prevTouchedAt >= CACHE_TOUCH_INTERVAL_MS;
+    index.set(file, { lastUsedMs: now, touchedAt: shouldTouch ? now : prevTouchedAt });
+    if (shouldTouch) {
+      // 再起動後も利用順がおおよそ保たれるよう、ディスク側にも粗く残す。
+      // 結果を待たない fire-and-forget（失敗しても読み上げは止めない）。
+      const sec = now / 1000;
+      fs.utimes(file, sec, sec, () => {});
+    }
+  }
+
+  /** 書き込み完了（rename 後）に呼ぶ。索引へ最新の利用時刻を記録する。 */
+  #recordCacheWrite(file) {
+    const index = this.#ensureCacheIndex();
+    const now = Date.now();
+    index.set(file, { lastUsedMs: now, touchedAt: now });
+  }
+
+  /** 索引が上限を超えたときだけ、古い順に削除して上限まで戻す。 */
+  #maybePruneCache(maxEntries) {
+    const index = this.#ensureCacheIndex();
+    if (index.size <= maxEntries) return;
+
+    // 前回の全走査から時間が経っていたら索引を作り直してから評価する。
+    // 外部削除・上限の縮小・同名再保存などで索引が実体とずれても、ここで追随する。
+    if (Date.now() - this.cacheIndexScannedAt >= CACHE_INDEX_RESYNC_MS) {
+      this.#resyncCacheIndex();
+    }
+
+    const current = this.cacheIndex;
+    if (current.size <= maxEntries) return;
+
+    const entries = [...current.entries()].sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
+    for (const [file] of entries.slice(0, entries.length - maxEntries)) {
+      try {
+        fs.unlinkSync(file);
+      } catch {
+        // ENOENT を含め、削除に失敗しても黙って続ける（既存の流儀どおり）
+      }
+      current.delete(file);
+    }
   }
 
   async #drain() {
