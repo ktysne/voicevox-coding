@@ -275,23 +275,41 @@ const PARK_OPEN = '§';
 const PARK_CLOSE = '§';
 const PARK_RE = /§(\d+)§/g;
 
+// Markdown の強調・装飾トークン。長いものから照合する（`__` を `_` より先に見る）。
+const EMPHASIS_TOKENS = ['**', '__', '~~', '*', '_', '`'];
+
 /**
  * text 中の URL を §n§ の目印へ一時退避する。復元は unparkUrls で行う。
  * URL 走査 (scanUrlLength) は空白と日本語句読点まで進むため、URL の直後に
  * 隙間なく続く Markdown の装飾記号（`**強調**` の閉じなど）を URL の一部として
  * 巻き込んでしまう。巻き込んだまま退避すると装飾記号が記号除去を免れて本文へ
- * 残るので、末尾に連なる装飾記号は退避せず本文側へ置いていく
- * （従来どおり記号除去で消える）。
+ * 残るので、装飾記号は退避せず本文側へ置いていく（従来どおり記号除去で消える）。
+ * ただし装飾とみなすのは、同じ記号列が URL の直前でも開いている
+ * （`**URL**` のように囲まれている）ときだけ。単独の `URL_` の末尾 `_` は
+ * 装飾か URL の一部かを判別できないため、URL の一部として保持する。
  */
 function parkUrls(text) {
   const parked = [];
-  const guarded = replaceUrls(text, (m) => {
-    const trail = (m.match(/[*_~`]+$/) ?? [''])[0];
-    const core = trail ? m.slice(0, -trail.length) : m;
+  const matches = findUrls(text);
+  if (!matches.length) return { guarded: text, parked };
+  let out = '';
+  let last = 0;
+  for (const m of matches) {
+    let core = m.text;
+    let trail = '';
+    for (const token of EMPHASIS_TOKENS) {
+      if (core.length > token.length && core.endsWith(token)
+        && m.start >= token.length && text.slice(m.start - token.length, m.start) === token) {
+        trail = token;
+        core = core.slice(0, -token.length);
+        break;
+      }
+    }
     parked.push(core);
-    return PARK_OPEN + (parked.length - 1) + PARK_CLOSE + trail;
-  });
-  return { guarded, parked };
+    out += text.slice(last, m.start) + PARK_OPEN + (parked.length - 1) + PARK_CLOSE + trail;
+    last = m.end;
+  }
+  return { guarded: out + text.slice(last), parked };
 }
 
 /** parkUrls が置いた目印を元の URL に戻す。 */

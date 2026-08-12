@@ -353,6 +353,13 @@ test('markdownSymbols を無効にすると強調の _ は残したまま定数�
   assert.match(text, /_movefile replace existing_/);
 });
 
+test('囲まれていない URL 末尾の _ や ~ は URL の一部として残る（#50）', () => {
+  const under = filterText('詳細は https://example.com/path_ を参照。', { ...F, url: 'read' });
+  assert.match(under.text, /https:\/\/example\.com\/path_/);
+  const tilde = filterText('詳細は https://example.com/~user を参照。', { ...F, url: 'read' });
+  assert.match(tilde.text, /https:\/\/example\.com\/~user/);
+});
+
 test('表の行は落ちる', () => {
   const { text } = filterText('前\n| 項目 | 値 |\n| --- | --- |\n| a | b |\n後', F);
   assert.doesNotMatch(text, /項目/);
