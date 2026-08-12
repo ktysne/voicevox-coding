@@ -45,8 +45,11 @@ const CACHE_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
 function cacheMaxEntriesOf(value) {
   const v = Number(value ?? 300);
   if (!Number.isFinite(v)) return 300;
-  if (v <= 0) return Infinity;
-  return Math.floor(v);
+  // 切り下げてから判定する。0.5 のような正の小数を先に正数判定すると、
+  // 切り下げ後に 0（全消し）へ化けてしまう
+  const n = Math.floor(v);
+  if (n <= 0) return Infinity;
+  return n;
 }
 
 /** 同一文の抑止時間（ミリ秒）。手編集で数値以外や極端な値が入っても読み上げを止めない。 */
@@ -326,7 +329,8 @@ export class SpeechQueue extends EventEmitter {
     }
     if (useCache) {
       this.#recordCacheWrite(file);
-      this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
+      // いま書いた WAV はこれから player.play() へ渡すので、整理の対象から守る
+      this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries), file);
     }
     return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache };
   }
@@ -482,8 +486,14 @@ export class SpeechQueue extends EventEmitter {
     index.set(file, { lastUsedMs: now, touchedAt: now, touching });
   }
 
-  /** 索引が上限を超えたときだけ、古い順に削除して上限まで戻す。 */
-  #maybePruneCache(maxEntries) {
+  /**
+   * 索引が上限を超えたときだけ、古い順に削除して上限まで戻す。
+   * protect はこの整理で削除してはならないファイル（書き込み直後で、これから
+   * 再生に使うもの）。lastUsedMs が最新なので通常は対象にならないが、より古い
+   * 候補の削除が EPERM 等で失敗し続けると代替候補として順番が回ってくるため、
+   * 明示的に除外する。
+   */
+  #maybePruneCache(maxEntries, protect = null) {
     this.#ensureCacheIndex();
 
     // 時間経過による再同期はサイズ判定より先に行う。索引が実体より少なく
@@ -503,6 +513,7 @@ export class SpeechQueue extends EventEmitter {
     let failed = 0;
     for (const [file] of entries) {
       if (current.size <= maxEntries) break;
+      if (file === protect) continue;
       try {
         fs.unlinkSync(file);
         current.delete(file);

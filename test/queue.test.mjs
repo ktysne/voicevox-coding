@@ -1022,6 +1022,50 @@ test('cacheMaxEntries が 0 のときは無制限扱いで、再生予定の WAV
   assert.equal([...disk.keys()].filter((p) => p.endsWith('.wav')).length, 3);
 });
 
+test('古い候補が削除できなくても、書き込み直後の再生予定 WAV は消さない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, locked } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 1 });
+  const [fileA, fileB] = cacheFilesFor(['Aの発話。', 'Bの発話。']);
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 最古の A がロックされていると、代替候補として書き込み直後の B に
+  // 削除の順番が回ってきてしまう。再生前に消すと play が失敗する
+  locked.add(fileA);
+  const errors = [];
+  queue.on('error', (err) => errors.push(err));
+  now = 100;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.ok(disk.has(fileB), '再生予定の B が整理で消されている');
+  assert.deepEqual(errors, []);
+});
+
+test('cacheMaxEntries が正の小数でも全消しにならない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, unlinked } = mockCacheDisk();
+  const player = new FakePlayer();
+  // 0.5 は切り下げると 0 になる。先に正数判定すると「全消し」へ化ける
+  const queue = makeCacheQueue(player, { maxEntries: 0.5 });
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  now = 100;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.deepEqual(unlinked, []);
+  assert.equal([...disk.keys()].filter((p) => p.endsWith('.wav')).length, 2);
+});
+
 test('cacheMaxEntries が数値でなくても全キャッシュを削除しない (#42)', async () => {
   let now = 0;
   mock.method(Date, 'now', () => now);
