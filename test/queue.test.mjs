@@ -539,6 +539,64 @@ test('別の文が挟まっても、その enqueue の掃除で先の記録を�
   await waitIdle(queue);
 });
 
+test('掃除の後に窓を広げても、UI で設定できる範囲の記録は残っている (#39)', async () => {
+  const player = new FakePlayer();
+  const queue = makeDedupeQueue(player);
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const text = '重複抑止の窓テスト（窓の拡大）。';
+
+  // 窓 10 秒で受理。この記録は UI 上限 (120 秒) まで保持されるべき
+  const r1 = queue.enqueue({
+    target: 'test', event: 'test', text, speaker: 1, voice: {},
+    queuePolicy: { policy: 'enqueue', dedupeWindowSec: 10 },
+  });
+  assert.equal(r1.accepted, true);
+
+  now = 61_000; // 別の文の enqueue で掃除が走っても、61 秒前の記録は消えない
+  const r2 = queue.enqueue({
+    target: 'test', event: 'test', text: '別の文。', speaker: 1, voice: {},
+    queuePolicy: { policy: 'enqueue', dedupeWindowSec: 10 },
+  });
+  assert.equal(r2.accepted, true);
+
+  now = 70_000; // 窓を 120 秒へ広げると、t=0 の記録に対して重複と判定される
+  const r3 = queue.enqueue({
+    target: 'test', event: 'test', text, speaker: 1, voice: {},
+    queuePolicy: { policy: 'enqueue', dedupeWindowSec: 120 },
+  });
+  assert.equal(r3.accepted, false);
+  assert.equal(r3.reason, 'duplicate');
+
+  await waitIdle(queue);
+});
+
+test('dedupeWindowSec が数値でなくても読み上げを止めず保持期間も壊さない (#39)', async () => {
+  const player = new FakePlayer();
+  const queue = makeDedupeQueue(player);
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const text = '重複抑止の窓テスト（不正値）。';
+
+  // 数値でない窓は「抑止なし」として扱い、連続でも受理される
+  const bad = { policy: 'enqueue', dedupeWindowSec: 'abc' };
+  assert.equal(queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: bad }).accepted, true);
+  assert.equal(queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: bad }).accepted, true);
+  // NaN で保持期間 (maxWindowMs) が汚染されると掃除が永久に効かなくなる
+  assert.equal(Number.isFinite(queue.maxWindowMs), true);
+
+  // その後の正常な窓では従来どおり重複判定が効く
+  const good = { policy: 'enqueue', dedupeWindowSec: 120 };
+  now = 10_000;
+  assert.equal(queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: good }).accepted, true);
+  now = 20_000;
+  const dup = queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: good });
+  assert.equal(dup.accepted, false);
+  assert.equal(dup.reason, 'duplicate');
+
+  await waitIdle(queue);
+});
+
 test('実行中に窓を短くすると、判定は現在の設定ですぐ効く (#39)', async () => {
   const player = new FakePlayer();
   const queue = makeDedupeQueue(player);

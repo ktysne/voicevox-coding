@@ -20,6 +20,12 @@ const SENTENCE_SPLIT = /(?<=[。．！？!?\n])/;
 // 管理コンソールの入力欄の上限（src/ui/app.js の listPauseSec）と同じ値にしてある。
 const MAX_LIST_PAUSE_SEC = 10;
 
+// 管理コンソールが許容する最大の抑止時間（秒）。
+// src/ui/app.js の dedupeWindowSec 入力欄の max と同じ値にしてある。
+// 重複判定の記録はこの時間を下限に保持する。窓を小さくして掃除された後に
+// また広げても、UI で設定できる範囲なら履歴が残っているようにするため。
+const MAX_DEDUPE_WINDOW_SEC = 120;
+
 /** 既定値のときはキャッシュキーから外すパラメータ（key -> 既定値）。catalog.js の解説を参照。 */
 const CACHE_KEY_OMITTABLE = new Map(
   VOICE_PARAMS.filter((p) => p.omitFromCacheKeyWhenDefault).map((p) => [p.key, p.default]),
@@ -126,9 +132,9 @@ export class SpeechQueue extends EventEmitter {
     this.running = false;
     this.skipRequested = false;
     this.recent = new Map(); // dedupe 用: key -> timestamp
-    // recent の掃除間隔（ミリ秒）。#isDuplicate が見た dedupeWindowSec の最大値と
-    // 60 秒の大きい方まで伸びる（詳細は #isDuplicate 参照）。
-    this.maxWindowMs = 60_000;
+    // recent の掃除間隔（ミリ秒）。管理コンソールが許容する最大の抑止時間を下限とし、
+    // 手編集などでそれより大きい窓を見たらそこまで伸びる（詳細は #isDuplicate 参照）。
+    this.maxWindowMs = MAX_DEDUPE_WINDOW_SEC * 1000;
     this.seq = 0;
   }
 
@@ -157,21 +163,25 @@ export class SpeechQueue extends EventEmitter {
   }
 
   #isDuplicate(utterance, windowSec) {
-    if (!windowSec || windowSec <= 0) return false;
-    // 記録は「これまでに指定された dedupeWindowSec の最大値」と 60 秒の
+    // 手編集や API 経由で数値以外が入っても読み上げを止めず、NaN で保持期間を
+    // 汚染しない（NaN は比較が常に偽になり、掃除が永久に効かなくなる）
+    const windowMs = Number(windowSec) * 1000;
+    if (!Number.isFinite(windowMs) || windowMs <= 0) return false;
+    // 記録は「UI が許容する最大の抑止時間」と「これまでに指定された窓の最大値」の
     // 大きい方まで保持しておく。エントリごとに個別の有効期限を持たせるのではなく、
-    // 十分長く時刻を保持したうえで判定は常に「今回の」windowSec で行う方式にすることで、
-    // 管理コンソールで窓を伸ばした直後から新しい設定がそのまま効く。
+    // 十分長く時刻を保持したうえで判定は常に「今回の」windowMs で行う方式なので、
+    // UI の範囲では、窓を広げても縮めても新しい設定がその場でそのまま効く。
+    // 手編集で UI 上限より大きい窓を使う場合は、その値を初めて見た時点から保持が伸びる。
     // 設定を後から小さくしても保持期間はここでは縮めない。記録が少し長く残るだけで、
-    // 判定自体は現在の windowSec で行うため誤検知にはならない。
-    this.maxWindowMs = Math.max(this.maxWindowMs, windowSec * 1000);
+    // 判定自体は現在の windowMs で行うため誤検知にはならない。
+    this.maxWindowMs = Math.max(this.maxWindowMs, windowMs);
     const key = `${utterance.target}:${utterance.text}`;
     const last = this.recent.get(key);
     const now = Date.now();
     // 古い記録を掃除しておく
     for (const [k, t] of this.recent) if (now - t > this.maxWindowMs) this.recent.delete(k);
     // last === 0 (テストの偽時計など) を未登録と誤判定しないよう undefined 判定にする
-    if (last !== undefined && now - last < windowSec * 1000) return true;
+    if (last !== undefined && now - last < windowMs) return true;
     this.recent.set(key, now);
     return false;
   }
