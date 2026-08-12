@@ -117,8 +117,10 @@ function mockCacheDisk() {
     if (!disk.has(p)) throw enoent(p);
     return WAV;
   });
+  const readdirFail = { value: false }; // true にすると走査を EPERM で失敗させる
   mock.method(fs, 'readdirSync', (dir) => {
     readdirCalls.push(dir);
+    if (readdirFail.value) throw Object.assign(new Error(`EPERM: ${dir}`), { code: 'EPERM' });
     return [...disk.keys()].map((p) => path.basename(p));
   });
   mock.method(fs, 'statSync', (p) => {
@@ -133,17 +135,23 @@ function mockCacheDisk() {
     unlinked.push(p);
     disk.delete(p);
   });
+  const utimesAsync = { value: false }; // true にすると完了をテスト側から制御する
+  const utimesPending = []; // utimesAsync 時の完了関数の列
   mock.method(fs, 'utimes', (p, atime, mtime, cb) => {
     utimesCalls.push({ p, atime, mtime });
-    if (utimesFail.value) {
-      cb?.(Object.assign(new Error(`EPERM: ${p}`), { code: 'EPERM' }));
-      return;
-    }
-    if (disk.has(p)) disk.set(p, Date.now());
-    cb?.(null);
+    const finish = () => {
+      if (utimesFail.value) {
+        cb?.(Object.assign(new Error(`EPERM: ${p}`), { code: 'EPERM' }));
+        return;
+      }
+      if (disk.has(p)) disk.set(p, Date.now());
+      cb?.(null);
+    };
+    if (utimesAsync.value) utimesPending.push(finish);
+    else finish();
   });
 
-  return { disk, unlinked, readdirCalls, utimesCalls, locked, utimesFail };
+  return { disk, unlinked, readdirCalls, utimesCalls, locked, utimesFail, readdirFail, utimesAsync, utimesPending };
 }
 
 /** キャッシュ有効・上限指定ありの SpeechQueue を作る（#42 のキャッシュ索引テスト用）。 */
@@ -944,6 +952,93 @@ test('utimes に失敗したときは touch 時刻を確定せず、次のヒッ
   now += 1000;
   await enq(); // 確定後は間引きが効いて呼ばれない
   assert.equal(utimesCalls.length, 3);
+});
+
+test('cacheMaxEntries が数値でなくても全キャッシュを削除しない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, unlinked } = mockCacheDisk();
+  const player = new FakePlayer();
+  // NaN のまま比較すると size <= NaN が常に偽になり、直前に合成した
+  // 再生予定の WAV まで全削除されるバグがあった
+  const queue = makeCacheQueue(player, { maxEntries: 'abc' });
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  now = 100;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.deepEqual(unlinked, []);
+  assert.equal([...disk.keys()].filter((p) => p.endsWith('.wav')).length, 2);
+});
+
+test('走査の一時的な失敗では索引を空で確定せず、既知のエントリで整理を続ける (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, readdirFail } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 2 });
+  const [fileA, fileB, fileC, fileD] = cacheFilesFor(['Aの発話。', 'Bの発話。', 'Cの発話。', 'Dの発話。']);
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  now = 100;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 再同期の期限が来た状態で走査が一時的に失敗しても、既存の索引を
+  // 空で置き換えず、既知のエントリに基づく整理は続く
+  readdirFail.value = true;
+  now = 11 * 60 * 1000;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Cの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  assert.ok(!disk.has(fileA), '既知の最古 A が整理されるべき（索引が空になっていない証拠）');
+  assert.ok(disk.has(fileB));
+  assert.ok(disk.has(fileC));
+
+  // 失敗時に scannedAt を進めていないので、走査が直れば次の整理ですぐ再同期する
+  readdirFail.value = false;
+  disk.set(path.join(CACHE_DIR, 'ext-0.wav'), 5); // 外部で増えた分
+  now += 1000;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Dの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  const wavs = [...disk.keys()].filter((p) => p.endsWith('.wav'));
+  assert.equal(wavs.length, 2, `再同期後に上限まで戻っていない: ${wavs.length}`);
+  assert.ok(disk.has(fileD));
+});
+
+test('utimes の応答待ち中は同じファイルへ多重発行しない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { utimesCalls, utimesAsync, utimesPending } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 1000 });
+  const enq = () => {
+    queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    return waitIdle(queue);
+  };
+
+  now = 0;
+  await enq(); // 書き込み
+
+  utimesAsync.value = true;
+  now = 6 * 60 * 1000;
+  await enq(); // ヒット → utimes 発行（応答は保留）
+  now += 1000;
+  await enq(); // 応答待ち中の再ヒット → 多重発行しない
+  assert.equal(utimesCalls.length, 1, '応答待ち中に多重発行された');
+
+  utimesPending.shift()(); // 完了 → touchedAt 確定
+  now += 1000;
+  await enq(); // 間引き間隔内なので発行されない
+  assert.equal(utimesCalls.length, 1);
+
+  now = 12 * 60 * 1000; // 間隔を超えたら再び発行される
+  await enq();
+  assert.equal(utimesCalls.length, 2);
 });
 
 test('キャッシュヒットのたびに touch せず、5 分間隔で間引いて mtime を更新する (#42)', async () => {

@@ -35,6 +35,17 @@ const CACHE_INDEX_RESYNC_MS = 10 * 60 * 1000;
 // utimes を呼ぶと I/O が増えるので、間引いて「おおまかに」利用時刻を残す。
 const CACHE_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
 
+/**
+ * キャッシュの保持数。手編集で数値以外や負数が入っても既定値へ倒す。
+ * NaN のまま比較すると size <= NaN が常に偽になり、整理が全エントリ
+ * （直前に合成した再生予定の WAV を含む）を削除してしまう。
+ */
+function cacheMaxEntriesOf(value) {
+  const v = Number(value ?? 300);
+  if (!Number.isFinite(v)) return 300;
+  return Math.max(0, Math.floor(v));
+}
+
 /** 同一文の抑止時間（ミリ秒）。手編集で数値以外や極端な値が入っても読み上げを止めない。 */
 function dedupeWindowMs(sec) {
   const v = Number(sec);
@@ -312,7 +323,7 @@ export class SpeechQueue extends EventEmitter {
     }
     if (useCache) {
       this.#recordCacheWrite(file);
-      this.#maybePruneCache(cfg.daemon?.cacheMaxEntries ?? 300);
+      this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
     }
     return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache };
   }
@@ -359,15 +370,21 @@ export class SpeechQueue extends EventEmitter {
   /**
    * CACHE_DIR を全走査し、有効な（tmp- でない）.wav の mtime を集める。
    * 索引の構築・再同期の両方で使う唯一の全走査経路。
+   * ディレクトリが無い（ENOENT）のは正常で空の Map、それ以外の失敗
+   * （一時的な EPERM/EBUSY 等）は null を返す。呼び出し側は null のとき
+   * 既存の索引を維持し、次の機会に再試行する（空で確定させると、既知の
+   * エントリを失ったまま最大 10 分間、上限超過を見逃してしまう）。
    */
   #scanDiskCacheFiles() {
-    const map = new Map();
     let files;
     try {
       files = fs.readdirSync(CACHE_DIR);
-    } catch {
-      return map; // CACHE_DIR がまだ無いのは正常
+    } catch (err) {
+      if (err?.code === 'ENOENT') return new Map(); // CACHE_DIR がまだ無いのは正常
+      this.log?.debug?.(`キャッシュの一覧を取得できません: ${err.message}`);
+      return null;
     }
+    const map = new Map();
     for (const f of files) {
       if (!f.endsWith('.wav') || f.startsWith('tmp-')) continue;
       const p = path.join(CACHE_DIR, f);
@@ -380,12 +397,18 @@ export class SpeechQueue extends EventEmitter {
     return map;
   }
 
-  /** 索引が未構築なら、ディスクの mtime を初期値として組み立てる。 */
+  /**
+   * 索引が未構築なら、ディスクの mtime を初期値として組み立てる。
+   * 走査に失敗したときは索引を確定させず（this.cacheIndex は null のまま）、
+   * 使い捨ての空 Map を返して次の機会に組み立て直す。
+   */
   #ensureCacheIndex() {
     if (this.cacheIndex) return this.cacheIndex;
+    const disk = this.#scanDiskCacheFiles();
+    if (disk === null) return new Map();
     const index = new Map();
-    for (const [file, mtimeMs] of this.#scanDiskCacheFiles()) {
-      index.set(file, { lastUsedMs: mtimeMs, touchedAt: 0 });
+    for (const [file, mtimeMs] of disk) {
+      index.set(file, { lastUsedMs: mtimeMs, touchedAt: 0, touching: false });
     }
     this.cacheIndex = index;
     this.cacheIndexScannedAt = Date.now();
@@ -393,15 +416,17 @@ export class SpeechQueue extends EventEmitter {
   }
 
   /**
-   * 索引をディスクと作り直す。ただし、既に索引にあるエントリの lastUsedMs
-   * （プロセス内で覚えた利用順）は保持し、実体に無いものを除去、
+   * 索引をディスクと作り直す。ただし、既に索引にあるエントリ
+   * （プロセス内で覚えた利用順や touch の状態）は保持し、実体に無いものを除去、
    * 索引に無い実体ファイルだけを mtime で追加する。
+   * 走査に失敗したときは既存の索引と scannedAt を維持する（次の整理で再試行）。
    */
   #resyncCacheIndex() {
     const disk = this.#scanDiskCacheFiles();
+    if (disk === null) return;
     const merged = new Map();
     for (const [file, mtimeMs] of disk) {
-      merged.set(file, this.cacheIndex?.get(file) ?? { lastUsedMs: mtimeMs, touchedAt: 0 });
+      merged.set(file, this.cacheIndex?.get(file) ?? { lastUsedMs: mtimeMs, touchedAt: 0, touching: false });
     }
     this.cacheIndex = merged;
     this.cacheIndexScannedAt = Date.now();
@@ -411,9 +436,13 @@ export class SpeechQueue extends EventEmitter {
   #recordCacheHit(file) {
     const index = this.#ensureCacheIndex();
     const now = Date.now();
-    const prevTouchedAt = index.get(file)?.touchedAt ?? 0;
-    const shouldTouch = now - prevTouchedAt >= CACHE_TOUCH_INTERVAL_MS;
-    index.set(file, { lastUsedMs: now, touchedAt: prevTouchedAt });
+    const entry = index.get(file);
+    const prevTouchedAt = entry?.touchedAt ?? 0;
+    // touching は「utimes の応答待ち」の印。応答を待たずに同じファイルへ何度も
+    // 発行すると、完了が逆順に届いたとき古い時刻で mtime を巻き戻し得る
+    const touching = entry?.touching === true;
+    const shouldTouch = !touching && now - prevTouchedAt >= CACHE_TOUCH_INTERVAL_MS;
+    index.set(file, { lastUsedMs: now, touchedAt: prevTouchedAt, touching: touching || shouldTouch });
     if (shouldTouch) {
       // 再起動後も利用順がおおよそ保たれるよう、ディスク側にも粗く残す。
       // 結果を待たない fire-and-forget（失敗しても読み上げは止めない）。
@@ -422,13 +451,17 @@ export class SpeechQueue extends EventEmitter {
       // 再起動後の利用順（LRU）が失われる。
       const sec = now / 1000;
       fs.utimes(file, sec, sec, (err) => {
-        const entry = index.get(file);
-        if (!entry) return; // その間に整理などで消えていた
-        if (err) {
-          this.log?.debug?.(`キャッシュの利用時刻を反映できません (${file}): ${err.message}`);
-          return;
-        }
-        index.set(file, { ...entry, touchedAt: now });
+        // 応答待ちの間に #resyncCacheIndex が Map を差し替えていることがあるので、
+        // 完了時点の現行索引を見る（古い Map へ書いても現行状態に反映されない）
+        const current = this.cacheIndex?.get(file);
+        if (!current) return; // その間に整理などで消えていた
+        this.cacheIndex.set(file, {
+          ...current,
+          touching: false,
+          // 古い完了で新しい時刻を巻き戻さない
+          touchedAt: err ? current.touchedAt : Math.max(current.touchedAt, now),
+        });
+        if (err) this.log?.debug?.(`キャッシュの利用時刻を反映できません (${file}): ${err.message}`);
       });
     }
   }
@@ -437,7 +470,8 @@ export class SpeechQueue extends EventEmitter {
   #recordCacheWrite(file) {
     const index = this.#ensureCacheIndex();
     const now = Date.now();
-    index.set(file, { lastUsedMs: now, touchedAt: now });
+    const touching = index.get(file)?.touching === true;
+    index.set(file, { lastUsedMs: now, touchedAt: now, touching });
   }
 
   /** 索引が上限を超えたときだけ、古い順に削除して上限まで戻す。 */
