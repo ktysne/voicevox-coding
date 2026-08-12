@@ -367,6 +367,58 @@ test('stop() 後の start() は baseline を取り直し、無効化中に増え
   }
 });
 
+test('確認の間に新しいターンが始まっても、前のターンの最後の commentary を回収する (#43)', async () => {
+  // idle のまま updatedAt が変わらず、turn1 に最後の commentary (b) が増えたうえで
+  // turn2 が始まるケース。limit: 1 だと最新の turn2 しか取得できず b が失われる
+  let phase = 0; // 0: turn1=[a], 1: turn1=[a,b] + turn2=[c]
+  class TurnSwapTransport extends EventEmitter {
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 't1', status: { type: 'idle' }, updatedAt: 'same' }] };
+      }
+      const turn1 = {
+        id: 'turn1',
+        items: phase === 0
+          ? [{ type: 'agentMessage', phase: 'commentary', id: 'a', text: 'A' }]
+          : [
+              { type: 'agentMessage', phase: 'commentary', id: 'a', text: 'A' },
+              { type: 'agentMessage', phase: 'commentary', id: 'b', text: 'B' },
+            ],
+      };
+      if (phase === 0) return { data: [turn1] };
+      const turn2 = { id: 'turn2', items: [{ type: 'agentMessage', phase: 'commentary', id: 'c', text: 'C' }] };
+      // sortDirection: 'desc' なので新しい turn2 が先頭
+      return { data: [turn2, turn1] };
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    fullRecheckMs: 40,
+    log: { warn() {}, info() {}, debug() {} },
+    transportFactory: () => new TurnSwapTransport(),
+  });
+  const heard = [];
+  monitor.on('commentary', (p) => heard.push(p.itemId));
+
+  try {
+    monitor.start();
+    await waitFor(() => monitor.baselineComplete);
+    phase = 1; // updatedAt を変えずに turn1 へ b が増え、turn2 (c) が始まる
+    await waitFor(() => heard.includes('b') && heard.includes('c'));
+    // 古いターンの b が新しいターンの c より先（時系列順）
+    assert.ok(heard.indexOf('b') < heard.indexOf('c'), `時系列順でない: ${heard}`);
+    assert.ok(!heard.includes('a'), 'baseline の item a は読み上げない');
+  } finally {
+    monitor.dispose();
+  }
+});
+
 test('updatedAt も status も変わらない更新でも、全確認の周期で取りこぼしを回収する (#43)', async () => {
   // ポーリング間で active 期間を観測できず、updatedAt も変わらないケース。
   // 間引きの追跡だけでは無期限にスキップされるため、周期的な全確認で拾う

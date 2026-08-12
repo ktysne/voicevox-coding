@@ -354,19 +354,25 @@ export class CodexCommentaryMonitor extends EventEmitter {
         currentThreadIds.add(threadId);
         if (!this.#shouldCheckThread(threadId, thread)) continue;
         const turnsResult = await transport.request('thread/turns/list', {
-          threadId, limit: 1, sortDirection: 'desc', itemsView: 'full',
+          threadId, limit: 2, sortDirection: 'desc', itemsView: 'full',
         });
         if (transport !== this.transport) return;
-        const turn = (turnsResult?.data ?? turnsResult?.turns ?? [])[0];
-        for (const item of extractCommentaryItems(turn)) {
-          const itemKey = `${threadId}:${turn?.id ?? ''}:${item.itemId}`;
-          const unseen = !this.seenItems.has(itemKey);
-          this.seenItems.add(itemKey);
-          while (this.seenItems.size > 5000) {
-            this.seenItems.delete(this.seenItems.values().next().value);
-          }
-          if (this.baselineComplete && unseen) {
-            this.emit('commentary', { ...item, threadId, turnId: turn?.id });
+        // 直近 2 ターンを古い順に処理する。確認の間引きで窓が広がった分、
+        // その間に新しいターンが 1 つ始まっても、前のターンの最後の commentary を
+        // 取りこぼさない。1 つの窓に 2 つ以上のターンが挟まるケースは、
+        // limit: 1 だった従来設計と同種の限界として許容する
+        const turns = (turnsResult?.data ?? turnsResult?.turns ?? []).slice(0, 2).reverse();
+        for (const turn of turns) {
+          for (const item of extractCommentaryItems(turn)) {
+            const itemKey = `${threadId}:${turn?.id ?? ''}:${item.itemId}`;
+            const unseen = !this.seenItems.has(itemKey);
+            this.seenItems.add(itemKey);
+            while (this.seenItems.size > 5000) {
+              this.seenItems.delete(this.seenItems.values().next().value);
+            }
+            if (this.baselineComplete && unseen) {
+              this.emit('commentary', { ...item, threadId, turnId: turn?.id });
+            }
           }
         }
         // 走査状態の記録は「世代確認 + item 処理」が済んでから行う。
