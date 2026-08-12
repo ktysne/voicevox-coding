@@ -174,8 +174,9 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.polling = false;
     this.baselineComplete = false;
     this.seenItems = new Set();
-    // スレッドごとの前回 updatedAt。idle 系スレッドで turns/list を間引くための基準値。
-    this.threadUpdatedAt = new Map();
+    // スレッドごとの前回走査の状態（{ updatedAt, statusType }）。
+    // idle 系スレッドで turns/list を間引くための基準値。
+    this.threadScanState = new Map();
     this.backoffMs = restartDelayMs;
     // 一度でも initialize + 初回 scan まで到達したか。true になった後の切断は
     // 一時的な app-server の不調とみなし、従来どおり無限にバックオフ再接続する。
@@ -201,9 +202,9 @@ export class CodexCommentaryMonitor extends EventEmitter {
     // baseline や既知 item、バックオフ・失敗カウンタを含めて「まっさらな状態」からやり直す。
     this.baselineComplete = false;
     this.seenItems.clear();
-    // baseline を取り直すため、前回の updatedAt 追跡もリセットする。
+    // baseline を取り直すため、前回の走査状態の追跡もリセットする。
     // これにより次の走査では（active 以外の）idle スレッドも含め全スレッドを確認する。
-    this.threadUpdatedAt.clear();
+    this.threadScanState.clear();
     this.backoffMs = this.restartDelayMs;
     this.everConnected = false;
     this.consecutiveFailures = 0;
@@ -351,16 +352,16 @@ export class CodexCommentaryMonitor extends EventEmitter {
             this.emit('commentary', { ...item, threadId, turnId: turn?.id });
           }
         }
-        // updatedAt の記録は「世代確認 + item 処理」が済んでから行う。
+        // 走査状態の記録は「世代確認 + item 処理」が済んでから行う。
         //   ・await より前や直後に記録すると、取得の失敗や stop() → start() の
         //     世代交代と競合し、新世代のクリア済み追跡へ旧走査の値を書き戻して
         //     baseline の取り直しを妨げる（無効化中の item を新規として読んでしまう）
         //   ・item 処理が例外なら記録されず、次回の走査で再試行される
-        if (thread?.updatedAt !== undefined) this.threadUpdatedAt.set(threadId, thread.updatedAt);
+        this.threadScanState.set(threadId, { updatedAt: thread?.updatedAt, statusType: thread?.status?.type });
       }
       // thread/list に現れなくなったスレッドの追跡は掃除する。
-      for (const threadId of this.threadUpdatedAt.keys()) {
-        if (!currentThreadIds.has(threadId)) this.threadUpdatedAt.delete(threadId);
+      for (const threadId of this.threadScanState.keys()) {
+        if (!currentThreadIds.has(threadId)) this.threadScanState.delete(threadId);
       }
       this.baselineComplete = true;
       // 走査が完走した = 接続に成功している。初回走査だけが失敗して後続の
@@ -404,8 +405,14 @@ export class CodexCommentaryMonitor extends EventEmitter {
     const statusType = thread?.status?.type;
     if (statusType === 'active') return true;
     if (statusType === 'idle' || statusType === 'notLoaded' || statusType === 'systemError') {
+      const prev = this.threadScanState.get(threadId);
+      // status が変わった直後（特に active → 非 active）は、updatedAt が同じでも
+      // 必ず確認する。active 中に追加された最後の commentary が updatedAt を
+      // 変えないまま残ることがあり、見送ると limit: 1 の走査では
+      // 次のターンが始まった後に二度と読めなくなる
+      if (!prev || prev.statusType !== statusType) return true;
       const updatedAt = thread?.updatedAt;
-      return updatedAt === undefined || this.threadUpdatedAt.get(threadId) !== updatedAt;
+      return updatedAt === undefined || prev.updatedAt !== updatedAt;
     }
     // status が無い、または未知の type。互換性のため従来どおり毎回確認する。
     return true;

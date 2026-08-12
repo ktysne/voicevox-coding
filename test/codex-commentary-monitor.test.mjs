@@ -367,6 +367,52 @@ test('stop() 後の start() は baseline を取り直し、無効化中に増え
   }
 });
 
+test('active から idle へ遷移した直後は、updatedAt が同じでも確認する (#43)', async () => {
+  // active 中に追加された最後の commentary が updatedAt を変えないまま idle へ
+  // 遷移するケース。見送ると limit: 1 の走査では次のターン開始後に二度と読めない
+  let phase = 0; // 0: active (item a のみ), 1: idle (item a + b)
+  class TransitionTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.turnsCalls = 0;
+    }
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 't1', status: { type: phase === 0 ? 'active' : 'idle' }, updatedAt: 'same' }] };
+      }
+      this.turnsCalls += 1;
+      const items = [{ type: 'agentMessage', phase: 'commentary', id: 'a', text: 'A' }];
+      if (phase === 1) items.push({ type: 'agentMessage', phase: 'commentary', id: 'b', text: 'B' });
+      return { data: [{ id: 'turn1', items }] };
+    }
+    dispose() {}
+  }
+
+  const transport = new TransitionTransport();
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    log: { warn() {}, info() {}, debug() {} },
+    transportFactory: () => transport,
+  });
+  const heard = [];
+  monitor.on('commentary', (p) => heard.push(p.itemId));
+
+  try {
+    monitor.start();
+    // baseline + active のままの走査で、追跡に active の状態を記録させる
+    await waitFor(() => transport.turnsCalls >= 2);
+    phase = 1; // idle へ遷移。updatedAt は同じだが item b が増えている
+    await waitFor(() => heard.includes('b'));
+    assert.ok(!heard.includes('a'), 'baseline の item a は読み上げない');
+  } finally {
+    monitor.dispose();
+  }
+});
+
 test('停止中に遅延して返った旧走査の応答は、新しい世代の追跡を汚さない (#43)', async () => {
   let releaseStale = null;
   const transports = [];
