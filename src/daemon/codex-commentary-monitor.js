@@ -12,6 +12,10 @@ const DEFAULT_RESTART_DELAY_MS = 1000;
 const MAX_CONNECT_FAILURES_BEFORE_SLOW_RETRY = 3;
 // 低頻度の再試行間隔。CLI が無い環境でもこの頻度の spawn なら実害がない。
 const DEFAULT_SLOW_RETRY_DELAY_MS = 10 * 60 * 1000;
+// idle スレッドの間引きに対する取りこぼしの保険。この周期で全スレッドを確認し直す。
+// updatedAt が変わらない更新（仕様上あり得る）やポーリング間で観測できなかった
+// active 期間があっても、遅延はこの周期までに抑えられる。
+const DEFAULT_THREAD_FULL_RECHECK_MS = 60 * 1000;
 // 接続は生きているのに走査（RPC）の失敗がこの回数続いたら、接続ごと取り直す。
 // 壊れた・非互換の app-server へ約 2 秒間隔の要求と警告を出し続けないための上限。
 const MAX_CONSECUTIVE_SCAN_FAILURES = 3;
@@ -158,6 +162,7 @@ export class CodexCommentaryMonitor extends EventEmitter {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     restartDelayMs = DEFAULT_RESTART_DELAY_MS,
     slowRetryDelayMs = DEFAULT_SLOW_RETRY_DELAY_MS,
+    fullRecheckMs = DEFAULT_THREAD_FULL_RECHECK_MS,
     log,
     transportFactory,
   } = {}) {
@@ -165,6 +170,8 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.pollMs = pollMs;
     this.restartDelayMs = restartDelayMs;
     this.slowRetryDelayMs = slowRetryDelayMs;
+    this.fullRecheckMs = fullRecheckMs;
+    this.lastFullCheckAt = 0;
     this.log = log;
     this.transportFactory = transportFactory ?? (() => new AppServerTransport({ timeoutMs, log }));
     this.transport = null;
@@ -215,6 +222,9 @@ export class CodexCommentaryMonitor extends EventEmitter {
 
   async #connect() {
     if (!this.running) return;
+    // 接続世代ごとに間引きの追跡を取り直す。切断中に updatedAt を変えない更新が
+    // あっても、再接続後の初回走査で全スレッドが確認される
+    this.threadScanState.clear();
     const transport = this.transportFactory();
     this.transport = transport;
     // ポーリングタイマーは接続世代ごとに所有し、その世代の close で必ず解除する。
@@ -330,6 +340,13 @@ export class CodexCommentaryMonitor extends EventEmitter {
       // 待機中に切断されていれば、古い応答は新しい接続へ持ち込まずに捨てる。
       if (transport !== this.transport) return;
       const threads = result?.data ?? result?.threads ?? [];
+      // 取りこぼしの保険。updatedAt が変わらない更新（仕様上あり得る）や、
+      // ポーリング間で観測できなかった active 期間があっても無期限にスキップ
+      // しないよう、一定周期で追跡を捨てて全スレッドを確認し直す
+      if (Date.now() - this.lastFullCheckAt >= this.fullRecheckMs) {
+        this.threadScanState.clear();
+        this.lastFullCheckAt = Date.now();
+      }
       const currentThreadIds = new Set();
       for (const thread of threads) {
         const threadId = thread?.id;

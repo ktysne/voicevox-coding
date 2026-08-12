@@ -367,6 +367,51 @@ test('stop() 後の start() は baseline を取り直し、無効化中に増え
   }
 });
 
+test('updatedAt も status も変わらない更新でも、全確認の周期で取りこぼしを回収する (#43)', async () => {
+  // ポーリング間で active 期間を観測できず、updatedAt も変わらないケース。
+  // 間引きの追跡だけでは無期限にスキップされるため、周期的な全確認で拾う
+  let hasNewItem = false;
+  class SilentUpdateTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.turnsCalls = 0;
+    }
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 't1', status: { type: 'idle' }, updatedAt: 'same' }] };
+      }
+      this.turnsCalls += 1;
+      const items = [{ type: 'agentMessage', phase: 'commentary', id: 'a', text: 'A' }];
+      if (hasNewItem) items.push({ type: 'agentMessage', phase: 'commentary', id: 'b', text: 'B' });
+      return { data: [{ id: 'turn1', items }] };
+    }
+    dispose() {}
+  }
+
+  const transport = new SilentUpdateTransport();
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    fullRecheckMs: 40, // テスト用に短くする（既定 60 秒）
+    log: { warn() {}, info() {}, debug() {} },
+    transportFactory: () => transport,
+  });
+  const heard = [];
+  monitor.on('commentary', (p) => heard.push(p.itemId));
+
+  try {
+    monitor.start();
+    await waitFor(() => monitor.baselineComplete);
+    hasNewItem = true; // updatedAt も status も変えずに item b が増える
+    await waitFor(() => heard.includes('b'));
+  } finally {
+    monitor.dispose();
+  }
+});
+
 test('active から idle へ遷移した直後は、updatedAt が同じでも確認する (#43)', async () => {
   // active 中に追加された最後の commentary が updatedAt を変えないまま idle へ
   // 遷移するケース。見送ると limit: 1 の走査では次のターン開始後に二度と読めない
