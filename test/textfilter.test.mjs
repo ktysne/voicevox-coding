@@ -360,6 +360,18 @@ test('囲まれていない URL 末尾の _ や ~ は URL の一部として残�
   assert.match(tilde.text, /https:\/\/example\.com\/~user/);
 });
 
+test('3 連記号で囲まれた URL も装飾だけ外れる（#50）', () => {
+  const { text } = filterText('***https://example.com/API_DOC*** を参照。', { ...F, url: 'read' });
+  assert.match(text, /https:\/\/example\.com\/API_DOC/);
+  assert.doesNotMatch(text, /\*/);
+});
+
+test('___ 強調で囲まれた定数名も単語に分けて読む（#50）', () => {
+  const { text } = filterText('___MOVEFILE_REPLACE_EXISTING___ を指定します。', F);
+  assert.match(text, /movefile replace existing/);
+  assert.doesNotMatch(text, /MOVEFILE/);
+});
+
 test('表の行は落ちる', () => {
   const { text } = filterText('前\n| 項目 | 値 |\n| --- | --- |\n| a | b |\n後', F);
   assert.doesNotMatch(text, /項目/);

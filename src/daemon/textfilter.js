@@ -275,8 +275,9 @@ const PARK_OPEN = '§';
 const PARK_CLOSE = '§';
 const PARK_RE = /§(\d+)§/g;
 
-// Markdown の強調・装飾トークン。長いものから照合する（`__` を `_` より先に見る）。
-const EMPHASIS_TOKENS = ['**', '__', '~~', '*', '_', '`'];
+// URL の末尾に付きうる Markdown の強調・装飾記号のひとまとまり
+// （`*` 1〜3 個、`_` 1〜3 個、`~~`、バッククォート）。
+const EMPHASIS_TRAIL = /(\*{1,3}|_{1,3}|~~|`)$/;
 
 /**
  * text 中の URL を §n§ の目印へ一時退避する。復元は unparkUrls で行う。
@@ -285,8 +286,10 @@ const EMPHASIS_TOKENS = ['**', '__', '~~', '*', '_', '`'];
  * 巻き込んでしまう。巻き込んだまま退避すると装飾記号が記号除去を免れて本文へ
  * 残るので、装飾記号は退避せず本文側へ置いていく（従来どおり記号除去で消える）。
  * ただし装飾とみなすのは、同じ記号列が URL の直前でも開いている
- * （`**URL**` のように囲まれている）ときだけ。単独の `URL_` の末尾 `_` は
- * 装飾か URL の一部かを判別できないため、URL の一部として保持する。
+ * （`**URL**` や `***URL***` のように囲まれている）ときだけ。単独の `URL_` の
+ * 末尾 `_` は装飾か URL の一部かを判別できないため、URL の一部として保持する。
+ * 既知の限界：`**_URL_**` のように種類の異なる装飾の入れ子は分離できず、
+ * URL の一部として読まれる（囲みの内外で記号が対応しないため）。
  */
 function parkUrls(text) {
   const parked = [];
@@ -296,14 +299,12 @@ function parkUrls(text) {
   let last = 0;
   for (const m of matches) {
     let core = m.text;
-    let trail = '';
-    for (const token of EMPHASIS_TOKENS) {
-      if (core.length > token.length && core.endsWith(token)
-        && m.start >= token.length && text.slice(m.start - token.length, m.start) === token) {
-        trail = token;
-        core = core.slice(0, -token.length);
-        break;
-      }
+    let trail = (core.match(EMPHASIS_TRAIL) ?? [''])[0];
+    if (trail && core.length > trail.length
+      && m.start >= trail.length && text.slice(m.start - trail.length, m.start) === trail) {
+      core = core.slice(0, -trail.length);
+    } else {
+      trail = '';
     }
     parked.push(core);
     out += text.slice(last, m.start) + PARK_OPEN + (parked.length - 1) + PARK_CLOSE + trail;
@@ -431,10 +432,10 @@ function applyFilePaths(text, mode) {
 // HTTP や JSON のような単独の大文字語はスペルアウトが正しい読みであることが多いため、
 // 意図的に対象外にする。
 // `_FOO_BAR_` のような `_` による Markdown 強調に接する形は、`\b` だと先行の `_` が
-// 語文字扱いになって検出できない。そこで語頭・語尾の `_`（強調記号、`__` まで）ごと
+// 語文字扱いになって検出できない。そこで語頭・語尾の `_`（強調記号、`___` まで）ごと
 // 一致させ、変換時に外す。lookbehind / lookahead からは `_` も除外しているので、
 // error_CODE のような小文字混じりの識別子の一部にまでは一致しない。
-const CONSTANT_CASE = /(?<![0-9A-Za-z_])_{0,2}[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+_{0,2}(?![0-9A-Za-z_])/g;
+const CONSTANT_CASE = /(?<![0-9A-Za-z_])_{0,3}[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+_{0,3}(?![0-9A-Za-z_])/g;
 
 /**
  * MOVEFILE_REPLACE_EXISTING のような定数名を「movefile replace existing」のように
