@@ -1022,6 +1022,82 @@ test('cacheMaxEntries が 0 のときは無制限扱いで、再生予定の WAV
   assert.equal([...disk.keys()].filter((p) => p.endsWith('.wav')).length, 3);
 });
 
+test('上限を実行中に縮小すると、以後の発話がヒットだけでも整理される (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk } = mockCacheDisk();
+  const player = new FakePlayer();
+  // 上限を実行中に書き換えられる config を持つキュー
+  const limit = { value: 300 };
+  const engine = { synthesize: async () => ({ wav: WAV }) };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: true, cacheMaxEntries: limit.value } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {}, debug() {} });
+  const [fileA] = cacheFilesFor(['Aの発話。']);
+
+  for (const [i, text] of ['Aの発話。', 'Bの発話。', 'Cの発話。'].entries()) {
+    now = i * 100;
+    queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    await waitIdle(queue);
+  }
+  assert.equal([...disk.keys()].filter((p) => p.endsWith('.wav')).length, 3);
+
+  // 上限を 1 へ縮小。以後は既存キャッシュへのヒットしか起きなくても、
+  // ヒット時の整理で新しい上限まで削除される
+  limit.value = 1;
+  now = 1000;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  const wavs = [...disk.keys()].filter((p) => p.endsWith('.wav'));
+  assert.deepEqual(wavs, [fileA], `ヒットした A だけが残るべき: ${wavs}`);
+});
+
+test('整理の失敗は既定レベルで見える warn で 1 回だけ知らせ、直ったらまた知らせる (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, locked } = mockCacheDisk();
+  const player = new FakePlayer();
+  const warns = [];
+  const debugs = [];
+  const engine = { synthesize: async () => ({ wav: WAV }) };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: true, cacheMaxEntries: 1 } });
+  const queue = new SpeechQueue(engine, player, config, {
+    warn: (m) => warns.push(m),
+    debug: (m) => debugs.push(m),
+  });
+  const [fileA] = cacheFilesFor(['Aの発話。']);
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // A をロックすると、以後の書き込みごとの整理が失敗し続ける
+  locked.add(fileA);
+  now = 100;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  now = 200;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Cの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // warn は最初の 1 回だけ。続報は debug に落ちる（ログを埋めない）
+  const pruneWarns = warns.filter((m) => m.includes('削除できませんでした'));
+  assert.equal(pruneWarns.length, 1, `warn が ${pruneWarns.length} 回出ている`);
+  assert.ok(debugs.some((m) => m.includes('削除できませんでした')));
+
+  // 直った（削除が全件成功した）後にまた失敗したら、改めて warn で知らせる
+  locked.delete(fileA);
+  now = 300;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Dの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  const [fileD] = cacheFilesFor(['Dの発話。']);
+  locked.add(fileD);
+  now = 400;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Eの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  assert.equal(warns.filter((m) => m.includes('削除できませんでした')).length, 2);
+});
+
 test('古い候補が削除できなくても、書き込み直後の再生予定 WAV は消さない (#42)', async () => {
   let now = 0;
   mock.method(Date, 'now', () => now);

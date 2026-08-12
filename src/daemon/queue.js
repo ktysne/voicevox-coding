@@ -172,6 +172,20 @@ export class SpeechQueue extends EventEmitter {
     // null の間は #ensureCacheIndex() が初回の全走査で組み立てる。
     this.cacheIndex = null;
     this.cacheIndexScannedAt = 0;
+    // キャッシュの走査・整理の失敗を「直るまで 1 回だけ」warn で知らせるためのフラグ。
+    // 再試行のたびに warn を繰り返さない（続報は debug に落とす）
+    this.cacheScanWarned = false;
+    this.cachePruneWarned = false;
+  }
+
+  /** キャッシュ整理まわりの失敗を、直るまで 1 回だけ warn で知らせる（続報は debug）。 */
+  #warnCacheIssue(flag, message) {
+    if (this[flag]) {
+      this.log?.debug?.(message);
+      return;
+    }
+    this[flag] = true;
+    this.log?.warn?.(message);
   }
 
   get state() {
@@ -308,6 +322,9 @@ export class SpeechQueue extends EventEmitter {
       try {
         const buf = fs.readFileSync(file);
         this.#recordCacheHit(file);
+        // 整理は書き込み時だけでなくヒット時にも確認する。上限を実行中に
+        // 縮小した後の発話がヒットばかりだと、いつまでも古い上限のまま残る
+        this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries), file);
         return { file, durationMs: wavDurationMs(buf) };
       } catch {
         // キャッシュが壊れていたら作り直す
@@ -388,7 +405,7 @@ export class SpeechQueue extends EventEmitter {
       files = fs.readdirSync(CACHE_DIR);
     } catch (err) {
       if (err?.code === 'ENOENT') return new Map(); // CACHE_DIR がまだ無いのは正常
-      this.log?.debug?.(`キャッシュの一覧を取得できません: ${err.message}`);
+      this.#warnCacheIssue('cacheScanWarned', `キャッシュの一覧を取得できません（整理を見送ります）: ${err.message}`);
       return null;
     }
     const map = new Map();
@@ -402,10 +419,11 @@ export class SpeechQueue extends EventEmitter {
         // 「存在しない」と同一視すると、再同期で既知のエントリまで索引から消えるので、
         // 走査全体を失敗扱いにして既存の索引を維持する
         if (err?.code === 'ENOENT') continue;
-        this.log?.debug?.(`キャッシュの情報を取得できません (${p}): ${err.message}`);
+        this.#warnCacheIssue('cacheScanWarned', `キャッシュの情報を取得できません（整理を見送ります）(${p}): ${err.message}`);
         return null;
       }
     }
+    this.cacheScanWarned = false; // 走査が成功したら、次の失敗をまた warn で知らせる
     return map;
   }
 
@@ -528,8 +546,11 @@ export class SpeechQueue extends EventEmitter {
       }
     }
     if (failed > 0) {
-      // 恒久的に失敗して上限を維持できない場合を無通知にしない（整理 1 回につき 1 行）
-      this.log?.debug?.(`キャッシュを ${failed} 件削除できませんでした（次回の整理で再試行します）`);
+      // 恒久的に失敗して上限を維持できない（ディスクが増え続ける）場合を
+      // 既定のログレベル (info) でも無通知にしない。直るまで 1 回だけ warn
+      this.#warnCacheIssue('cachePruneWarned', `キャッシュを ${failed} 件削除できませんでした（次回の整理で再試行します）`);
+    } else {
+      this.cachePruneWarned = false;
     }
   }
 
