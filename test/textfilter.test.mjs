@@ -285,6 +285,43 @@ test('URL を read にしてもパス判定に食われない', () => {
   assert.match(text, /https:\/\/example\.com\/docs\/guide/);
 });
 
+test('SCREAMING_SNAKE_CASE の定数名は単語に分けて読む（#50）', () => {
+  const { text } = filterText('フラグは MOVEFILE_REPLACE_EXISTING を指定します。', F);
+  assert.match(text, /movefile replace existing/);
+});
+
+test('複数の定数名がそれぞれ変換される（#50）', () => {
+  const { text } = filterText('環境変数 VOICEVOX_CODING_PORT と HTTP_PROXY を確認。', F);
+  assert.match(text, /voicevox coding port/);
+  assert.match(text, /http proxy/);
+});
+
+test('インラインコード内の定数名も変換される（#50）', () => {
+  const { text } = filterText('`ERROR_ACCESS_DENIED` が返る。', F);
+  assert.match(text, /error access denied/);
+});
+
+test('数字混じりの定数名も変換される（#50）', () => {
+  const { text } = filterText('バージョンは ISO_8601 に従う。', F);
+  assert.match(text, /iso 8601/);
+});
+
+test('単独の大文字語はスペルアウトのまま変換しない（#50）', () => {
+  const { text } = filterText('HTTP と JSON を使う。', F);
+  assert.match(text, /HTTP/);
+  assert.match(text, /JSON/);
+});
+
+test('constantCase を read にすると従来どおり Markdown 記号の除去で連結される（#50）', () => {
+  const { text } = filterText('フラグは MOVEFILE_REPLACE_EXISTING を指定します。', { ...F, constantCase: 'read' });
+  assert.match(text, /MOVEFILEREPLACEEXISTING/);
+});
+
+test('URL を read にしても URL 中の大文字は壊さない（#50）', () => {
+  const { text } = filterText('詳細は https://example.com/API_DOC を参照。', { ...F, url: 'read' });
+  assert.match(text, /https:\/\/example\.com\/API_DOC/);
+});
+
 test('表の行は落ちる', () => {
   const { text } = filterText('前\n| 項目 | 値 |\n| --- | --- |\n| a | b |\n後', F);
   assert.doesNotMatch(text, /項目/);

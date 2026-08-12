@@ -385,6 +385,32 @@ function applyFilePaths(text, mode) {
   return replaced.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
 }
 
+// SCREAMING_SNAKE_CASE の定数名。`_` 連結のトークンだけを対象にする。
+// HTTP や JSON のような単独の大文字語はスペルアウトが正しい読みであることが多いため、
+// 意図的に対象外にする。
+const CONSTANT_CASE = /\b[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+\b/g;
+
+/**
+ * MOVEFILE_REPLACE_EXISTING のような定数名を「movefile replace existing」のように
+ * 小文字化・空白区切りへ変換する。1 文字ずつのスペル読みになって聞き取れないのを避ける。
+ * URL をそのまま読む設定 (url: 'read') では本文中に URL が残るため、URL パス中の
+ * 大文字（https://example.com/API_DOC 等）を巻き込まないよう applyFilePaths と同じ
+ * 退避方式で一時的に除外してから変換する。
+ */
+function applyConstantCase(text, mode) {
+  if (mode !== 'split') return text;
+
+  const parked = [];
+  const guarded = replaceUrls(text, (m) => {
+    parked.push(m);
+    return PARK_OPEN + (parked.length - 1) + PARK_CLOSE;
+  });
+
+  const replaced = guarded.replace(CONSTANT_CASE, (m) => m.toLowerCase().replace(/_/g, ' '));
+
+  return replaced.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
+}
+
 function applyTables(text, mode) {
   if (mode === 'read') {
     // 読む場合でも区切り行だけは意味がないので落とす
@@ -435,6 +461,14 @@ export function filterText(input, f = {}) {
   t = applyFilePaths(t, f.filePath ?? 'basename');
   t = applyInlineCode(t, f.inlineCode ?? 'strip');
 
+  // Markdown 記号の除去（下の markdownSymbols）は `_` を先に消してしまい、
+  // FOO_BAR の単語の区切りが失われて検出できなくなる。必ずそれより前に行う。
+  // URL・ファイルパスの処理より後に置くのは、短縮・置換後に残ったテキストにだけ
+  // 掛けるようにするため。
+  // 既知の限界：filePath: 'read'（フルパスを読む設定）ではパス中の FOO_BAR も
+  // 変換対象になる。読み上げの聞き取りやすさを優先して許容する。
+  t = applyConstantCase(t, f.constantCase ?? 'split');
+
   if (f.headings) t = t.replace(HEADING_LINE, ' ');
   else t = t.replace(HEADING_MARK, '');
 
@@ -456,8 +490,19 @@ export function filterText(input, f = {}) {
   t = t.replace(HR, ' ').replace(BLOCKQUOTE, '');
 
   if (f.markdownSymbols !== false) {
+    // url: 'read' では本文に URL がまだ残っている。退避せずに記号を外すと
+    // URL 中の `_` `*` などを Markdown 記号と誤認して壊してしまう
+    // （例: https://example.com/API_DOC が https://example.com/APIDOC になる）。
+    // 他のモードでは URL 自体が既に短縮・置換済みで本文中に残らないため、
+    // ここでの退避は基本的に空振りする（replaceUrls は該当が無ければ即 return する）。
+    const parked = [];
+    t = replaceUrls(t, (m) => {
+      parked.push(m);
+      return PARK_OPEN + (parked.length - 1) + PARK_CLOSE;
+    });
     t = t.replace(MD_EMPHASIS, '$2');
     t = t.replace(/[*_`~>|#]/g, '');
+    t = t.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
   }
 
   if (f.emoji !== false) t = t.replace(EMOJI, ' ');

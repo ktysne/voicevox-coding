@@ -663,6 +663,10 @@ function renderTextFilterCard(base) {
           { value: 'omit', label: '飛ばす' },
           { value: 'read', label: 'フルパスを読む' },
         ]),
+        selectRow('定数名（FOO_BAR 形式）', `${f}.constantCase`, [
+          { value: 'split', label: '単語に分けて読む' },
+          { value: 'read', label: 'そのまま読む' },
+        ]),
         selectRow('表', `${f}.table`, [
           { value: 'omit', label: '飛ばす' },
           { value: 'read', label: '中身を読む' },
