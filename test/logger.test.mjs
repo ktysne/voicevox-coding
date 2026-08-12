@@ -5,14 +5,26 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { Logger } from '../src/daemon/logger.js';
 
+const tmpDirs = [];
+
 function tmpLogPath() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vvc-logger-'));
+  tmpDirs.push(dir);
   return path.join(dir, 'daemon.log');
 }
+
+// テストが作った一時ディレクトリを後始末する（反復実行で %TEMP% に残骸を溜めない）
+after(() => {
+  for (const dir of tmpDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
+});
 
 function readIfExists(p) {
   return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';

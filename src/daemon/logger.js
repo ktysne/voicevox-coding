@@ -29,6 +29,9 @@ const MAX_PENDING_LINES = 1000;
 // end の flush 完了待ちの上限。ストレージ障害で close イベントが来ない場合に
 // ローテーションや終了処理を固着させない。
 const STREAM_END_TIMEOUT_MS = 5000;
+// close() での flush 待ちの上限。main.js の 2 秒のフォールバック exit より
+// 短くしておかないと、タイムアウト警告や破棄が終わる前にプロセスが落ちる。
+const CLOSE_FLUSH_TIMEOUT_MS = 1500;
 
 export class Logger {
   constructor(getLevel = () => 'info', { path = LOG_PATH, maxBytes = MAX_FILE_BYTES } = {}) {
@@ -110,7 +113,7 @@ export class Logger {
       const stream = fs.createWriteStream(this.path, { flags: 'a' });
       stream.on('error', (err) => {
         // 古い世代のストリームの遅延エラーで、開き直した新しいストリームを捨てない
-        if (this.stream === stream) this.#streamBroken(err);
+        if (this.stream === stream) this.#streamBroken(err, stream);
       });
       if (this.streamFailed) {
         // 復旧の通知は fd が実際に開けてから出す（createWriteStream は遅延オープンで、
@@ -132,8 +135,15 @@ export class Logger {
    * stream が使えなくなった。メモリのみのログに落とし、間を置いてから開き直す。
    * 黙ってファイルログを捨て続けないよう、落ちたことを 1 回だけ warn に残す
    * （復旧したら #open が再開を知らせる）。
+   * 壊れたストリームは destroy してファイルハンドルを残さない
+   * （残すとローテーション時の rename を不安定にする）。
    */
-  #streamBroken(err) {
+  #streamBroken(err, stream = null) {
+    if (stream) {
+      try {
+        stream.destroy();
+      } catch {}
+    }
     this.stream = null;
     this.reopenAt = Date.now() + STREAM_REOPEN_DELAY_MS;
     if (!this.streamFailed) {
@@ -186,7 +196,7 @@ export class Logger {
         // ここで待つと、ログ出力のために本体の処理を止めることになってしまう。
         this.stream.write(line, 'utf8');
       } catch (err) {
-        this.#streamBroken(err);
+        this.#streamBroken(err, this.stream);
       }
     }
     // stream が無い間（エラー後など）も試行バイト数としては数えておく
@@ -207,7 +217,7 @@ export class Logger {
         try {
           this.stream.write(line, 'utf8');
         } catch (err) {
-          this.#streamBroken(err);
+          this.#streamBroken(err, this.stream);
         }
       }
       this.bytes += Buffer.byteLength(line, 'utf8');
@@ -215,29 +225,40 @@ export class Logger {
   }
 
   /** stream を end し、flush 完了を待つ。障害で close が来ない場合に固着しないよう上限付き。 */
-  #endStream(stream) {
+  #endStream(stream, timeoutMs = STREAM_END_TIMEOUT_MS) {
     return new Promise((resolve) => {
       let settled = false;
-      const finish = (kind, err) => {
+      let warned = false;
+      const warnOnce = (reason) => {
+        if (warned) return;
+        warned = true;
+        // flush の失敗・打ち切りを無通知にしない（メモリ側のログには必ず残る）
+        this.#emit('warn', `ログの flush を完了できませんでした: ${reason}`);
+      };
+      const settle = () => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        if (kind === 'timeout') {
-          // flush を待ちきれなかった。ファイルハンドルを残さないよう破棄する
-          try {
-            stream.destroy();
-          } catch {}
-        }
-        if (kind !== 'close') {
-          // flush の失敗・打ち切りを無通知にしない（メモリ側のログには必ず残る）
-          this.#emit('warn', `ログの flush を完了できませんでした: ${kind === 'error' ? err?.message : 'タイムアウト'}`);
-        }
         resolve();
       };
-      const timer = setTimeout(() => finish('timeout'), STREAM_END_TIMEOUT_MS);
+      const timer = setTimeout(() => {
+        warnOnce('タイムアウト');
+        // flush を待ちきれなかった。ファイルハンドルを残さないよう破棄して打ち切る
+        try {
+          stream.destroy();
+        } catch {}
+        settle();
+      }, timeoutMs);
       timer.unref?.();
-      stream.once('close', () => finish('close'));
-      stream.once('error', (err) => finish('error', err));
+      stream.once('close', settle);
+      stream.once('error', (err) => {
+        warnOnce(err?.message ?? 'エラー');
+        // 破棄して 'close' を待つ（destroy が close を発火させる）。
+        // close が来なければ上のタイムアウトが打ち切る
+        try {
+          stream.destroy();
+        } catch {}
+      });
       stream.end();
     });
   }
@@ -310,6 +331,7 @@ export class Logger {
     const stream = this.stream;
     this.stream = null;
     if (!stream) return;
-    await this.#endStream(stream);
+    // 終了時は main.js の 2 秒フォールバック exit より先に破棄と警告を終える
+    await this.#endStream(stream, CLOSE_FLUSH_TIMEOUT_MS);
   }
 }

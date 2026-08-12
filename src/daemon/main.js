@@ -28,8 +28,9 @@ const log = new Logger(() => store.config.daemon?.logLevel ?? 'info');
 store.on('error', (err) => log.error(err.message));
 store.on('externalChange', () => log.info('config.json の変更を検知して再読み込みしました'));
 
-// プロセス内だけで持つ状態。再起動すると読み上げは有効に戻る（気づかず無音のままにしない）
-const runtime = { muted: false };
+// プロセス内だけで持つ状態。再起動すると読み上げは有効に戻る（気づかず無音のままにしない）。
+// shuttingDown は終了処理の開始後に立ち、server.js が状態変更 API を拒否するのに使う。
+const runtime = { muted: false, shuttingDown: false };
 
 const engine = new VoicevoxEngine(() => store.config.engine);
 const engineProcess = new EngineProcess(() => store.config, engine, log);
@@ -172,6 +173,12 @@ store.on('change', () => startHealthCheck());
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
+  // 以後の状態変更 API は受け付けない（server.js が runtime.shuttingDown を見て拒否する）。
+  // 後始末の最中に /api/engine/start などが通ると、止めたはずの子プロセスを
+  // 起動し直して孤児にしてしまう。新規接続の受付もここで止める。
+  // 既存の SSE 接続で server.close の完了が延びても、終了は下のフォールバック exit が保証する。
+  runtime.shuttingDown = true;
+  server.close(() => {});
   log.info('デーモンを終了します');
   removeRuntimeFile();
   clearInterval(healthTimer);
@@ -190,14 +197,13 @@ async function shutdown() {
     await player.dispose();
   } catch {}
 
-  // SSE 接続が残っていると server.close のコールバックは呼ばれないことがあり、
-  // 2 秒のフォールバック exit が先に走って未 flush のログが失われる。
-  // ここまでで後始末のログはすべて出ているので、flush はこの時点で確実に待つ。
+  // ここまでで後始末のログはすべて出ているので、flush をこの時点で確実に待ってから終了する。
   // フォールバックのタイマーは flush より先に仕掛けておき、ストレージ障害などで
-  // log.close() 自体が長引いても終了が 2 秒を超えて延びないようにする。
+  // log.close() 自体が長引いても終了が 2 秒を超えて延びないようにする
+  // （Logger 側の flush 待ち上限はこの 2 秒より短い）。
   setTimeout(() => process.exit(0), 2000).unref();
   await log.close().catch(() => {});
-  server.close(() => process.exit(0));
+  process.exit(0);
 }
 
 process.on('SIGINT', shutdown);

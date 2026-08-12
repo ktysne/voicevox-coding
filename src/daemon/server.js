@@ -252,6 +252,14 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     const { pathname } = url;
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
+      // 終了処理が始まったら状態を変更する要求は受け付けない。後始末の最中に
+      // /api/engine/start などが通ると、止めたはずの子プロセスを起動し直して
+      // 孤児にしてしまう。/api/shutdown だけは通す（shutdown() 側の二重起動
+      // ガードで無害なので、トレイの「終了」の再押下をエラーにしない）。
+      if (runtime?.shuttingDown && pathname !== '/api/shutdown') {
+        json(res, 503, { error: '終了処理中のため受け付けられません' });
+        return;
+      }
       const verdict = checkMutationRequest({ pathname, headers: req.headers, port, token });
       if (!verdict.ok) {
         log.warn(`要求を拒否しました: ${req.method} ${pathname} — ${verdict.error}`);
