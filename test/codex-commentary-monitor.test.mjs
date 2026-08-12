@@ -367,6 +367,59 @@ test('stop() 後の start() は baseline を取り直し、無効化中に増え
   }
 });
 
+test('停止中に遅延して返った旧走査の応答は、新しい世代の追跡を汚さない (#43)', async () => {
+  let releaseStale = null;
+  const transports = [];
+
+  class RaceTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.gen = transports.length; // 0 = 旧世代
+      this.turnsCalls = [];
+      transports.push(this);
+    }
+    start() {}
+    notify() {}
+    async request(method, params) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 't1', status: { type: 'idle' }, updatedAt: 'same' }] };
+      }
+      this.turnsCalls.push(params.threadId);
+      if (this.gen === 0) {
+        // 旧世代の turns/list は停止後まで返さない
+        return new Promise((resolve) => {
+          releaseStale = () => resolve({ data: [{ id: 'turn1', items: [] }] });
+        });
+      }
+      return { data: [] };
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    log: { warn() {}, info() {}, debug() {} },
+    transportFactory: () => new RaceTransport(),
+  });
+
+  try {
+    monitor.start();
+    await waitFor(() => releaseStale !== null); // 旧世代の初回走査が turns/list で待機中
+    monitor.stop();
+    monitor.start(); // 新世代（追跡はクリア済み）
+    await waitFor(() => transports.length === 2);
+    releaseStale(); // 旧走査が今さら解決する。記録は世代確認の後なので何も書かない
+
+    // 新世代の初回走査で、同じ updatedAt の idle スレッドがスキップされずに確認される。
+    // 旧走査の記録が新世代の追跡へ書き戻されていれば、ここで確認されず取りこぼす
+    await waitFor(() => transports[1].turnsCalls.includes('t1'));
+  } finally {
+    monitor.dispose();
+  }
+});
+
 test('stop → start で idle スレッドの updatedAt 追跡がリセットされる', async () => {
   // status/updatedAt を持つ単一の idle スレッドを返す transport の代役。
   class IdleThreadTransport extends EventEmitter {

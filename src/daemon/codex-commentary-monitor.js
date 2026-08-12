@@ -338,9 +338,6 @@ export class CodexCommentaryMonitor extends EventEmitter {
         const turnsResult = await transport.request('thread/turns/list', {
           threadId, limit: 1, sortDirection: 'desc', itemsView: 'full',
         });
-        // 取得と処理が成功したスレッドだけ updatedAt を記録する。
-        // 判定時に記録すると、取得の失敗でも「確認済み」になって取りこぼす
-        if (thread?.updatedAt !== undefined) this.threadUpdatedAt.set(threadId, thread.updatedAt);
         if (transport !== this.transport) return;
         const turn = (turnsResult?.data ?? turnsResult?.turns ?? [])[0];
         for (const item of extractCommentaryItems(turn)) {
@@ -354,6 +351,12 @@ export class CodexCommentaryMonitor extends EventEmitter {
             this.emit('commentary', { ...item, threadId, turnId: turn?.id });
           }
         }
+        // updatedAt の記録は「世代確認 + item 処理」が済んでから行う。
+        //   ・await より前や直後に記録すると、取得の失敗や stop() → start() の
+        //     世代交代と競合し、新世代のクリア済み追跡へ旧走査の値を書き戻して
+        //     baseline の取り直しを妨げる（無効化中の item を新規として読んでしまう）
+        //   ・item 処理が例外なら記録されず、次回の走査で再試行される
+        if (thread?.updatedAt !== undefined) this.threadUpdatedAt.set(threadId, thread.updatedAt);
       }
       // thread/list に現れなくなったスレッドの追跡は掃除する。
       for (const threadId of this.threadUpdatedAt.keys()) {
