@@ -133,6 +133,8 @@ test('初回走査中に切断しても再接続後のポーリングタイマ�
     const transports = [];
     const monitor = new CodexCommentaryMonitor({
       pollMs: 10,
+      // start() がバックオフを restartDelayMs へ戻すので、注入はコンストラクタで行う
+      restartDelayMs: 5,
       transportFactory: () => {
         // 一本目だけ、初回走査の最中に切断を発火させる。
         const first = transports.length === 0;
@@ -143,7 +145,6 @@ test('初回走査中に切断しても再接続後のポーリングタイマ�
         return transport;
       },
     });
-    monitor.backoffMs = 5;
     monitor.start();
 
     await waitFor(() => transports.length === 2 && timers.active > 0);
@@ -171,6 +172,8 @@ test('切断後に古い走査が完了しても、その結果を新しい接�
     const transports = [];
     const monitor = new CodexCommentaryMonitor({
       pollMs: 10,
+      // start() がバックオフを restartDelayMs へ戻すので、注入はコンストラクタで行う
+      restartDelayMs: 5,
       transportFactory: () => {
         const first = transports.length === 0;
         const transport = new FakeConnectionTransport({
@@ -188,7 +191,6 @@ test('切断後に古い走査が完了しても、その結果を新しい接�
         return transport;
       },
     });
-    monitor.backoffMs = 5;
     monitor.start();
 
     await waitFor(() => transports.length === 2 && releaseStale !== null);
@@ -293,7 +295,7 @@ test('stop() 後の start() は baseline を取り直し、無効化中に増え
   }
 });
 
-test('CLI 不在: 一度も接続に成功しないまま 3 回連続で失敗したら自動再接続をやめ、warn は 1 回だけ出す', async () => {
+test('CLI 不在: 3 回連続で失敗したら低頻度の再試行へ切り替え、warn は 1 回だけ出す', async () => {
   const warns = [];
   const log = { warn: (msg) => warns.push(msg), debug: () => {} };
   let factoryCalls = 0;
@@ -311,6 +313,7 @@ test('CLI 不在: 一度も接続に成功しないまま 3 回連続で失敗�
   const monitor = new CodexCommentaryMonitor({
     pollMs: 5,
     restartDelayMs: 5,
+    slowRetryDelayMs: 80,
     log,
     transportFactory: () => {
       factoryCalls += 1;
@@ -318,15 +321,63 @@ test('CLI 不在: 一度も接続に成功しないまま 3 回連続で失敗�
     },
   });
 
-  monitor.start();
-  await waitFor(() => factoryCalls >= 3);
-  // 打ち切り後にさらに再接続が予約されていないことを、少し待って確認する。
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  try {
+    monitor.start();
+    await waitFor(() => monitor.slowRetry);
+    const fastCalls = factoryCalls;
+    assert.equal(fastCalls, 3);
+    // 短い間隔（restartDelayMs=5ms）での再試行は止まっている
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.equal(factoryCalls, fastCalls);
+    // ただし恒久停止ではなく、低頻度（slowRetryDelayMs=80ms）では試し続ける
+    await waitFor(() => factoryCalls > fastCalls);
+    assert.equal(monitor.running, true);
+    const slowWarns = warns.filter((m) => m.includes('再試行の間隔を広げます'));
+    assert.equal(slowWarns.length, 1);
+  } finally {
+    monitor.dispose();
+  }
+});
 
-  assert.equal(factoryCalls, 3);
-  assert.equal(monitor.running, false);
-  const giveUpWarns = warns.filter((m) => m.includes('途中経過監視を停止しました'));
-  assert.equal(giveUpWarns.length, 1);
+test('低頻度の再試行中に接続が回復したら通常の監視へ戻る', async () => {
+  const warns = [];
+  const infos = [];
+  const log = { warn: (msg) => warns.push(msg), info: (msg) => infos.push(msg), debug: () => {} };
+  let factoryCalls = 0;
+
+  class RecoveringTransport extends EventEmitter {
+    constructor(shouldFail) {
+      super();
+      this.shouldFail = shouldFail;
+    }
+    start() {}
+    notify() {}
+    async request(method) {
+      if (this.shouldFail && method === 'initialize') throw new Error('まだ起動できない');
+      return { data: [] };
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    slowRetryDelayMs: 30,
+    log,
+    // 最初の 3 回は失敗し、4 回目（低頻度での再試行）から成功する
+    transportFactory: () => new RecoveringTransport(++factoryCalls <= 3),
+  });
+
+  try {
+    monitor.start();
+    await waitFor(() => monitor.slowRetry);
+    // デーモン起動時にたまたま不調だっただけなら、設定変更なしで自動復旧する
+    await waitFor(() => monitor.everConnected);
+    assert.equal(monitor.slowRetry, false);
+    assert.ok(infos.some((m) => m.includes('接続を回復しました')));
+  } finally {
+    monitor.dispose();
+  }
 });
 
 test('一度接続に成功していれば、その後何度切断されても打ち切らずに再接続を続ける', async () => {
@@ -360,12 +411,13 @@ test('一度接続に成功していれば、その後何度切断されても�
   try {
     monitor.start();
     await waitFor(() => monitor.everConnected);
-    // everConnected になった後、打ち切り閾値（3 回）を超えて再接続が続くことを確認する。
+    // everConnected になった後、切替閾値（3 回）を超えて短い間隔の再接続が続くことを確認する。
     await waitFor(() => generation >= 6);
 
     assert.equal(monitor.running, true);
-    const giveUpWarns = warns.filter((m) => m.includes('途中経過監視を停止しました'));
-    assert.equal(giveUpWarns.length, 0);
+    assert.equal(monitor.slowRetry, false);
+    const slowWarns = warns.filter((m) => m.includes('再試行の間隔を広げます'));
+    assert.equal(slowWarns.length, 0);
   } finally {
     monitor.dispose();
   }

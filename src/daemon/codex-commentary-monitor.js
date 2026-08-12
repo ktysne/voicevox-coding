@@ -5,9 +5,13 @@ import readline from 'node:readline';
 const DEFAULT_POLL_MS = 2000;
 const DEFAULT_TIMEOUT_MS = 10000;
 const DEFAULT_RESTART_DELAY_MS = 1000;
-// 一度も接続に成功しないまま、この回数だけ連続で失敗したら自動再接続をあきらめる。
-// codex CLI が存在しない環境で spawn → 即終了 → 再接続を永遠に繰り返さないための上限。
-const MAX_CONNECT_FAILURES_BEFORE_GIVE_UP = 3;
+// 一度も接続に成功しないまま、この回数だけ連続で失敗したら低頻度の再試行へ切り替える。
+// codex CLI が存在しない環境で spawn → 即終了 → 再接続を短い間隔で永遠に繰り返さないための上限。
+// CLI 不在と「デーモン起動時にたまたま app-server が不調だった」は外からは区別できないため、
+// 恒久停止はせず、間隔を大きく広げて再試行を続ける（不調が直れば自動で復旧する）。
+const MAX_CONNECT_FAILURES_BEFORE_SLOW_RETRY = 3;
+// 低頻度の再試行間隔。CLI が無い環境でもこの頻度の spawn なら実害がない。
+const DEFAULT_SLOW_RETRY_DELAY_MS = 10 * 60 * 1000;
 
 /** 設定から、Codex の途中経過監視を動かすべきかどうかを判定する。 */
 export function commentaryEnabled(cfg) {
@@ -126,12 +130,14 @@ export class CodexCommentaryMonitor extends EventEmitter {
     pollMs = DEFAULT_POLL_MS,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     restartDelayMs = DEFAULT_RESTART_DELAY_MS,
+    slowRetryDelayMs = DEFAULT_SLOW_RETRY_DELAY_MS,
     log,
     transportFactory,
   } = {}) {
     super();
     this.pollMs = pollMs;
     this.restartDelayMs = restartDelayMs;
+    this.slowRetryDelayMs = slowRetryDelayMs;
     this.log = log;
     this.transportFactory = transportFactory ?? (() => new AppServerTransport({ timeoutMs, log }));
     this.transport = null;
@@ -145,8 +151,10 @@ export class CodexCommentaryMonitor extends EventEmitter {
     // 一度でも initialize + 初回 scan まで到達したか。true になった後の切断は
     // 一時的な app-server の不調とみなし、従来どおり無限にバックオフ再接続する。
     this.everConnected = false;
-    // everConnected に達しないまま連続した接続失敗の回数。CLI 不在の打ち切り判定に使う。
+    // everConnected に達しないまま連続した接続失敗の回数。低頻度再試行への切替判定に使う。
     this.consecutiveFailures = 0;
+    // 低頻度の再試行モード。切替時に 1 回だけ warn を出すためのフラグを兼ねる。
+    this.slowRetry = false;
   }
 
   start() {
@@ -159,6 +167,7 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.backoffMs = this.restartDelayMs;
     this.everConnected = false;
     this.consecutiveFailures = 0;
+    this.slowRetry = false;
     this.#connect();
   }
 
@@ -196,10 +205,14 @@ export class CodexCommentaryMonitor extends EventEmitter {
       // タイマーを作る直前にも接続世代を確認する。古い世代はここで手を引く。
       if (!this.running || transport !== this.transport) return;
       // initialize が完了し、初回 scan も（内部で失敗を握り潰さず）完走した。
-      // これ以降の切断は「一時的な不調」として扱い、CLI 不在の打ち切り判定からは外す。
+      // これ以降の切断は「一時的な不調」として扱い、低頻度再試行への切替判定からは外す。
       if (this.baselineComplete) {
         this.everConnected = true;
         this.consecutiveFailures = 0;
+        if (this.slowRetry) {
+          this.slowRetry = false;
+          this.log?.info?.('Codex の途中経過監視が接続を回復しました');
+        }
       }
       this.backoffMs = this.restartDelayMs;
       timer = setInterval(() => {
@@ -223,23 +236,22 @@ export class CodexCommentaryMonitor extends EventEmitter {
 
   /**
    * 接続失敗（close または #connect の catch）のたびに呼ぶ。
-   * 一度も接続に成功していない状態が MAX_CONNECT_FAILURES_BEFORE_GIVE_UP 回連続したら、
-   * それ以上の自動再接続をあきらめる（codex CLI 不在などで永久ループしないようにする）。
+   * 一度も接続に成功していない状態が MAX_CONNECT_FAILURES_BEFORE_SLOW_RETRY 回連続したら、
+   * 再試行の間隔を大きく広げる（codex CLI 不在などで短い間隔の spawn を永遠に繰り返さない）。
+   * CLI 不在と起動時のたまたまの不調は外から区別できないため、恒久停止はせず
+   * 低頻度で試し続ける（不調が直れば自動で復旧する）。切替を知らせる warn は 1 回だけ出す。
    * 一度でも接続に成功していれば（everConnected）、このカウンタは使わず従来どおり再接続を続ける。
    */
   #handleConnectFailure() {
     if (!this.running) return;
-    if (!this.everConnected) {
+    if (!this.everConnected && !this.slowRetry) {
       this.consecutiveFailures += 1;
-      if (this.consecutiveFailures >= MAX_CONNECT_FAILURES_BEFORE_GIVE_UP) {
+      if (this.consecutiveFailures >= MAX_CONNECT_FAILURES_BEFORE_SLOW_RETRY) {
+        this.slowRetry = true;
         this.log?.warn?.(
-          'Codex の途中経過監視を停止しました（codex CLI が見つからないか app-server を起動できません）。'
-          + '設定を変更すると再試行します',
+          'Codex の途中経過監視に接続できないため、再試行の間隔を広げます（codex CLI が'
+          + '見つからないか app-server を起動できません）。設定を変更すると直ちに再試行します',
         );
-        // stop() と同じ後片付けをしたうえで running を落とす。設定変更で syncCommentaryMonitor が
-        // 改めて start() を呼べば、そこで失敗カウンタごとリセットされて再試行する。
-        this.dispose();
-        return;
       }
     }
     this.#scheduleRestart();
@@ -247,7 +259,8 @@ export class CodexCommentaryMonitor extends EventEmitter {
 
   #scheduleRestart() {
     if (!this.running || this.restartTimer) return;
-    const delay = this.backoffMs;
+    // 低頻度モードでは固定の長い間隔で試す（倍々の 30 秒上限は使わない）
+    const delay = this.slowRetry ? this.slowRetryDelayMs : this.backoffMs;
     this.backoffMs = Math.min(this.backoffMs * 2, 30000);
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
