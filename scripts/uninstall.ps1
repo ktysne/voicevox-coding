@@ -39,8 +39,48 @@ $InstallDir = Join-Path $env:USERPROFILE '.voicevox-coding'
 $ClaudeDir  = Join-Path $env:USERPROFILE '.claude'
 $CodexDir   = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 
-function Write-Ok($msg)  { Write-Host "  OK   $msg" -ForegroundColor Green }
-function Write-Skip($msg){ Write-Host "  --   $msg" -ForegroundColor DarkGray }
+function Write-Ok($msg)    { Write-Host "  OK   $msg" -ForegroundColor Green }
+function Write-Skip($msg)  { Write-Host "  --   $msg" -ForegroundColor DarkGray }
+function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow }
+
+<#
+  対象ファイルのバックアップ世代を整理する。
+  「<ファイル名>.bak-yyyyMMdd-HHmmss（同一秒の一意化 -N を含む）」に完全一致する
+  ものだけを対象にし、新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
+  削除に失敗しても uninstall 全体は失敗させず、警告だけ出して続行する。
+  install.ps1 の同名関数と同じロジックだが、モジュール共有はせずそれぞれに持たせている。
+#>
+function Remove-OldBackups([string]$path, [int]$Keep = 5) {
+    $dir  = Split-Path -Parent $path
+    $name = Split-Path -Leaf $path
+    if (-not (Test-Path -LiteralPath $dir)) { return }
+
+    $pattern = '^' + [regex]::Escape($name) + '\.bak-\d{8}-\d{6}(-\d+)?$'
+    # 並びは「タイムスタンプの降順 → 同一秒の枝番の数値降順」。名前の文字列降順だと
+    # 枝番が二桁になったとき -9 が -10 より新しい扱いになり、最新の世代を消してしまう
+    $backups = @(
+        Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $pattern } |
+            ForEach-Object {
+                [void]($_.Name -match '\.bak-(\d{8}-\d{6})(?:-(\d+))?$')
+                # ?? は PowerShell 7 専用。5.1 は自己再起動より前にファイル全体を
+                # パースするため、ここで使うと -File 起動が構文エラーで壊れる
+                $seq = if ($Matches[2]) { [int]$Matches[2] } else { 1 }
+                [pscustomobject]@{ File = $_; Stamp = $Matches[1]; Seq = $seq }
+            } |
+            Sort-Object -Property Stamp, Seq -Descending
+    )
+
+    if ($backups.Count -le $Keep) { return }
+
+    foreach ($old in $backups[$Keep..($backups.Count - 1)]) {
+        try {
+            Remove-Item -LiteralPath $old.File.FullName -Force
+        } catch {
+            Write-Warn2 "古いバックアップを削除できませんでした: $($old.File.FullName) ($($_.Exception.Message))"
+        }
+    }
+}
 
 function Remove-OurHooks([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) {
@@ -54,8 +94,15 @@ function Remove-OurHooks([string]$path) {
     if (-not $root.ContainsKey('hooks')) { Write-Skip "$path にフックはありません"; return }
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    Copy-Item -LiteralPath $path -Destination "$path.bak-$stamp" -Force
-    Write-Ok "バックアップ: $path.bak-$stamp"
+    $backup = "$path.bak-$stamp"
+    # 同一秒内の再実行（install 直後の uninstall など）で既存の世代を上書きしない
+    $n = 2
+    while (Test-Path -LiteralPath $backup) {
+        $backup = "$path.bak-$stamp-$n"
+        $n += 1
+    }
+    Copy-Item -LiteralPath $path -Destination $backup -Force
+    Write-Ok "バックアップ: $backup"
 
     $removed = 0
     $hooks = $root['hooks']
@@ -82,6 +129,8 @@ function Remove-OurHooks([string]$path) {
 
     Set-Content -LiteralPath $path -Value ($root | ConvertTo-Json -Depth 30) -Encoding UTF8 -NoNewline
     Write-Ok "$path からフックを $removed 件取り除きました"
+    # 世代整理は書き込みが成功した後に行う（解除に失敗した実行で履歴だけ減らさない）
+    Remove-OldBackups $path
 }
 
 Write-Host ''
