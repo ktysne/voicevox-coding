@@ -174,6 +174,8 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.polling = false;
     this.baselineComplete = false;
     this.seenItems = new Set();
+    // スレッドごとの前回 updatedAt。idle 系スレッドで turns/list を間引くための基準値。
+    this.threadUpdatedAt = new Map();
     this.backoffMs = restartDelayMs;
     // 一度でも initialize + 初回 scan まで到達したか。true になった後の切断は
     // 一時的な app-server の不調とみなし、従来どおり無限にバックオフ再接続する。
@@ -199,6 +201,9 @@ export class CodexCommentaryMonitor extends EventEmitter {
     // baseline や既知 item、バックオフ・失敗カウンタを含めて「まっさらな状態」からやり直す。
     this.baselineComplete = false;
     this.seenItems.clear();
+    // baseline を取り直すため、前回の updatedAt 追跡もリセットする。
+    // これにより次の走査では（active 以外の）idle スレッドも含め全スレッドを確認する。
+    this.threadUpdatedAt.clear();
     this.backoffMs = this.restartDelayMs;
     this.everConnected = false;
     this.consecutiveFailures = 0;
@@ -324,12 +329,18 @@ export class CodexCommentaryMonitor extends EventEmitter {
       // 待機中に切断されていれば、古い応答は新しい接続へ持ち込まずに捨てる。
       if (transport !== this.transport) return;
       const threads = result?.data ?? result?.threads ?? [];
+      const currentThreadIds = new Set();
       for (const thread of threads) {
         const threadId = thread?.id;
         if (!threadId) continue;
+        currentThreadIds.add(threadId);
+        if (!this.#shouldCheckThread(threadId, thread)) continue;
         const turnsResult = await transport.request('thread/turns/list', {
           threadId, limit: 1, sortDirection: 'desc', itemsView: 'full',
         });
+        // 取得と処理が成功したスレッドだけ updatedAt を記録する。
+        // 判定時に記録すると、取得の失敗でも「確認済み」になって取りこぼす
+        if (thread?.updatedAt !== undefined) this.threadUpdatedAt.set(threadId, thread.updatedAt);
         if (transport !== this.transport) return;
         const turn = (turnsResult?.data ?? turnsResult?.turns ?? [])[0];
         for (const item of extractCommentaryItems(turn)) {
@@ -343,6 +354,10 @@ export class CodexCommentaryMonitor extends EventEmitter {
             this.emit('commentary', { ...item, threadId, turnId: turn?.id });
           }
         }
+      }
+      // thread/list に現れなくなったスレッドの追跡は掃除する。
+      for (const threadId of this.threadUpdatedAt.keys()) {
+        if (!currentThreadIds.has(threadId)) this.threadUpdatedAt.delete(threadId);
       }
       this.baselineComplete = true;
       // 走査が完走した = 接続に成功している。初回走査だけが失敗して後続の
@@ -370,6 +385,27 @@ export class CodexCommentaryMonitor extends EventEmitter {
     } finally {
       this.polling = false;
     }
+  }
+
+  /**
+   * スレッドの thread/turns/list（フルペイロード）を確認すべきか判定する。
+   * - active: commentary が増え得る。updatedAt の変化保証が無いため毎回確認する。
+   * - idle / notLoaded / systemError: updatedAt が前回走査から変化したときだけ確認する。
+   * - status/updatedAt が取れない未知の形: 安全側に倒して毎回確認する。
+   * updatedAt の記録はここでは行わない（turns/list の処理が成功した後に scan 側で
+   * 記録する）。判定時に記録してしまうと、取得が失敗しても「確認済み」となり、
+   * そのスレッドの変化を次回以降スキップして途中経過を取りこぼす。
+   * 比較は型を仮定せず `!==` の単純比較でよい。
+   */
+  #shouldCheckThread(threadId, thread) {
+    const statusType = thread?.status?.type;
+    if (statusType === 'active') return true;
+    if (statusType === 'idle' || statusType === 'notLoaded' || statusType === 'systemError') {
+      const updatedAt = thread?.updatedAt;
+      return updatedAt === undefined || this.threadUpdatedAt.get(threadId) !== updatedAt;
+    }
+    // status が無い、または未知の type。互換性のため従来どおり毎回確認する。
+    return true;
   }
 
   dispose() {
