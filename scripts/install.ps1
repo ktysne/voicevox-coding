@@ -90,14 +90,21 @@ function Backup-File([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
     $stamp  = Get-Date -Format 'yyyyMMdd-HHmmss'
     $backup = "$path.bak-$stamp"
+    # 同一秒内の再実行（update の install 再実行など）で既存の世代を上書きしない。
+    # 既にあるなら -2, -3 … を付けて一意化する（世代整理の正規表現もこの形を対象に含む）
+    $n = 2
+    while (Test-Path -LiteralPath $backup) {
+        $backup = "$path.bak-$stamp-$n"
+        $n += 1
+    }
     Copy-Item -LiteralPath $path -Destination $backup -Force
     return $backup
 }
 
 <#
   対象ファイルのバックアップ世代を整理する。
-  「<ファイル名>.bak-yyyyMMdd-HHmmss」に完全一致するものだけを対象にし、
-  新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
+  「<ファイル名>.bak-yyyyMMdd-HHmmss（同一秒の一意化 -N を含む）」に完全一致する
+  ものだけを対象にし、新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
   削除に失敗しても install 全体は失敗させず、警告だけ出して続行する。
 #>
 function Remove-OldBackups([string]$path, [int]$Keep = 5) {
@@ -105,7 +112,7 @@ function Remove-OldBackups([string]$path, [int]$Keep = 5) {
     $name = Split-Path -Leaf $path
     if (-not (Test-Path -LiteralPath $dir)) { return }
 
-    $pattern = '^' + [regex]::Escape($name) + '\.bak-\d{8}-\d{6}$'
+    $pattern = '^' + [regex]::Escape($name) + '\.bak-\d{8}-\d{6}(-\d+)?$'
     $backups = @(
         Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match $pattern } |

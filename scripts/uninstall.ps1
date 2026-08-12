@@ -45,8 +45,8 @@ function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow 
 
 <#
   対象ファイルのバックアップ世代を整理する。
-  「<ファイル名>.bak-yyyyMMdd-HHmmss」に完全一致するものだけを対象にし、
-  新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
+  「<ファイル名>.bak-yyyyMMdd-HHmmss（同一秒の一意化 -N を含む）」に完全一致する
+  ものだけを対象にし、新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
   削除に失敗しても uninstall 全体は失敗させず、警告だけ出して続行する。
   install.ps1 の同名関数と同じロジックだが、モジュール共有はせずそれぞれに持たせている。
 #>
@@ -55,7 +55,7 @@ function Remove-OldBackups([string]$path, [int]$Keep = 5) {
     $name = Split-Path -Leaf $path
     if (-not (Test-Path -LiteralPath $dir)) { return }
 
-    $pattern = '^' + [regex]::Escape($name) + '\.bak-\d{8}-\d{6}$'
+    $pattern = '^' + [regex]::Escape($name) + '\.bak-\d{8}-\d{6}(-\d+)?$'
     $backups = @(
         Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match $pattern } |
@@ -85,9 +85,15 @@ function Remove-OurHooks([string]$path) {
     if (-not $root.ContainsKey('hooks')) { Write-Skip "$path にフックはありません"; return }
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    Copy-Item -LiteralPath $path -Destination "$path.bak-$stamp" -Force
-    Write-Ok "バックアップ: $path.bak-$stamp"
-    Remove-OldBackups $path
+    $backup = "$path.bak-$stamp"
+    # 同一秒内の再実行（install 直後の uninstall など）で既存の世代を上書きしない
+    $n = 2
+    while (Test-Path -LiteralPath $backup) {
+        $backup = "$path.bak-$stamp-$n"
+        $n += 1
+    }
+    Copy-Item -LiteralPath $path -Destination $backup -Force
+    Write-Ok "バックアップ: $backup"
 
     $removed = 0
     $hooks = $root['hooks']
@@ -114,6 +120,8 @@ function Remove-OurHooks([string]$path) {
 
     Set-Content -LiteralPath $path -Value ($root | ConvertTo-Json -Depth 30) -Encoding UTF8 -NoNewline
     Write-Ok "$path からフックを $removed 件取り除きました"
+    # 世代整理は書き込みが成功した後に行う（解除に失敗した実行で履歴だけ減らさない）
+    Remove-OldBackups $path
 }
 
 Write-Host ''
