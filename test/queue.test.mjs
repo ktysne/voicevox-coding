@@ -1128,15 +1128,59 @@ test('低い上限で複数チャンクを読んでも、再生時点で WAV が
   assert.deepEqual(missing, [], `再生時に WAV が消えていた: ${missing}`);
   const plays = player.calls.filter(([kind]) => kind === 'play');
   assert.equal(plays.length, 3, `3 チャンクとも再生されるべき: ${plays.length}`);
+
+  // 保護が外れた後は上限まで片付いている（キューが空でも上限超過を残さない）
+  const wavs = [...disk.keys()].filter((p) => p.endsWith('.wav'));
+  assert.equal(wavs.length, 1, `再生終了後に上限まで戻っていない: ${wavs.length}`);
 });
 
-test('古い候補が削除できなくても、書き込み直後の再生予定 WAV は消さない (#42)', async () => {
+test('同一テキストのチャンクが同じ WAV を共有していても、使い終わるまで保護される (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk } = mockCacheDisk();
+  const missing = [];
+  class SlowPlayer extends FakePlayer {
+    async play(file) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (!disk.has(file)) missing.push(file);
+      return super.play(file);
+    }
+  }
+  const player = new SlowPlayer();
+  const engine = { synthesize: async () => ({ wav: WAV }) };
+  const config = () => ({ daemon: { chunkChars: 10, cacheEnabled: true, cacheMaxEntries: 1 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {}, debug() {} });
+
+  // 同じ文が並ぶと、再生中と先読み済みのチャンクが同じキャッシュファイルを参照する。
+  // Set だと 1 チャンク目の再生完了で保護が外れ、間の整理で消され得る
+  queue.enqueue({
+    target: 'test', event: 'test',
+    text: 'ううううううう。ううううううう。ううううううう。',
+    speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' },
+  });
+  await waitIdle(queue);
+
+  assert.deepEqual(missing, [], `再生時に WAV が消えていた: ${missing}`);
+  assert.equal(player.calls.filter(([kind]) => kind === 'play').length, 3);
+});
+
+test('古い候補が削除できなくても、再生前の WAV は消さない (#42)', async () => {
   let now = 0;
   mock.method(Date, 'now', () => now);
   const { disk, locked } = mockCacheDisk();
-  const player = new FakePlayer();
+  // 再生時点でファイルが存在することを検証する（再生完了後は、ロックされた
+  // A の代わりに B が正当に整理されることがある）
+  const missing = [];
+  class CheckingPlayer extends FakePlayer {
+    async play(file) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (!disk.has(file)) missing.push(file);
+      return super.play(file);
+    }
+  }
+  const player = new CheckingPlayer();
   const queue = makeCacheQueue(player, { maxEntries: 1 });
-  const [fileA, fileB] = cacheFilesFor(['Aの発話。', 'Bの発話。']);
+  const [fileA] = cacheFilesFor(['Aの発話。']);
 
   now = 0;
   queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
@@ -1151,7 +1195,7 @@ test('古い候補が削除できなくても、書き込み直後の再生予�
   queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
   await waitIdle(queue);
 
-  assert.ok(disk.has(fileB), '再生予定の B が整理で消されている');
+  assert.deepEqual(missing, [], `再生時に WAV が消えていた: ${missing}`);
   assert.deepEqual(errors, []);
 });
 

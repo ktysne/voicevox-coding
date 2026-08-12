@@ -175,12 +175,26 @@ export class SpeechQueue extends EventEmitter {
     // 合成済みでまだ再生に使い終わっていない WAV。整理の削除対象から除外する。
     // 上限が小さいと、先読み合成に伴う整理が「再生待ち・再生中」のファイルを
     // 最古として消してしまい、ワーカーの Load が file not found になるため。
+    // 同一テキストの連続チャンクは同じキャッシュファイルを共有するので、
+    // Set ではなく参照カウント（Map<file, count>）で持つ。
     // 追加は #synthesizeChunk、除去は #discardAudio（すべての消費経路が通る）。
-    this.protectedWavs = new Set();
+    this.protectedWavs = new Map();
     // キャッシュの走査・整理の失敗を「直るまで 1 回だけ」warn で知らせるためのフラグ。
     // 再試行のたびに warn を繰り返さない（続報は debug に落とす）
     this.cacheScanWarned = false;
     this.cachePruneWarned = false;
+  }
+
+  /** 再生に使い終わるまで WAV を整理から守る（参照カウントを増やす）。 */
+  #protectWav(file) {
+    this.protectedWavs.set(file, (this.protectedWavs.get(file) ?? 0) + 1);
+  }
+
+  /** 保護を 1 つ外し、参照が無くなったら整理の対象へ戻す。 */
+  #unprotectWav(file) {
+    const count = this.protectedWavs.get(file) ?? 0;
+    if (count <= 1) this.protectedWavs.delete(file);
+    else this.protectedWavs.set(file, count - 1);
   }
 
   /** キャッシュ整理まわりの失敗を、直るまで 1 回だけ warn で知らせる（続報は debug）。 */
@@ -327,7 +341,7 @@ export class SpeechQueue extends EventEmitter {
       try {
         const buf = fs.readFileSync(file);
         this.#recordCacheHit(file);
-        this.protectedWavs.add(file);
+        this.#protectWav(file);
         // 整理は書き込み時だけでなくヒット時にも確認する。上限を実行中に
         // 縮小した後の発話がヒットばかりだと、いつまでも古い上限のまま残る
         this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
@@ -353,7 +367,7 @@ export class SpeechQueue extends EventEmitter {
     if (useCache) {
       this.#recordCacheWrite(file);
       // いま書いた WAV はこれから player.play() へ渡すので、整理の対象から守る
-      this.protectedWavs.add(file);
+      this.#protectWav(file);
       this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
     }
     return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache };
@@ -362,8 +376,11 @@ export class SpeechQueue extends EventEmitter {
   /** 一時 WAV を削除する。再生ワーカーは PLAY 時に全体をメモリへ読むので、再生後の削除は安全。 */
   #discardAudio(audio) {
     if (!audio) return;
-    // 再生に使い終わった（または使わないことが確定した）ので、整理の保護を外す
-    this.protectedWavs.delete(audio.file);
+    // 再生に使い終わった（または使わないことが確定した）ので、整理の保護を外す。
+    // 保護中は削除候補が無くて上限超過が残ることがあるため、外した直後に
+    // 整理を再試行する（キューが空になると次の発話まで機会が無い）
+    this.#unprotectWav(audio.file);
+    this.#maybePruneCache(cacheMaxEntriesOf(this.getConfig().daemon?.cacheMaxEntries));
     if (!audio.ephemeral) return;
     fs.unlink(audio.file, (err) => {
       // 一時的な EBUSY/EPERM (ウイルス対策など) は起動時掃除が拾うが、無通知にはしない
@@ -536,7 +553,13 @@ export class SpeechQueue extends EventEmitter {
     // 走査の失敗が続いている間は索引が確定していない（null）。整理は諦めて
     // 次の機会に任せる（合成した WAV 自体は書けているので、読み上げは止めない）
     const current = this.cacheIndex;
-    if (!current || current.size <= maxEntries) return;
+    if (!current) return;
+    if (current.size <= maxEntries) {
+      // 上限以内に収まっている（外部削除や上限変更を含む）なら復旧扱い。
+      // 次の削除障害をまた warn で知らせる
+      this.cachePruneWarned = false;
+      return;
+    }
 
     const entries = [...current.entries()].sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
     let failed = 0;
