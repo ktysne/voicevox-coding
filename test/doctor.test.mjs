@@ -4,6 +4,7 @@ import {
   codexHomeMatches,
   missingToolEvents,
   normalizeInstallManifest,
+  extraToolEvents,
   normalizePathForComparison,
   parseCodexInitializeResult,
   resolveTargetPlan,
@@ -110,4 +111,16 @@ test('normalizeInstallManifest: 型が不正なら無効扱い（null）にす�
   assert.equal(normalizeInstallManifest({ skipCodex: false }), null); // schemaVersion 無し
   assert.equal(normalizeInstallManifest(null), null);
   assert.equal(normalizeInstallManifest('text'), null);
+});
+
+test('extraToolEvents: 対象外なのに残っている高頻度フックを検出する', () => {
+  const manifest = { includeToolEvents: false };
+  const ours = [{ ev: 'Stop' }, { ev: 'PreToolUse' }];
+  assert.deepEqual(extraToolEvents(manifest, ours), ['PreToolUse']);
+});
+
+test('extraToolEvents: 期待どおり（有効・または manifest なし）なら差分は無い', () => {
+  assert.deepEqual(extraToolEvents({ includeToolEvents: true }, [{ ev: 'PreToolUse' }]), []);
+  assert.deepEqual(extraToolEvents(null, [{ ev: 'PreToolUse' }]), []);
+  assert.deepEqual(extraToolEvents({ includeToolEvents: false }, [{ ev: 'Stop' }]), []);
 });

@@ -172,6 +172,19 @@ export function missingToolEvents(manifest, ourEvents) {
 }
 
 /**
+ * 導入時に -IncludeToolEvents を指定していない（manifest.includeToolEvents が false の）のに、
+ * 高頻度の PreToolUse / PostToolUse が残っている場合、そのイベント名を返す。
+ * install.ps1 は対象外のツールイベントを解除するようになったため、残っているのは
+ * manifest 対応前の導入の名残り。次の update で解除される旨を警告するのに使う。
+ * manifest が無い、または includeToolEvents が true の場合は常に空配列。
+ */
+export function extraToolEvents(manifest, ourEvents) {
+  if (!manifest || manifest.includeToolEvents !== false) return [];
+  const have = new Set((ourEvents ?? []).map((o) => o.ev));
+  return ['PreToolUse', 'PostToolUse'].filter((ev) => have.has(ev));
+}
+
+/**
  * codex CLI が PATH 上にあるかを確かめる（where.exe codex 相当）。
  * install.json が無い旧導入で、Codex を使うつもりがあるのかを見分けるための軽い判定に使う。
  * codexHooksList() と違い app-server を起動しないので、ほぼ即座に返る。
@@ -298,7 +311,7 @@ async function main() {
     ok('Claude Code', '対象外（導入時に -SkipClaude を指定）');
     // 対象外なのにフックが残っていると読み上げが動き続ける。盲点にしない
     if (claudeOurs.length > 0) {
-      warn('Claude Code', `対象外の設定ですがフックが ${claudeOurs.length} 件残っています。解除するには scripts\\uninstall.ps1 を実行してください`);
+      warn('Claude Code', `対象外の設定ですがフックが ${claudeOurs.length} 件残っています。scripts\\update.ps1 を実行すると導入時の構成で作り直され、対象外のフックだけが解除されます`);
     }
   } else if (!claude) {
     warn('Claude Code', `${CLAUDE_SETTINGS} を読めません`);
@@ -312,6 +325,13 @@ async function main() {
       fail(
         'Claude Code (ツールイベント)',
         `導入時に -IncludeToolEvents を指定していますが登録されていません: ${missing.join(', ')}。scripts\\install.ps1 を実行し直してください`,
+      );
+    }
+    const claudeExtra = extraToolEvents(manifest, claudeOurs);
+    if (claudeExtra.length > 0) {
+      warn(
+        'Claude Code (ツールイベント)',
+        `対象外の高頻度フックが残っています: ${claudeExtra.join(', ')}。scripts\\update.ps1 を実行すると解除されます`,
       );
     }
   }
@@ -333,7 +353,7 @@ async function main() {
   if (codexPlan.mode === 'skip') {
     ok('Codex', '対象外（導入時に -SkipCodex を指定）');
     if (codexOurs.length > 0) {
-      warn('Codex', `対象外の設定ですがフックが ${codexOurs.length} 件残っています。解除するには scripts\\uninstall.ps1 を実行してください`);
+      warn('Codex', `対象外の設定ですがフックが ${codexOurs.length} 件残っています。scripts\\update.ps1 を実行すると導入時の構成で作り直され、対象外のフックだけが解除されます`);
     }
   } else if (codexPlan.mode === 'warn-uninstalled') {
     warn('Codex', '未導入のようです（使う場合は scripts\\install.ps1 を実行してください）');
@@ -362,6 +382,13 @@ async function main() {
       fail(
         'Codex (ツールイベント)',
         `導入時に -IncludeToolEvents を指定していますが登録されていません: ${missing.join(', ')}。scripts\\install.ps1 を実行し直してください`,
+      );
+    }
+    const codexExtra = extraToolEvents(manifest, codexOurs);
+    if (codexExtra.length > 0) {
+      warn(
+        'Codex (ツールイベント)',
+        `対象外の高頻度フックが残っています: ${codexExtra.join(', ')}。scripts\\update.ps1 を実行すると解除されます`,
       );
     }
   }
