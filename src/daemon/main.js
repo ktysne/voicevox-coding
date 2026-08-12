@@ -187,7 +187,10 @@ async function shutdown() {
     await player.dispose();
   } catch {}
 
-  server.close(() => process.exit(0));
+  server.close(async () => {
+    await log.close().catch(() => {});
+    process.exit(0);
+  });
   setTimeout(() => process.exit(0), 2000).unref();
 }
 

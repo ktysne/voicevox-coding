@@ -310,6 +310,8 @@ Claude Code は `async: true` で待たないが、Codex は同期実行なの�
 
 読み上げなかった理由（`event-disabled`、`tool-filtered`、`duplicate` など）を見たいときは、ログの詳細度を `debug` にする。
 
+ログは 2MB を超えると `daemon.log.1` へ退避され、直近 1 世代だけ残る。
+
 ### 設定ファイル
 
 `%USERPROFILE%\.voicevox-coding\config.json`
