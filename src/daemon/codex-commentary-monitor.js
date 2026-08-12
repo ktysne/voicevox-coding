@@ -343,9 +343,10 @@ export class CodexCommentaryMonitor extends EventEmitter {
       // 取りこぼしの保険。updatedAt が変わらない更新（仕様上あり得る）や、
       // ポーリング間で観測できなかった active 期間があっても無期限にスキップ
       // しないよう、一定周期で追跡を捨てて全スレッドを確認し直す
-      if (Date.now() - this.lastFullCheckAt >= this.fullRecheckMs) {
+      // 時刻同期や手動変更で壁時計が後退しても止まらないよう、単調時計で測る
+      if (performance.now() - this.lastFullCheckAt >= this.fullRecheckMs) {
         this.threadScanState.clear();
-        this.lastFullCheckAt = Date.now();
+        this.lastFullCheckAt = performance.now();
       }
       const currentThreadIds = new Set();
       for (const thread of threads) {
