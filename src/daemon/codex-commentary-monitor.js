@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events';
-import { spawn } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
 import readline from 'node:readline';
 
 const DEFAULT_POLL_MS = 2000;
@@ -33,7 +33,8 @@ export function extractCommentaryItems(turn) {
   });
 }
 
-class AppServerTransport extends EventEmitter {
+// テストから spawnFn を注入して dispose の終了経路を検証できるよう export する
+export class AppServerTransport extends EventEmitter {
   constructor({ spawnFn = spawn, timeoutMs = DEFAULT_TIMEOUT_MS, log } = {}) {
     super();
     this.spawnFn = spawnFn;
@@ -124,7 +125,26 @@ class AppServerTransport extends EventEmitter {
       reject(new Error('Codex app-server を終了しました'));
     }
     this.pending.clear();
-    if (child && !child.killed) child.kill();
+    if (!child || child.killed) return;
+    // app-server は stdin の EOF で自力終了する。Windows では cmd.exe 経由で
+    // 起動しており、child.kill() は cmd.exe しか終了させず実体の codex が
+    // 孤児化するため、まず EOF を届けて正規に終了させる。
+    try {
+      child.stdin?.end();
+      child.stdin?.destroy();
+    } catch {}
+    // EOF で終わらない場合の保険。Windows はプロセスツリーごと、それ以外は kill で落とす。
+    // cmd.exe は実体の終了を待って生きているので、ツリー終了は実体まで届く。
+    const forceKill = setTimeout(() => {
+      if (child.exitCode !== null || child.killed) return;
+      if (process.platform === 'win32' && child.pid) {
+        execFile('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true }, () => {});
+      } else {
+        child.kill();
+      }
+    }, 2000);
+    forceKill.unref?.();
+    child.once('exit', () => clearTimeout(forceKill));
   }
 }
 

@@ -1,7 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { CodexCommentaryMonitor, extractCommentaryItems, commentaryEnabled } from '../src/daemon/codex-commentary-monitor.js';
+import { spawn } from 'node:child_process';
+import {
+  CodexCommentaryMonitor, extractCommentaryItems, commentaryEnabled, AppServerTransport,
+} from '../src/daemon/codex-commentary-monitor.js';
 
 test('commentaryEnabled: 既定は有効、Codex ターゲットか Commentary イベントを明示的に無効化したときだけ false', () => {
   assert.equal(commentaryEnabled({}), true);
@@ -416,6 +419,32 @@ test('接続は生きていても走査の失敗が続いたら接続を取り�
   } finally {
     monitor.dispose();
   }
+});
+
+test('dispose は stdin の EOF で cmd 経由の実プロセスを終了させる', { skip: process.platform !== 'win32' }, async () => {
+  // Windows の codex は cmd.exe 経由で起動するため、child.kill() だけでは
+  // cmd.exe しか終了せず実体が孤児化する。dispose が stdin の EOF を実体まで
+  // 届かせることを、EOF まで stdin を読み続ける実プロセス (more) で検証する。
+  let child = null;
+  const transport = new AppServerTransport({
+    spawnFn: () => {
+      child = spawn(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'more'], {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+      return child;
+    },
+  });
+  transport.start();
+  await waitFor(() => child !== null);
+  const exited = new Promise((resolve) => child.once('exit', resolve));
+  transport.dispose();
+  // 強制終了のフォールバック (2 秒) を待たず、EOF の正規経路で終わること
+  const result = await Promise.race([
+    exited.then(() => 'exited'),
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 1500)),
+  ]);
+  assert.equal(result, 'exited');
 });
 
 test('停止による走査キャンセルの reject は警告しない', async () => {
