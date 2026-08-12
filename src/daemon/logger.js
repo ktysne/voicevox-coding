@@ -70,13 +70,18 @@ export class Logger {
    */
   #swapToBackup() {
     const dest = `${this.path}.1`;
+    const tmp = `${dest}.tmp`;
     try {
       fs.renameSync(this.path, dest);
+      // 以前のローテーションが一時退避 (.tmp) を消し損ねていたら、成功したついでに掃除する
+      // （残ると「直近 1 世代だけ残す」から外れた古い世代が居座り続ける）
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {}
       return;
     } catch {
       // 宛先が掴まれているか、現在のログが掴まれている。切り分けは下の手順に任せる
     }
-    const tmp = `${dest}.tmp`;
     try {
       fs.rmSync(tmp, { force: true });
     } catch {
