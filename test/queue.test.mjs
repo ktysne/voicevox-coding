@@ -123,7 +123,9 @@ function mockCacheDisk() {
     if (readdirFail.value) throw Object.assign(new Error(`EPERM: ${dir}`), { code: 'EPERM' });
     return [...disk.keys()].map((p) => path.basename(p));
   });
+  const statFail = new Set(); // EPERM で statSync に失敗させたいファイル
   mock.method(fs, 'statSync', (p) => {
+    if (statFail.has(p)) throw Object.assign(new Error(`EPERM: ${p}`), { code: 'EPERM' });
     if (!disk.has(p)) throw enoent(p);
     return { mtimeMs: disk.get(p) };
   });
@@ -151,7 +153,7 @@ function mockCacheDisk() {
     else finish();
   });
 
-  return { disk, unlinked, readdirCalls, utimesCalls, locked, utimesFail, readdirFail, utimesAsync, utimesPending };
+  return { disk, unlinked, readdirCalls, utimesCalls, locked, utimesFail, readdirFail, statFail, utimesAsync, utimesPending };
 }
 
 /** キャッシュ有効・上限指定ありの SpeechQueue を作る（#42 のキャッシュ索引テスト用）。 */
@@ -952,6 +954,72 @@ test('utimes に失敗したときは touch 時刻を確定せず、次のヒッ
   now += 1000;
   await enq(); // 確定後は間引きが効いて呼ばれない
   assert.equal(utimesCalls.length, 3);
+});
+
+test('初回走査の失敗が続いても合成と再生は止まらない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, readdirFail } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 2 });
+  const [fileA] = cacheFilesFor(['Aの発話。']);
+
+  // 走査が最初から失敗し続けていても、書き込み・整理の経路で例外にならず
+  // （null.size を参照しない）、WAV は書けて再生まで進む
+  readdirFail.value = true;
+  const errors = [];
+  queue.on('error', (err) => errors.push(err));
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.deepEqual(errors, []);
+  assert.ok(disk.has(fileA));
+  assert.ok(player.calls.some(([kind]) => kind === 'play'), '再生まで到達していない');
+});
+
+test('個別の statSync 失敗では走査全体を失敗扱いにし、既知のエントリを失わない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, statFail } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 2 });
+  const [fileA, fileB, fileC] = cacheFilesFor(['Aの発話。', 'Bの発話。', 'Cの発話。']);
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  now = 100;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 再同期の期限が来た状態で、A の stat だけが一時的に EPERM になる。
+  // これを「存在しない」と同一視すると A が索引から消え、追跡できなくなる
+  statFail.add(fileA);
+  now = 11 * 60 * 1000;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Cの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 走査全体が失敗扱いになり、既存の索引（A,B,C）に基づいて最古の A が整理される
+  assert.ok(!disk.has(fileA), '既知の最古 A が整理されるべき（索引から消えていない証拠）');
+  assert.ok(disk.has(fileB));
+  assert.ok(disk.has(fileC));
+});
+
+test('cacheMaxEntries が 0 のときは無制限扱いで、再生予定の WAV を消さない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, unlinked } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 0 });
+
+  for (const [i, text] of ['Aの発話。', 'Bの発話。', 'Cの発話。'].entries()) {
+    now = i * 100;
+    queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    await waitIdle(queue);
+  }
+
+  assert.deepEqual(unlinked, []);
+  assert.equal([...disk.keys()].filter((p) => p.endsWith('.wav')).length, 3);
 });
 
 test('cacheMaxEntries が数値でなくても全キャッシュを削除しない (#42)', async () => {

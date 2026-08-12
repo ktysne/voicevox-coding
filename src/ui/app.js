@@ -842,7 +842,7 @@ function renderEnginePanel() {
         { value: 'error', label: 'error' },
       ]),
       checkboxRow('合成結果をキャッシュする', 'daemon.cacheEnabled'),
-      numberRow('キャッシュ上限', 'daemon.cacheMaxEntries', { min: 0, max: 5000, hint: 'ファイル数' }),
+      numberRow('キャッシュ上限', 'daemon.cacheMaxEntries', { min: 0, max: 5000, hint: 'ファイル数。0 で無制限' }),
       checkboxRow('タスクトレイに常駐する', 'daemon.tray', '変更にはデーモンの再起動が必要です'),
     ),
   );

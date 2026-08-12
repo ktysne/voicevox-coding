@@ -36,14 +36,17 @@ const CACHE_INDEX_RESYNC_MS = 10 * 60 * 1000;
 const CACHE_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
 
 /**
- * キャッシュの保持数。手編集で数値以外や負数が入っても既定値へ倒す。
+ * キャッシュの保持数。手編集で数値以外が入っても既定値へ倒す。
  * NaN のまま比較すると size <= NaN が常に偽になり、整理が全エントリ
  * （直前に合成した再生予定の WAV を含む）を削除してしまう。
+ * 0 以下は「無制限」（maxChars などの 0 と同じ扱い）。「全部消す」と
+ * 解釈すると、書き込み直後の再生予定 WAV まで削除して再生に失敗する。
  */
 function cacheMaxEntriesOf(value) {
   const v = Number(value ?? 300);
   if (!Number.isFinite(v)) return 300;
-  return Math.max(0, Math.floor(v));
+  if (v <= 0) return Infinity;
+  return Math.floor(v);
 }
 
 /** 同一文の抑止時間（ミリ秒）。手編集で数値以外や極端な値が入っても読み上げを止めない。 */
@@ -390,8 +393,13 @@ export class SpeechQueue extends EventEmitter {
       const p = path.join(CACHE_DIR, f);
       try {
         map.set(p, fs.statSync(p).mtimeMs);
-      } catch {
-        // 列挙後に消えていたら無視
+      } catch (err) {
+        // 列挙後に消えていた（ENOENT）のは正常。それ以外（一時的な EPERM/EBUSY 等）を
+        // 「存在しない」と同一視すると、再同期で既知のエントリまで索引から消えるので、
+        // 走査全体を失敗扱いにして既存の索引を維持する
+        if (err?.code === 'ENOENT') continue;
+        this.log?.debug?.(`キャッシュの情報を取得できません (${p}): ${err.message}`);
+        return null;
       }
     }
     return map;
@@ -486,10 +494,13 @@ export class SpeechQueue extends EventEmitter {
       this.#resyncCacheIndex();
     }
 
+    // 走査の失敗が続いている間は索引が確定していない（null）。整理は諦めて
+    // 次の機会に任せる（合成した WAV 自体は書けているので、読み上げは止めない）
     const current = this.cacheIndex;
-    if (current.size <= maxEntries) return;
+    if (!current || current.size <= maxEntries) return;
 
     const entries = [...current.entries()].sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
+    let failed = 0;
     for (const [file] of entries) {
       if (current.size <= maxEntries) break;
       try {
@@ -502,7 +513,12 @@ export class SpeechQueue extends EventEmitter {
         // 実体が残ったまま追跡できなくなり、以後は正常なキャッシュばかりが
         // 削除され続ける。
         if (err?.code === 'ENOENT') current.delete(file);
+        else failed += 1;
       }
+    }
+    if (failed > 0) {
+      // 恒久的に失敗して上限を維持できない場合を無通知にしない（整理 1 回につき 1 行）
+      this.log?.debug?.(`キャッシュを ${failed} 件削除できませんでした（次回の整理で再試行します）`);
     }
   }
 
