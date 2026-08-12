@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   codexHomeMatches,
   missingToolEvents,
+  normalizeInstallManifest,
   normalizePathForComparison,
   parseCodexInitializeResult,
   resolveTargetPlan,
@@ -95,4 +96,18 @@ test('missingToolEvents: includeToolEvents が期待されているのに登録�
 test('missingToolEvents: includeToolEvents を期待していなければ登録の有無に関わらず差分は無い', () => {
   assert.deepEqual(missingToolEvents({ includeToolEvents: false }, []), []);
   assert.deepEqual(missingToolEvents(null, []), []);
+});
+
+test('normalizeInstallManifest: 正しい形式はそのまま返す', () => {
+  const m = { schemaVersion: 1, includeToolEvents: false, skipClaude: false, skipCodex: true, registerStartup: true };
+  assert.equal(normalizeInstallManifest(m), m);
+});
+
+test('normalizeInstallManifest: 型が不正なら無効扱い（null）にする', () => {
+  // "false" のような文字列 bool は truthy に化けて検査を誤って省略するため弾く
+  assert.equal(normalizeInstallManifest({ schemaVersion: 1, skipCodex: 'false' }), null);
+  assert.equal(normalizeInstallManifest({ schemaVersion: '1', skipCodex: false }), null);
+  assert.equal(normalizeInstallManifest({ skipCodex: false }), null); // schemaVersion 無し
+  assert.equal(normalizeInstallManifest(null), null);
+  assert.equal(normalizeInstallManifest('text'), null);
 });

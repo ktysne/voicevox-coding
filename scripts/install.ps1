@@ -44,9 +44,14 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     }
     $forward = @()
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-        if ($kv.Value -is [switch] -and -not $kv.Value.IsPresent) { continue }
-        $forward += "-$($kv.Key)"
-        if ($kv.Value -isnot [switch]) { $forward += [string]$kv.Value }
+        if ($kv.Value -is [switch]) {
+            # 明示的な -Name:$false も失わずに転送する（未指定と明示 false の区別を
+            # pwsh 側でも保つ。-File への -Name:$false 渡しは PowerShell が公式に対応）
+            $forward += "-$($kv.Key):`$$($kv.Value.IsPresent)"
+        } else {
+            $forward += "-$($kv.Key)"
+            $forward += [string]$kv.Value
+        }
     }
     & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forward
     exit $LASTEXITCODE
@@ -215,6 +220,41 @@ function Merge-Hook {
 }
 
 <#
+  対象イベントから我々のフックだけを取り除く。他のフックは残し、
+  空になったイベントキーは消す。-IncludeToolEvents を外した更新で、
+  以前に登録した高頻度フック（PreToolUse / PostToolUse）が
+  発火し続けないようにするために使う。
+#>
+function Remove-OurHook {
+    param(
+        [hashtable]$Root,
+        [string]$EventName
+    )
+    if (-not $Root.ContainsKey('hooks') -or $Root.hooks -isnot [hashtable]) { return $Root }
+    $hooks = $Root['hooks']
+    if (-not $hooks.ContainsKey($EventName)) { return $Root }
+
+    $kept = @()
+    foreach ($g in @($hooks[$EventName])) {
+        if ($null -eq $g) { continue }
+        $inner = @()
+        foreach ($hk in @($g.hooks)) {
+            if ($null -eq $hk) { continue }
+            if ([string]$hk.command -like '*hook-client.js*') { continue }
+            $inner += $hk
+        }
+        if ($inner.Count -gt 0) {
+            $ng = [ordered]@{}
+            if ($g.matcher) { $ng['matcher'] = $g.matcher }
+            $ng['hooks'] = $inner
+            $kept += $ng
+        }
+    }
+    if ($kept.Count -gt 0) { $hooks[$EventName] = @($kept) } else { $hooks.Remove($EventName) }
+    return $Root
+}
+
+<#
   「期待する導入構成」を manifest (install.json) に保存する。
   update.ps1 はこれを読み、明示指定されなかったオプションを引き継ぐ。
   doctor.mjs はこれを読み、導入形態に応じて検査の要否を判定する。
@@ -288,6 +328,13 @@ if (-not $SkipClaude) {
         $matcher = if ($ev -in @('PreToolUse', 'PostToolUse')) { '*' } else { $null }
         $settings = Merge-Hook -Root $settings -EventName $ev -Command $cmd -Matcher $matcher -Async -TimeoutSec 10
     }
+    if (-not $IncludeToolEvents) {
+        # 以前の導入で登録したツールイベントが残っていると高頻度で発火し続ける。
+        # 今回の指定に合わせて取り除く（他のフックには触れない）
+        foreach ($ev in @('PreToolUse', 'PostToolUse')) {
+            $settings = Remove-OurHook -Root $settings -EventName $ev
+        }
+    }
 
     # 書き込む内容が既存ファイルと完全一致するなら、バックアップも書き込みも行わない。
     # これにより定例の update ではバックアップ世代がそもそも増えない。
@@ -321,6 +368,11 @@ if (-not $SkipCodex) {
         $matcher = if ($ev -in @('PreToolUse', 'PostToolUse')) { '*' } else { $null }
         $timeout = if ($ev -eq 'SessionEnd') { 3 } else { 5 }
         $codexHooks = Merge-Hook -Root $codexHooks -EventName $ev -Command $cmd -Matcher $matcher -TimeoutSec $timeout
+    }
+    if (-not $IncludeToolEvents) {
+        foreach ($ev in @('PreToolUse', 'PostToolUse')) {
+            $codexHooks = Remove-OurHook -Root $codexHooks -EventName $ev
+        }
     }
 
     # 書き込む内容が既存ファイルと完全一致するなら、バックアップも書き込みも行わない。

@@ -57,9 +57,14 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     }
     $forward = @()
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-        if ($kv.Value -is [switch] -and -not $kv.Value.IsPresent) { continue }
-        $forward += "-$($kv.Key)"
-        if ($kv.Value -isnot [switch]) { $forward += [string]$kv.Value }
+        if ($kv.Value -is [switch]) {
+            # 明示的な -Name:$false も失わずに転送する（未指定と明示 false の区別を
+            # pwsh 側でも保つ。-File への -Name:$false 渡しは PowerShell が公式に対応）
+            $forward += "-$($kv.Key):`$$($kv.Value.IsPresent)"
+        } else {
+            $forward += "-$($kv.Key)"
+            $forward += [string]$kv.Value
+        }
     }
     & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forward
     exit $LASTEXITCODE
@@ -129,20 +134,35 @@ function Read-InstallManifest([string]$path) {
     try {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
         if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        return $raw | ConvertFrom-Json
+        $m = $raw | ConvertFrom-Json
+        # 形式が不正なら無効扱いにして現状推定へ戻す。"false" のような文字列は
+        # bool として true 相当に化けるので、型まで確かめる
+        if (-not (Get-Member -InputObject $m -Name 'schemaVersion' -ErrorAction SilentlyContinue)) { return $null }
+        if ($m.schemaVersion -isnot [int] -and $m.schemaVersion -isnot [long]) { return $null }
+        foreach ($key in 'includeToolEvents', 'skipClaude', 'skipCodex', 'registerStartup') {
+            if (Get-Member -InputObject $m -Name $key -ErrorAction SilentlyContinue) {
+                if ($m.$key -isnot [bool]) { return $null }
+            }
+        }
+        return $m
     } catch {
         return $null
     }
 }
 
-function Read-JsonFileSafe([string]$path) {
+<#
+  設定ファイルを読む。存在しない場合は $null（未導入として扱ってよい）。
+  存在するのに読めない・JSON として壊れている場合は例外を投げて更新を中断する。
+  壊れた設定を「フック 0 件 = 意図的な Skip」と誤推定して manifest に固定しないため。
+#>
+function Read-JsonFileStrict([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
     try {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
         if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
         return $raw | ConvertFrom-Json
     } catch {
-        return $null
+        throw "設定ファイルを読み取れないため更新を中断しました（壊れている可能性があります。修復するか退避してから再実行してください）: $path"
     }
 }
 
@@ -176,8 +196,8 @@ function Get-BackfillEstimate {
     $codexDir       = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
     $codexHooksPath = Join-Path $codexDir 'hooks.json'
 
-    $claudeEvents = Get-OurHookEvents (Read-JsonFileSafe $settingsPath)
-    $codexEvents  = Get-OurHookEvents (Read-JsonFileSafe $codexHooksPath)
+    $claudeEvents = Get-OurHookEvents (Read-JsonFileStrict $settingsPath)
+    $codexEvents  = Get-OurHookEvents (Read-JsonFileStrict $codexHooksPath)
 
     $toolEvents = @('PreToolUse', 'PostToolUse')
     $claudeHasToolEvents = @($claudeEvents | Where-Object { $toolEvents -contains $_ }).Count -gt 0

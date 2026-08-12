@@ -126,11 +126,25 @@ export function parseCodexInitializeResult(message) {
  * @param {object|null} manifest install.json の中身（無ければ null）
  * @param {object} opts
  * @param {'skipClaude'|'skipCodex'} opts.skipKey manifest 内でこの対象を指すキー
- * @param {boolean} opts.hooksExist 対象の設定ファイルに我々のフックが登録されているか
+ * @param {boolean} opts.hooksExist 対象の設定ファイルが存在するか
  * @param {boolean} [opts.cliAvailable] CLI が PATH にあるか（Codex の移行判定にのみ使う）
  * @param {boolean} [opts.migrateWhenMissing] manifest が無いときに未導入への移行判定を行うか
  * @returns {{ mode: 'skip' | 'check' | 'warn-uninstalled' }}
  */
+/**
+ * install.json の中身を検証して返す。形式が不正なら null（manifest なしとして扱う）。
+ * "false" のような文字列の bool は truthy に化けて検査や登録を誤って省略するため、
+ * schemaVersion が整数であることと、各オプションが本物の boolean であることを確かめる。
+ */
+export function normalizeInstallManifest(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  if (!Number.isInteger(obj.schemaVersion) || obj.schemaVersion < 1) return null;
+  for (const key of ['includeToolEvents', 'skipClaude', 'skipCodex', 'registerStartup']) {
+    if (key in obj && typeof obj[key] !== 'boolean') return null;
+  }
+  return obj;
+}
+
 export function resolveTargetPlan(manifest, opts = {}) {
   const { skipKey, hooksExist, cliAvailable, migrateWhenMissing = false } = opts;
 
@@ -236,8 +250,10 @@ async function main() {
   else warn('設定ファイル', `${CONFIG_PATH} がありません（デーモン初回起動時に作られます）`);
 
   // --- 導入構成（install.ps1 が保存した期待構成） ---
-  const manifest = readJson(MANIFEST_PATH);
+  const rawManifest = readJson(MANIFEST_PATH);
+  const manifest = normalizeInstallManifest(rawManifest);
   if (manifest) ok('導入構成', `${MANIFEST_PATH} を期待構成として使用します`);
+  else if (rawManifest) warn('導入構成', `${MANIFEST_PATH} の形式が不正なため無視します（scripts\\install.ps1 の再実行で作り直せます）`);
 
   const port = config?.daemon?.port ?? 7591;
   const baseUrl = config?.engine?.baseUrl ?? 'http://127.0.0.1:50021';
@@ -273,10 +289,14 @@ async function main() {
   // --- Claude Code ---
   const claude = readJson(CLAUDE_SETTINGS);
   const claudeOurs = claude ? countOurHooks(claude) : [];
-  const claudePlan = resolveTargetPlan(manifest, { skipKey: 'skipClaude', hooksExist: claudeOurs.length > 0 });
+  const claudePlan = resolveTargetPlan(manifest, { skipKey: 'skipClaude', hooksExist: fs.existsSync(CLAUDE_SETTINGS) });
 
   if (claudePlan.mode === 'skip') {
     ok('Claude Code', '対象外（導入時に -SkipClaude を指定）');
+    // 対象外なのにフックが残っていると読み上げが動き続ける。盲点にしない
+    if (claudeOurs.length > 0) {
+      warn('Claude Code', `対象外の設定ですがフックが ${claudeOurs.length} 件残っています。解除するには scripts\\uninstall.ps1 を実行してください`);
+    }
   } else if (!claude) {
     warn('Claude Code', `${CLAUDE_SETTINGS} を読めません`);
   } else {
@@ -296,18 +316,22 @@ async function main() {
   // --- Codex ---
   // manifest が無い（旧導入）場合の「未導入かどうか」の判定は、hooks.json が無いときに
   // 限って CLI の有無を確認する。フックが既にあるなら、CLI 探索をするまでもなく検査対象。
-  const codexRoot = manifest?.skipCodex ? null : readJson(CODEX_HOOKS);
+  const codexRoot = readJson(CODEX_HOOKS);
   const codexOurs = codexRoot ? countOurHooks(codexRoot) : [];
-  const codexCliAvailable = (!manifest && codexOurs.length === 0) ? isCodexCliAvailable() : undefined;
+  const codexHooksFileExists = fs.existsSync(CODEX_HOOKS);
+  const codexCliAvailable = (!manifest && !codexHooksFileExists) ? isCodexCliAvailable() : undefined;
   const codexPlan = resolveTargetPlan(manifest, {
     skipKey: 'skipCodex',
-    hooksExist: codexOurs.length > 0,
+    hooksExist: codexHooksFileExists,
     cliAvailable: codexCliAvailable,
     migrateWhenMissing: true,
   });
 
   if (codexPlan.mode === 'skip') {
     ok('Codex', '対象外（導入時に -SkipCodex を指定）');
+    if (codexOurs.length > 0) {
+      warn('Codex', `対象外の設定ですがフックが ${codexOurs.length} 件残っています。解除するには scripts\\uninstall.ps1 を実行してください`);
+    }
   } else if (codexPlan.mode === 'warn-uninstalled') {
     warn('Codex', '未導入のようです（使う場合は scripts\\install.ps1 を実行してください）');
   } else if (!codexRoot) {

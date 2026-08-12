@@ -27,9 +27,14 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     }
     $forward = @()
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-        if ($kv.Value -is [switch] -and -not $kv.Value.IsPresent) { continue }
-        $forward += "-$($kv.Key)"
-        if ($kv.Value -isnot [switch]) { $forward += [string]$kv.Value }
+        if ($kv.Value -is [switch]) {
+            # 明示的な -Name:$false も失わずに転送する（未指定と明示 false の区別を
+            # pwsh 側でも保つ。-File への -Name:$false 渡しは PowerShell が公式に対応）
+            $forward += "-$($kv.Key):`$$($kv.Value.IsPresent)"
+        } else {
+            $forward += "-$($kv.Key)"
+            $forward += [string]$kv.Value
+        }
     }
     & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forward
     exit $LASTEXITCODE
