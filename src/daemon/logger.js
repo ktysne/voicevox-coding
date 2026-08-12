@@ -19,6 +19,16 @@ const MAX_ROTATE_ATTEMPTS = 3;
 // （ログビューアが掴んだまま等）、1 行書くたびに end → rename → 再オープンの
 // 一巡が走ってしまう。
 const ROTATE_RETRY_DELAY_MS = 60_000;
+// stream が壊れたあとに開き直しを試すまでの間隔。毎行 statSync + createWriteStream を
+// 繰り返さないための抑えで、一時的なアクセス拒否が解消すれば自動で復旧する
+// （従来の appendFileSync は毎行が再試行を兼ねていた。その復旧性を保つ）。
+const STREAM_REOPEN_DELAY_MS = 30_000;
+// ローテーション中に溜める行数の上限。ストレージ障害でローテーションが固着しても
+// メモリが増え続けないよう、あふれたら古い行から捨てる（メモリ側のログには残る）。
+const MAX_PENDING_LINES = 1000;
+// end の flush 完了待ちの上限。ストレージ障害で close イベントが来ない場合に
+// ローテーションや終了処理を固着させない。
+const STREAM_END_TIMEOUT_MS = 5000;
 
 export class Logger {
   constructor(getLevel = () => 'info', { path = LOG_PATH, maxBytes = MAX_FILE_BYTES } = {}) {
@@ -34,18 +44,52 @@ export class Logger {
     this.pending = [];
     this.closed = false;
     this.retryRotateAt = 0;
+    this.reopenAt = 0;
+    this.streamFailed = false;
     this._closePromise = null;
 
     // 起動時にすでに上限を超えていたら、従来どおり開く前に先にローテーションしておく
     try {
       if (fs.existsSync(this.path) && fs.statSync(this.path).size > this.maxBytes) {
         try {
-          fs.rmSync(`${this.path}.1`, { force: true });
-          fs.renameSync(this.path, `${this.path}.1`);
+          this.#swapToBackup();
         } catch {}
       }
     } catch {}
     this.#open();
+  }
+
+  /**
+   * 現在のログを .1 へ退避する。renameSync は宛先があっても置き換えるので、
+   * 通常は 1 回の rename で済む。宛先 (.1) 側が掴まれて置き換えに失敗した場合だけ、
+   * .1 を一時名へどかしてから移す。現在のログ側が掴まれて移せなかった場合にも
+   * 既存の退避世代を失わないよう、.1 の削除はせず rename と復元で行う。
+   */
+  #swapToBackup() {
+    const dest = `${this.path}.1`;
+    try {
+      fs.renameSync(this.path, dest);
+      return;
+    } catch {
+      // 宛先が掴まれているか、現在のログが掴まれている。切り分けは下の手順に任せる
+    }
+    const tmp = `${dest}.tmp`;
+    let moved = false;
+    try {
+      fs.rmSync(tmp, { force: true });
+      fs.renameSync(dest, tmp);
+      moved = true;
+      fs.renameSync(this.path, dest);
+      fs.rmSync(tmp, { force: true });
+    } catch (err) {
+      // 現在のログを移せなかった。どかした .1 を元へ戻して世代を守る
+      if (moved) {
+        try {
+          fs.renameSync(tmp, dest);
+        } catch {}
+      }
+      throw err;
+    }
   }
 
   /** 書き込み用ストリームを（再）オープンする。失敗しても例外は投げない。 */
@@ -59,14 +103,31 @@ export class Logger {
       }
       this.bytes = size;
       const stream = fs.createWriteStream(this.path, { flags: 'a' });
-      stream.on('error', () => {
-        // 書き込みに失敗した。ストリームを捨ててメモリのみのログに落とす。
-        // 再オープンは次のローテーション契機（バイトカウンタが上限を超えたとき）に任せる。
-        this.stream = null;
+      stream.on('error', (err) => {
+        // 古い世代のストリームの遅延エラーで、開き直した新しいストリームを捨てない
+        if (this.stream === stream) this.#streamBroken(err);
       });
       this.stream = stream;
-    } catch {
-      this.stream = null;
+      if (this.streamFailed) {
+        this.streamFailed = false;
+        this.info('ログファイルへの書き込みを再開しました');
+      }
+    } catch (err) {
+      this.#streamBroken(err);
+    }
+  }
+
+  /**
+   * stream が使えなくなった。メモリのみのログに落とし、間を置いてから開き直す。
+   * 黙ってファイルログを捨て続けないよう、落ちたことを 1 回だけ warn に残す
+   * （復旧したら #open が再開を知らせる）。
+   */
+  #streamBroken(err) {
+    this.stream = null;
+    this.reopenAt = Date.now() + STREAM_REOPEN_DELAY_MS;
+    if (!this.streamFailed) {
+      this.streamFailed = true;
+      this.warn(`ログファイルへ書き込めません（しばらくしてから開き直します）: ${err.message}`);
     }
   }
 
@@ -88,8 +149,15 @@ export class Logger {
   /** ファイルへの実書き込み。ローテーション中は pending に溜めるだけにする。 */
   #writeToFile(line) {
     if (this.rotating) {
+      // 障害でローテーションが長引いてもメモリが増え続けないよう、古い行から捨てる
+      // （メモリ側のログには残っている）
+      if (this.pending.length >= MAX_PENDING_LINES) this.pending.shift();
       this.pending.push(line);
       return;
+    }
+    // stream が壊れていたら、間を置いてから開き直す
+    if (!this.stream && !this.closed && Date.now() >= this.reopenAt) {
+      this.#open();
     }
     if (this.stream) {
       try {
@@ -97,12 +165,11 @@ export class Logger {
         // ログの量はもともと少なく、あふれても Node 内部バッファに乗るだけ。
         // ここで待つと、ログ出力のために本体の処理を止めることになってしまう。
         this.stream.write(line, 'utf8');
-      } catch {
-        this.stream = null;
+      } catch (err) {
+        this.#streamBroken(err);
       }
     }
-    // stream が無い間（エラー後など）も試行バイト数としては数えておく。
-    // これが積み重なって上限を超えると #rotate() 経由で再オープンを試みる。
+    // stream が無い間（エラー後など）も試行バイト数としては数えておく
     this.bytes += Buffer.byteLength(line, 'utf8');
     // close() 後は回さない（閉じたはずのストリームを開き直さない）。
     // 直前のローテーションが失敗している間は、間を置いてから試し直す。
@@ -119,12 +186,27 @@ export class Logger {
       if (this.stream) {
         try {
           this.stream.write(line, 'utf8');
-        } catch {
-          this.stream = null;
+        } catch (err) {
+          this.#streamBroken(err);
         }
       }
       this.bytes += Buffer.byteLength(line, 'utf8');
     }
+  }
+
+  /** stream を end し、flush 完了を待つ。障害で close が来ない場合に固着しないよう上限付き。 */
+  #endStream(stream) {
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, STREAM_END_TIMEOUT_MS);
+      timer.unref?.();
+      const done = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      stream.once('close', done);
+      stream.once('error', done);
+      stream.end();
+    });
   }
 
   /**
@@ -140,20 +222,13 @@ export class Logger {
       for (let attempt = 0; attempt < MAX_ROTATE_ATTEMPTS && this.bytes > this.maxBytes; attempt++) {
         const oldStream = this.stream;
         this.stream = null;
-        if (oldStream) {
-          await new Promise((resolve) => {
-            oldStream.once('close', resolve);
-            oldStream.once('error', resolve);
-            oldStream.end();
-          });
-        }
+        if (oldStream) await this.#endStream(oldStream);
         try {
-          fs.rmSync(`${this.path}.1`, { force: true });
-          fs.renameSync(this.path, `${this.path}.1`);
+          this.#swapToBackup();
           this.retryRotateAt = 0;
           failure = null;
         } catch (err) {
-          // ログビューアが掴んでいる等で rename に失敗しても継続する
+          // ログビューアが掴んでいる等で退避に失敗しても継続する
           failure = err;
         }
         this.#open();
@@ -202,10 +277,6 @@ export class Logger {
     const stream = this.stream;
     this.stream = null;
     if (!stream) return;
-    await new Promise((resolve) => {
-      stream.once('close', resolve);
-      stream.once('error', resolve);
-      stream.end();
-    });
+    await this.#endStream(stream);
   }
 }

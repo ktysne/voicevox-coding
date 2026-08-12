@@ -112,16 +112,19 @@ const server = createServer({
   token: apiToken,
 });
 
-server.on('error', (err) => {
+server.on('error', async (err) => {
+  // ログは非同期書き込みなので、exit の前に flush を待たないと診断ログが残らない
   if (err.code === 'EADDRINUSE') {
     log.error(`ポート ${port} は使用中です。デーモンが既に起動している可能性があります。`);
     if (shouldOpen) {
       // 既に起動しているなら、コンソールを開くだけで用は足りる
       spawn('cmd.exe', ['/c', 'start', '', `http://127.0.0.1:${port}/`], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
     }
+    await log.close().catch(() => {});
     process.exit(1);
   }
   log.error(`サーバーエラー: ${err.message}`);
+  await log.close().catch(() => {});
   process.exit(1);
 });
 
@@ -187,10 +190,11 @@ async function shutdown() {
     await player.dispose();
   } catch {}
 
-  server.close(async () => {
-    await log.close().catch(() => {});
-    process.exit(0);
-  });
+  // SSE 接続が残っていると server.close のコールバックは呼ばれないことがあり、
+  // 2 秒のフォールバック exit が先に走って未 flush のログが失われる。
+  // ここまでで後始末のログはすべて出ているので、flush はこの時点で確実に待つ。
+  await log.close().catch(() => {});
+  server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 2000).unref();
 }
 

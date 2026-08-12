@@ -93,6 +93,31 @@ test('ローテーションを跨いで大量に書いても行が失われな�
   assert.deepEqual(found, expected);
 });
 
+test('stream のエラー後はメモリのみに落ち、間を置いて開き直すと復旧する', async () => {
+  const logPath = tmpLogPath();
+  const logger = new Logger(() => 'info', { path: logPath });
+  logger.info('before-failure');
+
+  // 書き込み障害を模擬する。ストリームは捨てられ、warn が 1 回だけ残る
+  logger.stream.emit('error', new Error('模擬障害'));
+  logger.info('during-failure');
+  const warns = logger.recent(100).filter((l) => l.message.includes('ログファイルへ書き込めません'));
+  assert.equal(warns.length, 1);
+
+  // 開き直しの待ち時間を省略して復旧させる
+  logger.reopenAt = 0;
+  logger.info('after-recovery');
+  await logger.close();
+
+  const content = readIfExists(logPath);
+  assert.match(content, /after-recovery/);
+  // 障害中の行はファイルには無いが、メモリ側には残っている
+  assert.doesNotMatch(content, /during-failure/);
+  assert.ok(logger.recent(100).some((l) => l.message === 'during-failure'));
+  // 復旧したことも知らせている
+  assert.ok(logger.recent(100).some((l) => l.message.includes('書き込みを再開しました')));
+});
+
 test('close() は二重に呼んでも例外にならない', async () => {
   const logPath = tmpLogPath();
   const logger = new Logger(() => 'info', { path: logPath });
