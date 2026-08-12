@@ -119,7 +119,7 @@ export class Logger {
         stream.once('open', () => {
           if (this.stream !== stream || !this.streamFailed) return;
           this.streamFailed = false;
-          this.info('ログファイルへの書き込みを再開しました');
+          this.#emit('info', 'ログファイルへの書き込みを再開しました');
         });
       }
       this.stream = stream;
@@ -138,13 +138,22 @@ export class Logger {
     this.reopenAt = Date.now() + STREAM_REOPEN_DELAY_MS;
     if (!this.streamFailed) {
       this.streamFailed = true;
-      this.warn(`ログファイルへ書き込めません（しばらくしてから開き直します）: ${err.message}`);
+      this.#emit('warn', `ログファイルへ書き込めません（しばらくしてから開き直します）: ${err.message}`);
     }
   }
 
   #write(level, message) {
     const threshold = LEVELS[this.getLevel()] ?? LEVELS.info;
     if ((LEVELS[level] ?? 20) < threshold) return;
+    this.#emit(level, message);
+  }
+
+  /**
+   * レベルの閾値を通さずに記録する。ロガー自身の健全性通知
+   * （書き込み不能・flush 失敗・ローテーション失敗・復旧）はこちらを使う。
+   * logLevel を error に絞った設定でも「黙って捨て続けない」を守るため。
+   */
+  #emit(level, message) {
     const entry = { ts: new Date().toISOString(), level, message: String(message) };
     this.lines.push(entry);
     if (this.lines.length > MAX_MEMORY_LINES) this.lines.splice(0, this.lines.length - MAX_MEMORY_LINES);
@@ -221,7 +230,7 @@ export class Logger {
         }
         if (kind !== 'close') {
           // flush の失敗・打ち切りを無通知にしない（メモリ側のログには必ず残る）
-          this.warn(`ログの flush を完了できませんでした: ${kind === 'error' ? err?.message : 'タイムアウト'}`);
+          this.#emit('warn', `ログの flush を完了できませんでした: ${kind === 'error' ? err?.message : 'タイムアウト'}`);
         }
         resolve();
       };
@@ -266,7 +275,7 @@ export class Logger {
       // 黙り続けないよう memory ログへ 1 行だけ残す
       // （rotating を下ろした後なので、この warn は pending に滞留しない）。
       this.retryRotateAt = Date.now() + ROTATE_RETRY_DELAY_MS;
-      this.warn(`ログのローテーションに失敗しました（しばらくしてから再試行します）: ${failure.message}`);
+      this.#emit('warn', `ログのローテーションに失敗しました（しばらくしてから再試行します）: ${failure.message}`);
     }
   }
 

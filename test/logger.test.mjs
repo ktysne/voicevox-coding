@@ -18,6 +18,15 @@ function readIfExists(p) {
   return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
 }
 
+/** 固定の sleep は低速な環境で不安定になるので、条件の成立を期限付きで待つ。 */
+async function waitFor(cond, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error('waitFor: 条件が時間内に成立しませんでした');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
 test('書き込んだ行は close() 後にファイルへ flush されている', async () => {
   const logPath = tmpLogPath();
   const logger = new Logger(() => 'info', { path: logPath });
@@ -107,8 +116,8 @@ test('stream のエラー後はメモリのみに落ち、間を置いて開き�
   // 開き直しの待ち時間を省略して復旧させる
   logger.reopenAt = 0;
   logger.info('after-recovery');
-  // 復旧の通知は fd が実際に開けた 'open' の後に出るので、少し待ってから閉じる
-  await new Promise((resolve) => setTimeout(resolve, 50));
+  // 復旧の通知は fd が実際に開けた 'open' の後に出るので、通知が出るまで待ってから閉じる
+  await waitFor(() => !logger.streamFailed);
   await logger.close();
 
   const content = readIfExists(logPath);
@@ -131,11 +140,23 @@ test('復旧を起こした行がローテーションを跨いでも失われ�
   // 復旧通知の再入で this.stream が消え、この行が落ちる回帰があった。
   logger.reopenAt = 0;
   logger.info('x'.repeat(100));
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await waitFor(() => fs.existsSync(`${logPath}.1`) && !logger.rotating);
   await logger.close();
 
   const combined = readIfExists(logPath) + readIfExists(`${logPath}.1`);
   assert.match(combined, /x{100}/);
+});
+
+test('logLevel を error に絞ってもログ基盤自身の障害通知は残る', async () => {
+  const logPath = tmpLogPath();
+  const logger = new Logger(() => 'error', { path: logPath });
+  logger.warn('通常の warn は閾値で消える');
+  logger.stream.emit('error', new Error('模擬障害'));
+
+  const messages = logger.recent(100).map((l) => l.message);
+  assert.ok(!messages.includes('通常の warn は閾値で消える'));
+  assert.equal(messages.filter((m) => m.includes('ログファイルへ書き込めません')).length, 1);
+  await logger.close();
 });
 
 test('close() は二重に呼んでも例外にならない', async () => {
