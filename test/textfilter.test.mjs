@@ -348,6 +348,11 @@ test('小文字混じりの識別子の大文字部分は変換しない（#50�
   assert.match(text, /error_CODE_X/);
 });
 
+test('markdownSymbols を無効にすると強調の _ は残したまま定数名だけ変換する（#50）', () => {
+  const { text } = filterText('_MOVEFILE_REPLACE_EXISTING_ を指定します。', { ...F, markdownSymbols: false });
+  assert.match(text, /_movefile replace existing_/);
+});
+
 test('表の行は落ちる', () => {
   const { text } = filterText('前\n| 項目 | 値 |\n| --- | --- |\n| a | b |\n後', F);
   assert.doesNotMatch(text, /項目/);

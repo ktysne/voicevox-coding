@@ -427,10 +427,14 @@ const CONSTANT_CASE = /(?<![0-9A-Za-z_])_{0,2}[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+_{0,2
 function applyConstantCase(text, mode) {
   if (mode !== 'split') return text;
   const { guarded, parked } = parkUrls(text);
-  const replaced = guarded.replace(CONSTANT_CASE, (m) => (
-    // 語頭・語尾に付いてきた強調記号の `_` は読み上げ対象ではないので外す
-    m.replace(/^_+|_+$/g, '').toLowerCase().replace(/_/g, ' ')
-  ));
+  const replaced = guarded.replace(CONSTANT_CASE, (m) => {
+    // 語頭・語尾に付いてきた強調記号の `_` は変換の対象から外すが、ここでは消さない。
+    // 消すかどうかは「Markdown 記号を外す」(markdownSymbols) の設定に任せる。
+    const lead = (m.match(/^_+/) ?? [''])[0];
+    const trail = (m.match(/_+$/) ?? [''])[0];
+    const core = m.slice(lead.length, m.length - trail.length);
+    return lead + core.toLowerCase().replace(/_/g, ' ') + trail;
+  });
   return unparkUrls(replaced, parked);
 }
 
