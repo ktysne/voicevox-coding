@@ -36,6 +36,8 @@ function defaultTextFilter() {
     codeBlockPlaceholder: 'コードは省略',
     // インラインコード: read / strip（記号だけ外す） / omit
     inlineCode: 'strip',
+    // 大文字_連結の定数名: split（単語に分けて読む） / read（そのまま）
+    constantCase: 'split',
     // URL: read / placeholder / omit
     url: 'placeholder',
     urlPlaceholder: 'リンク',

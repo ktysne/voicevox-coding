@@ -663,6 +663,12 @@ function renderTextFilterCard(base) {
           { value: 'omit', label: '飛ばす' },
           { value: 'read', label: 'フルパスを読む' },
         ]),
+        selectRow('定数名（FOO_BAR 形式）', `${f}.constantCase`, [
+          { value: 'split', label: '単語に分けて読む' },
+          // 「そのまま読む」とは書かない。_ を消すかどうかは「Markdown 記号を外す」が
+          // 決めるので、この設定が保証するのは「単語に分けない」ことだけ。
+          { value: 'read', label: '単語に分けない' },
+        ]),
         selectRow('表', `${f}.table`, [
           { value: 'omit', label: '飛ばす' },
           { value: 'read', label: '中身を読む' },

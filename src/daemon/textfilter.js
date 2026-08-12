@@ -275,6 +275,49 @@ const PARK_OPEN = '§';
 const PARK_CLOSE = '§';
 const PARK_RE = /§(\d+)§/g;
 
+// URL の末尾に付きうる Markdown の強調・装飾記号のひとまとまり
+// （`*` 1〜3 個、`_` 1〜3 個、`~~`、バッククォート）。
+const EMPHASIS_TRAIL = /(\*{1,3}|_{1,3}|~~|`)$/;
+
+/**
+ * text 中の URL を §n§ の目印へ一時退避する。復元は unparkUrls で行う。
+ * URL 走査 (scanUrlLength) は空白と日本語句読点まで進むため、URL の直後に
+ * 隙間なく続く Markdown の装飾記号（`**強調**` の閉じなど）を URL の一部として
+ * 巻き込んでしまう。巻き込んだまま退避すると装飾記号が記号除去を免れて本文へ
+ * 残るので、装飾記号は退避せず本文側へ置いていく（従来どおり記号除去で消える）。
+ * ただし装飾とみなすのは、同じ記号列が URL の直前でも開いている
+ * （`**URL**` や `***URL***` のように囲まれている）ときだけ。単独の `URL_` の
+ * 末尾 `_` は装飾か URL の一部かを判別できないため、URL の一部として保持する。
+ * 既知の限界：`**_URL_**` のように種類の異なる装飾の入れ子は分離できず、
+ * URL の一部として読まれる（囲みの内外で記号が対応しないため）。
+ */
+function parkUrls(text) {
+  const parked = [];
+  const matches = findUrls(text);
+  if (!matches.length) return { guarded: text, parked };
+  let out = '';
+  let last = 0;
+  for (const m of matches) {
+    let core = m.text;
+    let trail = (core.match(EMPHASIS_TRAIL) ?? [''])[0];
+    if (trail && core.length > trail.length
+      && m.start >= trail.length && text.slice(m.start - trail.length, m.start) === trail) {
+      core = core.slice(0, -trail.length);
+    } else {
+      trail = '';
+    }
+    parked.push(core);
+    out += text.slice(last, m.start) + PARK_OPEN + (parked.length - 1) + PARK_CLOSE + trail;
+    last = m.end;
+  }
+  return { guarded: out + text.slice(last), parked };
+}
+
+/** parkUrls が置いた目印を元の URL に戻す。 */
+function unparkUrls(text, parked) {
+  return text.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
+}
+
 const SENTENCE_END = /(?<=[。．.!?！？])\s*/;
 
 // 箇条書き項目の切れ目を、整形後のテキスト上へ残しておくための内部マーカー。
@@ -385,6 +428,35 @@ function applyFilePaths(text, mode) {
   return replaced.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
 }
 
+// SCREAMING_SNAKE_CASE の定数名。`_` 連結のトークンだけを対象にする。
+// HTTP や JSON のような単独の大文字語はスペルアウトが正しい読みであることが多いため、
+// 意図的に対象外にする。
+// `_FOO_BAR_` のような `_` による Markdown 強調に接する形は、`\b` だと先行の `_` が
+// 語文字扱いになって検出できない。そこで語頭・語尾の `_`（強調記号、`___` まで）ごと
+// 一致させ、変換時に外す。lookbehind / lookahead からは `_` も除外しているので、
+// error_CODE のような小文字混じりの識別子の一部にまでは一致しない。
+const CONSTANT_CASE = /(?<![0-9A-Za-z_])_{0,3}[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+_{0,3}(?![0-9A-Za-z_])/g;
+
+/**
+ * MOVEFILE_REPLACE_EXISTING のような定数名を「movefile replace existing」のように
+ * 小文字化・空白区切りへ変換する。1 文字ずつのスペル読みになって聞き取れないのを避ける。
+ * URL をそのまま読む設定 (url: 'read') では本文中に URL が残るため、URL パス中の
+ * 大文字（https://example.com/API_DOC 等）を巻き込まないよう一時的に退避してから変換する。
+ */
+function applyConstantCase(text, mode) {
+  if (mode !== 'split') return text;
+  const { guarded, parked } = parkUrls(text);
+  const replaced = guarded.replace(CONSTANT_CASE, (m) => {
+    // 語頭・語尾に付いてきた強調記号の `_` は変換の対象から外すが、ここでは消さない。
+    // 消すかどうかは「Markdown 記号を外す」(markdownSymbols) の設定に任せる。
+    const lead = (m.match(/^_+/) ?? [''])[0];
+    const trail = (m.match(/_+$/) ?? [''])[0];
+    const core = m.slice(lead.length, m.length - trail.length);
+    return lead + core.toLowerCase().replace(/_/g, ' ') + trail;
+  });
+  return unparkUrls(replaced, parked);
+}
+
 function applyTables(text, mode) {
   if (mode === 'read') {
     // 読む場合でも区切り行だけは意味がないので落とす
@@ -435,6 +507,14 @@ export function filterText(input, f = {}) {
   t = applyFilePaths(t, f.filePath ?? 'basename');
   t = applyInlineCode(t, f.inlineCode ?? 'strip');
 
+  // Markdown 記号の除去（下の markdownSymbols）は `_` を先に消してしまい、
+  // FOO_BAR の単語の区切りが失われて検出できなくなる。必ずそれより前に行う。
+  // URL・ファイルパスの処理より後に置くのは、短縮・置換後に残ったテキストにだけ
+  // 掛けるようにするため。
+  // 既知の限界：filePath: 'read'（フルパスを読む設定）ではパス中の FOO_BAR も
+  // 変換対象になる。読み上げの聞き取りやすさを優先して許容する。
+  t = applyConstantCase(t, f.constantCase ?? 'split');
+
   if (f.headings) t = t.replace(HEADING_LINE, ' ');
   else t = t.replace(HEADING_MARK, '');
 
@@ -456,8 +536,15 @@ export function filterText(input, f = {}) {
   t = t.replace(HR, ' ').replace(BLOCKQUOTE, '');
 
   if (f.markdownSymbols !== false) {
-    t = t.replace(MD_EMPHASIS, '$2');
+    // url: 'read' では本文に URL がまだ残っている。退避せずに記号を外すと
+    // URL 中の `_` `*` などを Markdown 記号と誤認して壊してしまう
+    // （例: https://example.com/API_DOC が https://example.com/APIDOC になる）。
+    // 他のモードでは URL 自体が既に短縮・置換済みで本文中に残らないため、
+    // ここでの退避は基本的に空振りする（replaceUrls は該当が無ければ即 return する）。
+    const { guarded, parked } = parkUrls(t);
+    t = guarded.replace(MD_EMPHASIS, '$2');
     t = t.replace(/[*_`~>|#]/g, '');
+    t = unparkUrls(t, parked);
   }
 
   if (f.emoji !== false) t = t.replace(EMOJI, ' ');
