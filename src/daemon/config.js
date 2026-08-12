@@ -269,6 +269,10 @@ export class ConfigStore extends EventEmitter {
   close() {
     this.watcher?.close();
     this.watcher = null;
+    // 保留中の再読み込みも取り消す。残すと、終了処理の後に change が発火して
+    // 停止済みのコンポーネント（Codex 監視など）を起こし直してしまう
+    clearTimeout(this._reloadTimer);
+    this._reloadTimer = null;
   }
 
   profile(target) {
