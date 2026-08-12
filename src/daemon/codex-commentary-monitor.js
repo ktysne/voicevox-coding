@@ -12,6 +12,10 @@ const DEFAULT_RESTART_DELAY_MS = 1000;
 const MAX_CONNECT_FAILURES_BEFORE_SLOW_RETRY = 3;
 // 低頻度の再試行間隔。CLI が無い環境でもこの頻度の spawn なら実害がない。
 const DEFAULT_SLOW_RETRY_DELAY_MS = 10 * 60 * 1000;
+// idle スレッドの間引きに対する取りこぼしの保険。この周期で全スレッドを確認し直す。
+// updatedAt が変わらない更新（仕様上あり得る）やポーリング間で観測できなかった
+// active 期間があっても、遅延はこの周期までに抑えられる。
+const DEFAULT_THREAD_FULL_RECHECK_MS = 60 * 1000;
 // 接続は生きているのに走査（RPC）の失敗がこの回数続いたら、接続ごと取り直す。
 // 壊れた・非互換の app-server へ約 2 秒間隔の要求と警告を出し続けないための上限。
 const MAX_CONSECUTIVE_SCAN_FAILURES = 3;
@@ -158,6 +162,7 @@ export class CodexCommentaryMonitor extends EventEmitter {
     timeoutMs = DEFAULT_TIMEOUT_MS,
     restartDelayMs = DEFAULT_RESTART_DELAY_MS,
     slowRetryDelayMs = DEFAULT_SLOW_RETRY_DELAY_MS,
+    fullRecheckMs = DEFAULT_THREAD_FULL_RECHECK_MS,
     log,
     transportFactory,
   } = {}) {
@@ -165,6 +170,8 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.pollMs = pollMs;
     this.restartDelayMs = restartDelayMs;
     this.slowRetryDelayMs = slowRetryDelayMs;
+    this.fullRecheckMs = fullRecheckMs;
+    this.lastFullCheckAt = 0;
     this.log = log;
     this.transportFactory = transportFactory ?? (() => new AppServerTransport({ timeoutMs, log }));
     this.transport = null;
@@ -174,6 +181,9 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.polling = false;
     this.baselineComplete = false;
     this.seenItems = new Set();
+    // スレッドごとの前回走査の状態（{ updatedAt, statusType }）。
+    // idle 系スレッドで turns/list を間引くための基準値。
+    this.threadScanState = new Map();
     this.backoffMs = restartDelayMs;
     // 一度でも initialize + 初回 scan まで到達したか。true になった後の切断は
     // 一時的な app-server の不調とみなし、従来どおり無限にバックオフ再接続する。
@@ -199,6 +209,9 @@ export class CodexCommentaryMonitor extends EventEmitter {
     // baseline や既知 item、バックオフ・失敗カウンタを含めて「まっさらな状態」からやり直す。
     this.baselineComplete = false;
     this.seenItems.clear();
+    // baseline を取り直すため、前回の走査状態の追跡もリセットする。
+    // これにより次の走査では（active 以外の）idle スレッドも含め全スレッドを確認する。
+    this.threadScanState.clear();
     this.backoffMs = this.restartDelayMs;
     this.everConnected = false;
     this.consecutiveFailures = 0;
@@ -209,6 +222,9 @@ export class CodexCommentaryMonitor extends EventEmitter {
 
   async #connect() {
     if (!this.running) return;
+    // 接続世代ごとに間引きの追跡を取り直す。切断中に updatedAt を変えない更新が
+    // あっても、再接続後の初回走査で全スレッドが確認される
+    this.threadScanState.clear();
     const transport = this.transportFactory();
     this.transport = transport;
     // ポーリングタイマーは接続世代ごとに所有し、その世代の close で必ず解除する。
@@ -324,25 +340,52 @@ export class CodexCommentaryMonitor extends EventEmitter {
       // 待機中に切断されていれば、古い応答は新しい接続へ持ち込まずに捨てる。
       if (transport !== this.transport) return;
       const threads = result?.data ?? result?.threads ?? [];
+      // 取りこぼしの保険。updatedAt が変わらない更新（仕様上あり得る）や、
+      // ポーリング間で観測できなかった active 期間があっても無期限にスキップ
+      // しないよう、一定周期で追跡を捨てて全スレッドを確認し直す
+      // 時刻同期や手動変更で壁時計が後退しても止まらないよう、単調時計で測る
+      if (performance.now() - this.lastFullCheckAt >= this.fullRecheckMs) {
+        this.threadScanState.clear();
+        this.lastFullCheckAt = performance.now();
+      }
+      const currentThreadIds = new Set();
       for (const thread of threads) {
         const threadId = thread?.id;
         if (!threadId) continue;
+        currentThreadIds.add(threadId);
+        if (!this.#shouldCheckThread(threadId, thread)) continue;
         const turnsResult = await transport.request('thread/turns/list', {
-          threadId, limit: 1, sortDirection: 'desc', itemsView: 'full',
+          threadId, limit: 2, sortDirection: 'desc', itemsView: 'full',
         });
         if (transport !== this.transport) return;
-        const turn = (turnsResult?.data ?? turnsResult?.turns ?? [])[0];
-        for (const item of extractCommentaryItems(turn)) {
-          const itemKey = `${threadId}:${turn?.id ?? ''}:${item.itemId}`;
-          const unseen = !this.seenItems.has(itemKey);
-          this.seenItems.add(itemKey);
-          while (this.seenItems.size > 5000) {
-            this.seenItems.delete(this.seenItems.values().next().value);
-          }
-          if (this.baselineComplete && unseen) {
-            this.emit('commentary', { ...item, threadId, turnId: turn?.id });
+        // 直近 2 ターンを古い順に処理する。確認の間引きで窓が広がった分、
+        // その間に新しいターンが 1 つ始まっても、前のターンの最後の commentary を
+        // 取りこぼさない。1 つの窓に 2 つ以上のターンが挟まるケースは、
+        // limit: 1 だった従来設計と同種の限界として許容する
+        const turns = (turnsResult?.data ?? turnsResult?.turns ?? []).slice(0, 2).reverse();
+        for (const turn of turns) {
+          for (const item of extractCommentaryItems(turn)) {
+            const itemKey = `${threadId}:${turn?.id ?? ''}:${item.itemId}`;
+            const unseen = !this.seenItems.has(itemKey);
+            this.seenItems.add(itemKey);
+            while (this.seenItems.size > 5000) {
+              this.seenItems.delete(this.seenItems.values().next().value);
+            }
+            if (this.baselineComplete && unseen) {
+              this.emit('commentary', { ...item, threadId, turnId: turn?.id });
+            }
           }
         }
+        // 走査状態の記録は「世代確認 + item 処理」が済んでから行う。
+        //   ・await より前や直後に記録すると、取得の失敗や stop() → start() の
+        //     世代交代と競合し、新世代のクリア済み追跡へ旧走査の値を書き戻して
+        //     baseline の取り直しを妨げる（無効化中の item を新規として読んでしまう）
+        //   ・item 処理が例外なら記録されず、次回の走査で再試行される
+        this.threadScanState.set(threadId, { updatedAt: thread?.updatedAt, statusType: thread?.status?.type });
+      }
+      // thread/list に現れなくなったスレッドの追跡は掃除する。
+      for (const threadId of this.threadScanState.keys()) {
+        if (!currentThreadIds.has(threadId)) this.threadScanState.delete(threadId);
       }
       this.baselineComplete = true;
       // 走査が完走した = 接続に成功している。初回走査だけが失敗して後続の
@@ -370,6 +413,33 @@ export class CodexCommentaryMonitor extends EventEmitter {
     } finally {
       this.polling = false;
     }
+  }
+
+  /**
+   * スレッドの thread/turns/list（フルペイロード）を確認すべきか判定する。
+   * - active: commentary が増え得る。updatedAt の変化保証が無いため毎回確認する。
+   * - idle / notLoaded / systemError: updatedAt が前回走査から変化したときだけ確認する。
+   * - status/updatedAt が取れない未知の形: 安全側に倒して毎回確認する。
+   * updatedAt の記録はここでは行わない（turns/list の処理が成功した後に scan 側で
+   * 記録する）。判定時に記録してしまうと、取得が失敗しても「確認済み」となり、
+   * そのスレッドの変化を次回以降スキップして途中経過を取りこぼす。
+   * 比較は型を仮定せず `!==` の単純比較でよい。
+   */
+  #shouldCheckThread(threadId, thread) {
+    const statusType = thread?.status?.type;
+    if (statusType === 'active') return true;
+    if (statusType === 'idle' || statusType === 'notLoaded' || statusType === 'systemError') {
+      const prev = this.threadScanState.get(threadId);
+      // status が変わった直後（特に active → 非 active）は、updatedAt が同じでも
+      // 必ず確認する。active 中に追加された最後の commentary が updatedAt を
+      // 変えないまま残ることがあり、見送ると limit: 1 の走査では
+      // 次のターンが始まった後に二度と読めなくなる
+      if (!prev || prev.statusType !== statusType) return true;
+      const updatedAt = thread?.updatedAt;
+      return updatedAt === undefined || prev.updatedAt !== updatedAt;
+    }
+    // status が無い、または未知の type。互換性のため従来どおり毎回確認する。
+    return true;
   }
 
   dispose() {
