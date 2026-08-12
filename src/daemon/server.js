@@ -70,6 +70,16 @@ function readMutationId(req) {
   return typeof header === 'string' && header.length > 0 && header.length <= 200 ? header : null;
 }
 
+/**
+ * 終了処理中に拒否すべき状態変更の要求か。後始末の最中に /api/engine/start などが
+ * 通ると、止めたはずの子プロセスを起動し直して孤児にしてしまう。
+ * /api/shutdown だけは通す（shutdown() 側の二重起動ガードで無害なので、
+ * トレイの「終了」の再押下をエラーにしない）。
+ */
+export function isRejectedDuringShutdown(runtime, method, pathname) {
+  return Boolean(runtime?.shuttingDown) && method !== 'GET' && method !== 'HEAD' && pathname !== '/api/shutdown';
+}
+
 const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
 function parseHostname(value) {
@@ -252,6 +262,12 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     const { pathname } = url;
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
+      if (isRejectedDuringShutdown(runtime, req.method, pathname)) {
+        json(res, 503, { error: '終了処理中のため受け付けられません' });
+        return;
+      }
+      // /api/shutdown はこの下の検証（Origin / トークン / Content-Type）を
+      // 終了処理中でも従来どおり通る。ガードで安全性は弱めない。
       const verdict = checkMutationRequest({ pathname, headers: req.headers, port, token });
       if (!verdict.ok) {
         log.warn(`要求を拒否しました: ${req.method} ${pathname} — ${verdict.error}`);
