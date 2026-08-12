@@ -107,6 +107,8 @@ test('stream のエラー後はメモリのみに落ち、間を置いて開き�
   // 開き直しの待ち時間を省略して復旧させる
   logger.reopenAt = 0;
   logger.info('after-recovery');
+  // 復旧の通知は fd が実際に開けた 'open' の後に出るので、少し待ってから閉じる
+  await new Promise((resolve) => setTimeout(resolve, 50));
   await logger.close();
 
   const content = readIfExists(logPath);
@@ -116,6 +118,24 @@ test('stream のエラー後はメモリのみに落ち、間を置いて開き�
   assert.ok(logger.recent(100).some((l) => l.message === 'during-failure'));
   // 復旧したことも知らせている
   assert.ok(logger.recent(100).some((l) => l.message.includes('書き込みを再開しました')));
+});
+
+test('復旧を起こした行がローテーションを跨いでも失われない', async () => {
+  const logPath = tmpLogPath();
+  const maxBytes = 120;
+  const logger = new Logger(() => 'info', { path: logPath, maxBytes });
+  logger.info('aaaa');
+  logger.stream.emit('error', new Error('模擬障害'));
+
+  // 開き直した直後の書き込みが上限を跨ぎ、ローテーションを誘発するケース。
+  // 復旧通知の再入で this.stream が消え、この行が落ちる回帰があった。
+  logger.reopenAt = 0;
+  logger.info('x'.repeat(100));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  await logger.close();
+
+  const combined = readIfExists(logPath) + readIfExists(`${logPath}.1`);
+  assert.match(combined, /x{100}/);
 });
 
 test('close() は二重に呼んでも例外にならない', async () => {

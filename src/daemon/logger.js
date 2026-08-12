@@ -74,22 +74,27 @@ export class Logger {
       // 宛先が掴まれているか、現在のログが掴まれている。切り分けは下の手順に任せる
     }
     const tmp = `${dest}.tmp`;
-    let moved = false;
     try {
       fs.rmSync(tmp, { force: true });
-      fs.renameSync(dest, tmp);
-      moved = true;
+    } catch {
+      // tmp を消せなければ次の rename が失敗して伝播する。ここでは判断しない
+    }
+    fs.renameSync(dest, tmp);
+    try {
       fs.renameSync(this.path, dest);
-      fs.rmSync(tmp, { force: true });
     } catch (err) {
-      // 現在のログを移せなかった。どかした .1 を元へ戻して世代を守る
-      if (moved) {
-        try {
-          fs.renameSync(tmp, dest);
-        } catch {}
-      }
+      // 現在のログを移せなかった。どかした .1 を元へ戻して世代を守る。
+      // 復元はこの失敗時に限る。移動が済んだ後の掃除失敗で復元すると、
+      // 退避したばかりの最新世代を古い世代で上書きしてしまう。
+      try {
+        fs.renameSync(tmp, dest);
+      } catch {}
       throw err;
     }
+    // 最新の退避は dest に載った。どかした古い世代の削除に失敗しても致命ではない
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {}
   }
 
   /** 書き込み用ストリームを（再）オープンする。失敗しても例外は投げない。 */
@@ -107,11 +112,17 @@ export class Logger {
         // 古い世代のストリームの遅延エラーで、開き直した新しいストリームを捨てない
         if (this.stream === stream) this.#streamBroken(err);
       });
-      this.stream = stream;
       if (this.streamFailed) {
-        this.streamFailed = false;
-        this.info('ログファイルへの書き込みを再開しました');
+        // 復旧の通知は fd が実際に開けてから出す（createWriteStream は遅延オープンで、
+        // アクセス拒否が続いていてもここでは失敗しない）。'open' は次のティック以降に
+        // 届くので、#open を呼び出した元の書き込みへ再入してその行を失うこともない。
+        stream.once('open', () => {
+          if (this.stream !== stream || !this.streamFailed) return;
+          this.streamFailed = false;
+          this.info('ログファイルへの書き込みを再開しました');
+        });
       }
+      this.stream = stream;
     } catch (err) {
       this.#streamBroken(err);
     }
@@ -197,14 +208,27 @@ export class Logger {
   /** stream を end し、flush 完了を待つ。障害で close が来ない場合に固着しないよう上限付き。 */
   #endStream(stream) {
     return new Promise((resolve) => {
-      const timer = setTimeout(resolve, STREAM_END_TIMEOUT_MS);
-      timer.unref?.();
-      const done = () => {
+      let settled = false;
+      const finish = (kind, err) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
+        if (kind === 'timeout') {
+          // flush を待ちきれなかった。ファイルハンドルを残さないよう破棄する
+          try {
+            stream.destroy();
+          } catch {}
+        }
+        if (kind !== 'close') {
+          // flush の失敗・打ち切りを無通知にしない（メモリ側のログには必ず残る）
+          this.warn(`ログの flush を完了できませんでした: ${kind === 'error' ? err?.message : 'タイムアウト'}`);
+        }
         resolve();
       };
-      stream.once('close', done);
-      stream.once('error', done);
+      const timer = setTimeout(() => finish('timeout'), STREAM_END_TIMEOUT_MS);
+      timer.unref?.();
+      stream.once('close', () => finish('close'));
+      stream.once('error', (err) => finish('error', err));
       stream.end();
     });
   }

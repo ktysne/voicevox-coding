@@ -193,9 +193,11 @@ async function shutdown() {
   // SSE 接続が残っていると server.close のコールバックは呼ばれないことがあり、
   // 2 秒のフォールバック exit が先に走って未 flush のログが失われる。
   // ここまでで後始末のログはすべて出ているので、flush はこの時点で確実に待つ。
+  // フォールバックのタイマーは flush より先に仕掛けておき、ストレージ障害などで
+  // log.close() 自体が長引いても終了が 2 秒を超えて延びないようにする。
+  setTimeout(() => process.exit(0), 2000).unref();
   await log.close().catch(() => {});
   server.close(() => process.exit(0));
-  setTimeout(() => process.exit(0), 2000).unref();
 }
 
 process.on('SIGINT', shutdown);
