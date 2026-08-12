@@ -413,12 +413,23 @@ export class SpeechQueue extends EventEmitter {
     const now = Date.now();
     const prevTouchedAt = index.get(file)?.touchedAt ?? 0;
     const shouldTouch = now - prevTouchedAt >= CACHE_TOUCH_INTERVAL_MS;
-    index.set(file, { lastUsedMs: now, touchedAt: shouldTouch ? now : prevTouchedAt });
+    index.set(file, { lastUsedMs: now, touchedAt: prevTouchedAt });
     if (shouldTouch) {
       // 再起動後も利用順がおおよそ保たれるよう、ディスク側にも粗く残す。
       // 結果を待たない fire-and-forget（失敗しても読み上げは止めない）。
+      // touchedAt は成功が確認できてから進める。先に進めると、一時的な
+      // EPERM/EBUSY のとき次の間引き間隔まで再試行されず、無通知のまま
+      // 再起動後の利用順（LRU）が失われる。
       const sec = now / 1000;
-      fs.utimes(file, sec, sec, () => {});
+      fs.utimes(file, sec, sec, (err) => {
+        const entry = index.get(file);
+        if (!entry) return; // その間に整理などで消えていた
+        if (err) {
+          this.log?.debug?.(`キャッシュの利用時刻を反映できません (${file}): ${err.message}`);
+          return;
+        }
+        index.set(file, { ...entry, touchedAt: now });
+      });
     }
   }
 
@@ -431,11 +442,12 @@ export class SpeechQueue extends EventEmitter {
 
   /** 索引が上限を超えたときだけ、古い順に削除して上限まで戻す。 */
   #maybePruneCache(maxEntries) {
-    const index = this.#ensureCacheIndex();
-    if (index.size <= maxEntries) return;
+    this.#ensureCacheIndex();
 
-    // 前回の全走査から時間が経っていたら索引を作り直してから評価する。
-    // 外部削除・上限の縮小・同名再保存などで索引が実体とずれても、ここで追随する。
+    // 時間経過による再同期はサイズ判定より先に行う。索引が実体より少なく
+    // 見えている場合（初回走査の部分的な失敗、外部からの WAV 追加など）、
+    // サイズ判定で先に戻ると実ファイル数が上限を超えたまま放置されるため。
+    // 外部削除・上限の縮小・同名再保存とのずれもここで追随する。
     if (Date.now() - this.cacheIndexScannedAt >= CACHE_INDEX_RESYNC_MS) {
       this.#resyncCacheIndex();
     }
@@ -444,13 +456,19 @@ export class SpeechQueue extends EventEmitter {
     if (current.size <= maxEntries) return;
 
     const entries = [...current.entries()].sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
-    for (const [file] of entries.slice(0, entries.length - maxEntries)) {
+    for (const [file] of entries) {
+      if (current.size <= maxEntries) break;
       try {
         fs.unlinkSync(file);
-      } catch {
-        // ENOENT を含め、削除に失敗しても黙って続ける（既存の流儀どおり）
+        current.delete(file);
+      } catch (err) {
+        // 実体が既に無いなら索引からだけ外す。それ以外（ウイルス対策の一時的な
+        // EPERM/EBUSY 等）は索引に残して次回の整理で再試行し、ここでは代わりに
+        // 次の候補を消して実ファイル数を上限へ近づける。索引から外してしまうと、
+        // 実体が残ったまま追跡できなくなり、以後は正常なキャッシュばかりが
+        // 削除され続ける。
+        if (err?.code === 'ENOENT') current.delete(file);
       }
-      current.delete(file);
     }
   }
 

@@ -125,18 +125,25 @@ function mockCacheDisk() {
     if (!disk.has(p)) throw enoent(p);
     return { mtimeMs: disk.get(p) };
   });
+  const locked = new Set(); // EPERM で削除に失敗させたいファイル
+  const utimesFail = { value: false }; // true にすると utimes を失敗させる
   mock.method(fs, 'unlinkSync', (p) => {
+    if (locked.has(p)) throw Object.assign(new Error(`EPERM: ${p}`), { code: 'EPERM' });
     if (!disk.has(p)) throw enoent(p);
     unlinked.push(p);
     disk.delete(p);
   });
   mock.method(fs, 'utimes', (p, atime, mtime, cb) => {
     utimesCalls.push({ p, atime, mtime });
+    if (utimesFail.value) {
+      cb?.(Object.assign(new Error(`EPERM: ${p}`), { code: 'EPERM' }));
+      return;
+    }
     if (disk.has(p)) disk.set(p, Date.now());
     cb?.(null);
   });
 
-  return { disk, unlinked, readdirCalls, utimesCalls };
+  return { disk, unlinked, readdirCalls, utimesCalls, locked, utimesFail };
 }
 
 /** キャッシュ有効・上限指定ありの SpeechQueue を作る（#42 のキャッシュ索引テスト用）。 */
@@ -844,6 +851,99 @@ test('索引の外で実ファイルが消えていても、10 分経過後の�
   assert.deepEqual(unlinked, []);
   assert.ok(!disk.has(fileA));
   assert.ok(disk.has(fileB));
+});
+
+test('索引が実体より少なくても、時間経過後の整理が外部追加分に追随する (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, unlinked } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 3 });
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 外部で WAV が 5 つ増える（索引は知らない）。索引のサイズ (2) は上限以下に
+  // 見えるが、再同期をサイズ判定より先に行うので実体 (7) に追随できる
+  for (let i = 0; i < 5; i += 1) disk.set(path.join(CACHE_DIR, `ext-${i}.wav`), 10 + i);
+
+  now = 11 * 60 * 1000; // 再同期間隔 (10 分) を超える
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  const wavs = [...disk.keys()].filter((p) => p.endsWith('.wav'));
+  assert.equal(wavs.length, 3, `実ファイル数が上限まで戻っていない: ${wavs.length}`);
+  assert.ok(unlinked.length >= 4);
+});
+
+test('削除に失敗したファイルは索引に残して再試行し、代わりに次の候補を消す (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk, unlinked, locked } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 2 });
+  const [fileA, fileB, fileC, fileD] = cacheFilesFor(['Aの発話。', 'Bの発話。', 'Cの発話。', 'Dの発話。']);
+
+  now = 0;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  now = 100;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Bの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // 最古の A をロック（ウイルス対策の一時的な EPERM を模す）
+  locked.add(fileA);
+  now = 200;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Cの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  // A は消せないので索引に残し、代わりに次に古い B が消えて実ファイル数を上限へ近づける
+  assert.ok(disk.has(fileA), 'ロック中の A はディスクに残る');
+  assert.ok(!disk.has(fileB), '代わりに B が削除されるべき');
+  assert.ok(disk.has(fileC));
+  assert.deepEqual(unlinked, [fileB]);
+
+  // ロックが解けたら、次の整理で A の削除を再試行する（索引から外れていない証拠）
+  locked.delete(fileA);
+  now = 300;
+  queue.enqueue({ target: 'test', event: 'test', text: 'Dの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  assert.ok(!disk.has(fileA), 'ロック解除後の整理で A が削除されるべき');
+  assert.ok(disk.has(fileD));
+});
+
+test('utimes に失敗したときは touch 時刻を確定せず、次のヒットで再試行する (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { utimesCalls, utimesFail } = mockCacheDisk();
+  const player = new FakePlayer();
+  const queue = makeCacheQueue(player, { maxEntries: 1000 });
+  const enq = () => {
+    queue.enqueue({ target: 'test', event: 'test', text: 'Aの発話。', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    return waitIdle(queue);
+  };
+
+  now = 0;
+  await enq(); // 書き込み（touchedAt = 0）
+
+  utimesFail.value = true;
+  now = 6 * 60 * 1000; // 間引き間隔 (5 分) を超える
+  await enq(); // ヒット → utimes 失敗 → touchedAt は進まない
+  assert.equal(utimesCalls.length, 1);
+
+  now += 1000;
+  await enq(); // 失敗直後でも、間引きにかからず再試行される
+  assert.equal(utimesCalls.length, 2);
+
+  utimesFail.value = false;
+  now += 1000;
+  await enq(); // 成功 → touchedAt 確定
+  assert.equal(utimesCalls.length, 3);
+
+  now += 1000;
+  await enq(); // 確定後は間引きが効いて呼ばれない
+  assert.equal(utimesCalls.length, 3);
 });
 
 test('キャッシュヒットのたびに touch せず、5 分間隔で間引いて mtime を更新する (#42)', async () => {
