@@ -1098,6 +1098,38 @@ test('整理の失敗は既定レベルで見える warn で 1 回だけ知ら�
   assert.equal(warns.filter((m) => m.includes('削除できませんでした')).length, 2);
 });
 
+test('低い上限で複数チャンクを読んでも、再生時点で WAV が消えていない (#42)', async () => {
+  let now = 0;
+  mock.method(Date, 'now', () => now);
+  const { disk } = mockCacheDisk();
+  // 再生を 1 ティック遅らせると、先読み合成に伴う整理が PLAY より先に走り、
+  // 保護が無ければ再生待ちの前チャンクが最古として消される
+  const missing = [];
+  class SlowPlayer extends FakePlayer {
+    async play(file) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      if (!disk.has(file)) missing.push(file);
+      return super.play(file);
+    }
+  }
+  const player = new SlowPlayer();
+  const engine = { synthesize: async () => ({ wav: WAV }) };
+  const config = () => ({ daemon: { chunkChars: 10, cacheEnabled: true, cacheMaxEntries: 1 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {}, debug() {} });
+
+  // 10 文字上限で 3 チャンクに割れる長さの本文
+  queue.enqueue({
+    target: 'test', event: 'test',
+    text: 'あああああああ。いいいいいいい。ううううううう。',
+    speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' },
+  });
+  await waitIdle(queue);
+
+  assert.deepEqual(missing, [], `再生時に WAV が消えていた: ${missing}`);
+  const plays = player.calls.filter(([kind]) => kind === 'play');
+  assert.equal(plays.length, 3, `3 チャンクとも再生されるべき: ${plays.length}`);
+});
+
 test('古い候補が削除できなくても、書き込み直後の再生予定 WAV は消さない (#42)', async () => {
   let now = 0;
   mock.method(Date, 'now', () => now);
