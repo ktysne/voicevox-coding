@@ -378,6 +378,81 @@ test('初回走査だけ失敗しても、後続のポーリングで完走す�
   }
 });
 
+test('接続は生きていても走査の失敗が続いたら接続を取り直す', async () => {
+  const warns = [];
+  const log = { warn: (msg) => warns.push(msg), info: () => {}, debug: () => {} };
+  let factoryCalls = 0;
+
+  class ScanAlwaysFailsTransport extends EventEmitter {
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      throw new Error('非互換の app-server');
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    slowRetryDelayMs: 60_000,
+    log,
+    transportFactory: () => {
+      factoryCalls += 1;
+      return new ScanAlwaysFailsTransport();
+    },
+  });
+
+  try {
+    monitor.start();
+    // 走査の連続失敗 → 接続の取り直し → 接続失敗カウント → 低頻度モードへ
+    await waitFor(() => monitor.slowRetry);
+    assert.ok(factoryCalls >= 2, '接続を取り直していない');
+    // 「取得できません」の警告は失敗のたびではなく、連続失敗の先頭だけに出る
+    const fetchWarns = warns.filter((m) => m.includes('取得できません'));
+    const retryWarns = warns.filter((m) => m.includes('接続をやり直します'));
+    assert.ok(fetchWarns.length <= retryWarns.length + 1, `警告が多すぎる: ${fetchWarns.length}`);
+  } finally {
+    monitor.dispose();
+  }
+});
+
+test('停止による走査キャンセルの reject は警告しない', async () => {
+  const warns = [];
+  const log = { warn: (msg) => warns.push(msg), info: () => {}, debug: () => {} };
+  let rejectScan = null;
+
+  class HangingScanTransport extends EventEmitter {
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      return new Promise((_resolve, reject) => {
+        rejectScan = () => reject(new Error('Codex app-server を終了しました'));
+      });
+    }
+    dispose() {
+      rejectScan?.();
+    }
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    log,
+    transportFactory: () => new HangingScanTransport(),
+  });
+
+  monitor.start();
+  await waitFor(() => rejectScan !== null);
+  monitor.stop(); // dispose が進行中の走査を reject する
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  const fetchWarns = warns.filter((m) => m.includes('取得できません'));
+  assert.deepEqual(fetchWarns, []);
+});
+
 test('低頻度の再試行待ちでも、start()（設定変更）で直ちに試し直す', async () => {
   const log = { warn: () => {}, info: () => {}, debug: () => {} };
   let factoryCalls = 0;

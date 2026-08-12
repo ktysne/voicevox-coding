@@ -12,6 +12,9 @@ const DEFAULT_RESTART_DELAY_MS = 1000;
 const MAX_CONNECT_FAILURES_BEFORE_SLOW_RETRY = 3;
 // 低頻度の再試行間隔。CLI が無い環境でもこの頻度の spawn なら実害がない。
 const DEFAULT_SLOW_RETRY_DELAY_MS = 10 * 60 * 1000;
+// 接続は生きているのに走査（RPC）の失敗がこの回数続いたら、接続ごと取り直す。
+// 壊れた・非互換の app-server へ約 2 秒間隔の要求と警告を出し続けないための上限。
+const MAX_CONSECUTIVE_SCAN_FAILURES = 3;
 
 /** 設定から、Codex の途中経過監視を動かすべきかどうかを判定する。 */
 export function commentaryEnabled(cfg) {
@@ -155,6 +158,8 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.consecutiveFailures = 0;
     // 低頻度の再試行モード。切替時に 1 回だけ warn を出すためのフラグを兼ねる。
     this.slowRetry = false;
+    // 接続が生きたまま走査（RPC）だけが連続で失敗している回数。完走でリセットする。
+    this.scanFailures = 0;
   }
 
   start() {
@@ -174,6 +179,7 @@ export class CodexCommentaryMonitor extends EventEmitter {
     this.everConnected = false;
     this.consecutiveFailures = 0;
     this.slowRetry = false;
+    this.scanFailures = 0;
     this.#connect();
   }
 
@@ -241,6 +247,7 @@ export class CodexCommentaryMonitor extends EventEmitter {
   #noteConnected() {
     this.everConnected = true;
     this.consecutiveFailures = 0;
+    this.scanFailures = 0;
     if (this.slowRetry) {
       this.slowRetry = false;
       this.log?.info?.('Codex の途中経過監視が接続を回復しました');
@@ -319,7 +326,23 @@ export class CodexCommentaryMonitor extends EventEmitter {
       // （#connect 直後の判定だけだと、その後の切断で低頻度モードへ誤って入る）。
       this.#noteConnected();
     } catch (err) {
-      this.log?.warn?.(`Codex の途中経過を取得できません: ${err.message}`);
+      // dispose() や世代交代で進行中の要求が reject されるのは正常なキャンセル。
+      // 「取得できません」と騒がない
+      if (!this.running || transport !== this.transport) return;
+      this.scanFailures += 1;
+      // 失敗が続く間は毎回は警告しない（約 2 秒ごとにログが埋まる）
+      if (this.scanFailures === 1) {
+        this.log?.warn?.(`Codex の途中経過を取得できません: ${err.message}`);
+      }
+      // 接続は生きているのに走査が失敗し続ける（壊れた・非互換の app-server など）
+      // 場合は、切断と同じ扱いで接続を取り直す。everConnected でなければ
+      // #handleConnectFailure が低頻度の再試行へ切り替えてくれる
+      if (this.scanFailures >= MAX_CONSECUTIVE_SCAN_FAILURES) {
+        this.log?.warn?.('Codex の途中経過の取得に失敗が続くため、接続をやり直します');
+        this.transport = null;
+        transport.dispose?.();
+        this.#handleConnectFailure();
+      }
     } finally {
       this.polling = false;
     }
