@@ -5,12 +5,13 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const HOME = os.homedir();
 const CONFIG_PATH = path.join(HOME, '.voicevox-coding', 'config.json');
 const HOOK_CLIENT = path.join(HOME, '.voicevox-coding', 'hook-client.js');
+const MANIFEST_PATH = path.join(HOME, '.voicevox-coding', 'install.json');
 const CLAUDE_SETTINGS = path.join(HOME, '.claude', 'settings.json');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, '.codex');
 const CODEX_HOOKS = path.join(CODEX_HOME, 'hooks.json');
@@ -109,6 +110,67 @@ export function parseCodexInitializeResult(message) {
   return typeof codexHome === 'string' && codexHome.trim() !== '' ? codexHome : null;
 }
 
+/**
+ * install.json（導入時の期待構成）と現状の手がかりから、Claude Code / Codex それぞれの
+ * 点検方針を決める純関数。
+ *
+ *   - manifest があれば、対応する skip キー（'skipClaude' | 'skipCodex'）だけで決まる。
+ *     true なら 'skip'（導入時に対象外にした＝検査そのものを省略し、中立表示にする）、
+ *     false なら 'check'（通常どおり検査する）。
+ *   - manifest が無い（install.json 保存に対応する前の旧導入）場合は 'check' が既定。
+ *     ただし migrateWhenMissing を立てた対象（Codex）に限り、フックも CLI も
+ *     見当たらないなら「そもそも導入していない」とみなして 'warn-uninstalled' にする
+ *     （フックが無いだけで fail 扱いにすると、使うつもりがない対象にまで
+ *     エラーが出てしまうため）。
+ *
+ * @param {object|null} manifest install.json の中身（無ければ null）
+ * @param {object} opts
+ * @param {'skipClaude'|'skipCodex'} opts.skipKey manifest 内でこの対象を指すキー
+ * @param {boolean} opts.hooksExist 対象の設定ファイルに我々のフックが登録されているか
+ * @param {boolean} [opts.cliAvailable] CLI が PATH にあるか（Codex の移行判定にのみ使う）
+ * @param {boolean} [opts.migrateWhenMissing] manifest が無いときに未導入への移行判定を行うか
+ * @returns {{ mode: 'skip' | 'check' | 'warn-uninstalled' }}
+ */
+export function resolveTargetPlan(manifest, opts = {}) {
+  const { skipKey, hooksExist, cliAvailable, migrateWhenMissing = false } = opts;
+
+  if (manifest) {
+    return manifest[skipKey] ? { mode: 'skip' } : { mode: 'check' };
+  }
+  if (migrateWhenMissing && !hooksExist && cliAvailable !== true) {
+    return { mode: 'warn-uninstalled' };
+  }
+  return { mode: 'check' };
+}
+
+/**
+ * 導入時に -IncludeToolEvents を指定した（＝ manifest.includeToolEvents が true の）のに、
+ * PreToolUse / PostToolUse が実際には登録されていない場合、その不足イベント名を返す。
+ * 期待していない場合（manifest が無い、または includeToolEvents が false）は常に空配列。
+ *
+ * @param {object|null} manifest install.json の中身
+ * @param {{ ev: string }[]} ourEvents countOurHooks() が返す、登録済みイベントの一覧
+ */
+export function missingToolEvents(manifest, ourEvents) {
+  if (!manifest?.includeToolEvents) return [];
+  const have = new Set((ourEvents ?? []).map((o) => o.ev));
+  return ['PreToolUse', 'PostToolUse'].filter((ev) => !have.has(ev));
+}
+
+/**
+ * codex CLI が PATH 上にあるかを確かめる（where.exe codex 相当）。
+ * install.json が無い旧導入で、Codex を使うつもりがあるのかを見分けるための軽い判定に使う。
+ * codexHooksList() と違い app-server を起動しないので、ほぼ即座に返る。
+ */
+function isCodexCliAvailable() {
+  try {
+    const r = spawnSync('where.exe', ['codex'], { windowsHide: true });
+    return r.status === 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Codex の app-server に hooks/list を投げて、実際に読み込まれているかと信頼状態を見る。 */
 function codexHooksList() {
   return new Promise((resolve) => {
@@ -173,6 +235,10 @@ async function main() {
   if (config) ok('設定ファイル', CONFIG_PATH);
   else warn('設定ファイル', `${CONFIG_PATH} がありません（デーモン初回起動時に作られます）`);
 
+  // --- 導入構成（install.ps1 が保存した期待構成） ---
+  const manifest = readJson(MANIFEST_PATH);
+  if (manifest) ok('導入構成', `${MANIFEST_PATH} を期待構成として使用します`);
+
   const port = config?.daemon?.port ?? 7591;
   const baseUrl = config?.engine?.baseUrl ?? 'http://127.0.0.1:50021';
 
@@ -206,30 +272,56 @@ async function main() {
 
   // --- Claude Code ---
   const claude = readJson(CLAUDE_SETTINGS);
-  if (!claude) {
+  const claudeOurs = claude ? countOurHooks(claude) : [];
+  const claudePlan = resolveTargetPlan(manifest, { skipKey: 'skipClaude', hooksExist: claudeOurs.length > 0 });
+
+  if (claudePlan.mode === 'skip') {
+    ok('Claude Code', '対象外（導入時に -SkipClaude を指定）');
+  } else if (!claude) {
     warn('Claude Code', `${CLAUDE_SETTINGS} を読めません`);
   } else {
-    const ours = countOurHooks(claude);
     const others = Object.entries(claude.hooks ?? {}).length;
-    if (ours.length === 0) fail('Claude Code', 'フックが登録されていません。scripts\\install.ps1 を実行してください');
-    else ok('Claude Code', `${ours.length} イベント登録済み: ${ours.map((o) => o.ev).join(', ')}（他 ${others} 種のイベントキーと共存）`);
+    if (claudeOurs.length === 0) fail('Claude Code', 'フックが登録されていません。scripts\\install.ps1 を実行してください');
+    else ok('Claude Code', `${claudeOurs.length} イベント登録済み: ${claudeOurs.map((o) => o.ev).join(', ')}（他 ${others} 種のイベントキーと共存）`);
+
+    const missing = missingToolEvents(manifest, claudeOurs);
+    if (missing.length > 0) {
+      fail(
+        'Claude Code (ツールイベント)',
+        `導入時に -IncludeToolEvents を指定していますが登録されていません: ${missing.join(', ')}。scripts\\install.ps1 を実行し直してください`,
+      );
+    }
   }
 
   // --- Codex ---
-  const codex = readJson(CODEX_HOOKS);
-  if (!codex) {
+  // manifest が無い（旧導入）場合の「未導入かどうか」の判定は、hooks.json が無いときに
+  // 限って CLI の有無を確認する。フックが既にあるなら、CLI 探索をするまでもなく検査対象。
+  const codexRoot = manifest?.skipCodex ? null : readJson(CODEX_HOOKS);
+  const codexOurs = codexRoot ? countOurHooks(codexRoot) : [];
+  const codexCliAvailable = (!manifest && codexOurs.length === 0) ? isCodexCliAvailable() : undefined;
+  const codexPlan = resolveTargetPlan(manifest, {
+    skipKey: 'skipCodex',
+    hooksExist: codexOurs.length > 0,
+    cliAvailable: codexCliAvailable,
+    migrateWhenMissing: true,
+  });
+
+  if (codexPlan.mode === 'skip') {
+    ok('Codex', '対象外（導入時に -SkipCodex を指定）');
+  } else if (codexPlan.mode === 'warn-uninstalled') {
+    warn('Codex', '未導入のようです（使う場合は scripts\\install.ps1 を実行してください）');
+  } else if (!codexRoot) {
     fail('Codex', `${CODEX_HOOKS} がありません。scripts\\install.ps1 を実行してください`);
   } else {
-    const ours = countOurHooks(codex);
-    const asyncOnes = ours.filter((o) => o.async);
-    if (ours.length === 0) fail('Codex', 'フックが登録されていません');
-    else ok('Codex', `${ours.length} イベント登録済み: ${ours.map((o) => o.ev).join(', ')}`);
+    const asyncOnes = codexOurs.filter((o) => o.async);
+    if (codexOurs.length === 0) fail('Codex', 'フックが登録されていません');
+    else ok('Codex', `${codexOurs.length} イベント登録済み: ${codexOurs.map((o) => o.ev).join(', ')}`);
     if (asyncOnes.length > 0) {
       fail('Codex (async)', `async: true のフックは Codex に無視されます: ${asyncOnes.map((o) => o.ev).join(', ')}`);
     }
     // Codex は command 先頭の実行ファイルを引用符付きで書くと解決に失敗する。
     // エラーにならず「Failed」とだけ出るので、静かに壊れる。
-    const quoted = ours.filter((o) => o.command.trimStart().startsWith('"'));
+    const quoted = codexOurs.filter((o) => o.command.trimStart().startsWith('"'));
     if (quoted.length > 0) {
       fail(
         'Codex (引用符)',
@@ -237,40 +329,52 @@ async function main() {
           'Codex では実行ファイルを引用できません。scripts\\install.ps1 を実行し直してください',
       );
     }
+
+    const missing = missingToolEvents(manifest, codexOurs);
+    if (missing.length > 0) {
+      fail(
+        'Codex (ツールイベント)',
+        `導入時に -IncludeToolEvents を指定していますが登録されていません: ${missing.join(', ')}。scripts\\install.ps1 を実行し直してください`,
+      );
+    }
   }
 
   // --- Codex の読み込み・信頼状態 ---
-  console.log('\n  Codex に問い合わせています…');
-  const listed = await codexHooksList().catch(() => null);
-  if (!listed) {
-    warn('Codex 信頼状態', 'codex app-server から取得できませんでした（codex が PATH にあるか確認してください）');
-  } else {
-    for (const w of listed.warnings ?? []) warn('Codex 警告', w);
-    for (const e of listed.errors ?? []) fail('Codex エラー', String(e));
-    if (listed.codexHome && !codexHomeMatches(CODEX_HOME, listed.codexHome)) {
-      warn(
-        'Codex 信頼状態',
-        `app-server の CODEX_HOME (${listed.codexHome}) が doctor の期待値 (${CODEX_HOME}) と異なるため、判定不能（通常PowerShellで実行）`,
-      );
+  // 対象外（skip）・未導入と推定（warn-uninstalled）の場合は、app-server への問い合わせ
+  // （最大 20 秒）も含めて Codex 関連の検査を一切行わない。
+  if (codexPlan.mode === 'check') {
+    console.log('\n  Codex に問い合わせています…');
+    const listed = await codexHooksList().catch(() => null);
+    if (!listed) {
+      warn('Codex 信頼状態', 'codex app-server から取得できませんでした（codex が PATH にあるか確認してください）');
     } else {
-      const mine = (listed.hooks ?? []).filter((h) => String(h.command).includes('hook-client.js'));
-      if (mine.length === 0) {
-        fail('Codex 読み込み', 'フックが 1 件も読み込まれていません');
+      for (const w of listed.warnings ?? []) warn('Codex 警告', w);
+      for (const e of listed.errors ?? []) fail('Codex エラー', String(e));
+      if (listed.codexHome && !codexHomeMatches(CODEX_HOME, listed.codexHome)) {
+        warn(
+          'Codex 信頼状態',
+          `app-server の CODEX_HOME (${listed.codexHome}) が doctor の期待値 (${CODEX_HOME}) と異なるため、判定不能（通常PowerShellで実行）`,
+        );
       } else {
-        const untrusted = mine.filter((h) => h.trustStatus !== 'trusted');
-        if (untrusted.length > 0) {
-          const states = [...new Set(untrusted.map((h) => h.trustStatus))].join('/');
-          warn(
-            'Codex 信頼状態',
-            `${untrusted.length}/${mine.length} 件が未承認です (${states})。codex を起動して /hooks から承認してください`,
-          );
+        const mine = (listed.hooks ?? []).filter((h) => String(h.command).includes('hook-client.js'));
+        if (mine.length === 0) {
+          fail('Codex 読み込み', 'フックが 1 件も読み込まれていません');
         } else {
-          ok('Codex 信頼状態', `${mine.length} 件すべて承認済み`);
-        }
-        // /hooks で個別にオフにされたものは、承認済みでも実行されない
-        const disabled = mine.filter((h) => h.enabled === false);
-        if (disabled.length > 0) {
-          warn('Codex 無効化', `${disabled.map((h) => h.eventName).join(', ')} が /hooks でオフになっています`);
+          const untrusted = mine.filter((h) => h.trustStatus !== 'trusted');
+          if (untrusted.length > 0) {
+            const states = [...new Set(untrusted.map((h) => h.trustStatus))].join('/');
+            warn(
+              'Codex 信頼状態',
+              `${untrusted.length}/${mine.length} 件が未承認です (${states})。codex を起動して /hooks から承認してください`,
+            );
+          } else {
+            ok('Codex 信頼状態', `${mine.length} 件すべて承認済み`);
+          }
+          // /hooks で個別にオフにされたものは、承認済みでも実行されない
+          const disabled = mine.filter((h) => h.enabled === false);
+          if (disabled.length > 0) {
+            warn('Codex 無効化', `${disabled.map((h) => h.eventName).join(', ')} が /hooks でオフになっています`);
+          }
         }
       }
     }

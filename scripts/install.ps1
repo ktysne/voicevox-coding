@@ -52,11 +52,12 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     exit $LASTEXITCODE
 }
 
-$RepoRoot   = Split-Path -Parent $PSScriptRoot
-$InstallDir = Join-Path $env:USERPROFILE '.voicevox-coding'
-$HookScript = Join-Path $InstallDir 'hook-client.js'
-$ClaudeDir  = Join-Path $env:USERPROFILE '.claude'
-$CodexDir   = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$RepoRoot     = Split-Path -Parent $PSScriptRoot
+$InstallDir   = Join-Path $env:USERPROFILE '.voicevox-coding'
+$HookScript   = Join-Path $InstallDir 'hook-client.js'
+$ManifestPath = Join-Path $InstallDir 'install.json'
+$ClaudeDir    = Join-Path $env:USERPROFILE '.claude'
+$CodexDir     = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 
 function Write-Step($msg)  { Write-Host "  $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "  OK   $msg" -ForegroundColor Green }
@@ -213,6 +214,38 @@ function Merge-Hook {
     return $Root
 }
 
+<#
+  「期待する導入構成」を manifest (install.json) に保存する。
+  update.ps1 はこれを読み、明示指定されなかったオプションを引き継ぐ。
+  doctor.mjs はこれを読み、導入形態に応じて検査の要否を判定する。
+  一時ファイルへ書いてから置き換えるので、書き込み中に落ちても既存の manifest は壊れない。
+#>
+function Save-InstallManifest {
+    param(
+        [string]$Path,
+        [bool]$IncludeToolEvents,
+        [bool]$SkipClaude,
+        [bool]$SkipCodex,
+        [bool]$RegisterStartup
+    )
+
+    $manifest = [ordered]@{
+        schemaVersion     = 1
+        savedAt           = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+        includeToolEvents = $IncludeToolEvents
+        skipClaude        = $SkipClaude
+        skipCodex         = $SkipCodex
+        registerStartup   = $RegisterStartup
+    }
+    $json = $manifest | ConvertTo-Json -Depth 5
+
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $tmp = "$Path.tmp-$([guid]::NewGuid().ToString('N'))"
+    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8 -NoNewline
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+}
+
 # ------------------------------------------------------------------ 開始
 
 Write-Host ''
@@ -221,6 +254,10 @@ Write-Host ('=' * 50)
 
 $node = Get-NodePath
 Write-Ok "node.exe: $node"
+
+if ($SkipClaude -and $SkipCodex) {
+    Write-Warn2 'フックの登録対象がありません（-SkipClaude と -SkipCodex が両方指定されています）'
+}
 
 # --- フッククライアントの配置 ---
 Write-Step 'フッククライアントを配置します'
@@ -335,6 +372,18 @@ sh.Run """$node"" ""$mainJs""", 0, False
     Write-Ok "$startupDir\VOICEVOX Coding.vbs"
     Write-Ok 'サインイン時にデーモンが起動し、タスクトレイに常駐します'
 }
+
+# --- 導入構成の記録 ---
+# ここまで到達した時点でフック登録はすべて成功している
+# （途中で失敗すれば $ErrorActionPreference = 'Stop' によりここには来ない）。
+# 失敗した実行で既存の期待構成を壊さないよう、保存は最後にまとめて行う。
+Write-Step '導入構成を記録します'
+Save-InstallManifest -Path $ManifestPath `
+    -IncludeToolEvents $IncludeToolEvents.IsPresent `
+    -SkipClaude $SkipClaude.IsPresent `
+    -SkipCodex $SkipCodex.IsPresent `
+    -RegisterStartup $RegisterStartup.IsPresent
+Write-Ok $ManifestPath
 
 Write-Host ''
 Write-Host '次の手順' -ForegroundColor White

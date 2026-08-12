@@ -17,7 +17,10 @@
       4. デーモンが稼働していた場合は起動し直す
 
 .PARAMETER IncludeToolEvents
-    install.ps1 にそのまま引き継ぐ。導入時に指定していた場合は更新時にも指定する。
+    install.ps1 にそのまま引き継ぐ。既定では install.json に記録された導入時の値を
+    自動で引き継ぐので、変えたいときだけ明示的に指定すればよい
+    （-SkipClaude / -SkipCodex も同様）。install.json が無い旧導入からの初回更新では、
+    現在の settings.json / hooks.json の登録状況から推定する。
 
 .PARAMETER SkipPull
     git pull を省略する（取得済みの状態から適用だけ行う）。
@@ -62,9 +65,10 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     exit $LASTEXITCODE
 }
 
-$RepoRoot   = Split-Path -Parent $PSScriptRoot
-$ConfigDir  = Join-Path $env:USERPROFILE '.voicevox-coding'
+$RepoRoot    = Split-Path -Parent $PSScriptRoot
+$ConfigDir   = Join-Path $env:USERPROFILE '.voicevox-coding'
 $RuntimeJson = Join-Path $ConfigDir 'runtime.json'
+$ManifestPath = Join-Path $ConfigDir 'install.json'
 
 function Write-Step([string]$m) { Write-Host "`n== $m" -ForegroundColor Cyan }
 function Write-Ok([string]$m)   { Write-Host "  [OK] $m" -ForegroundColor Green }
@@ -114,6 +118,76 @@ function Confirm-DaemonProcess([int]$ownerPid, $runtime) {
         }
     } catch {}
     return $false
+}
+
+<#
+  install.ps1 が保存した「期待する導入構成」(install.json) を読む。
+  無い、または壊れている場合は $null を返す（呼び出し側で現状からの推定に切り替える）。
+#>
+function Read-InstallManifest([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        return $raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+function Read-JsonFileSafe([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        return $raw | ConvertFrom-Json
+    } catch {
+        return $null
+    }
+}
+
+<#
+  settings.json / hooks.json の中から、我々のフック (hook-client.js) が
+  登録されているイベント名の一覧を返す（doctor.mjs の countOurHooks 相当）。
+#>
+function Get-OurHookEvents($root) {
+    $events = @()
+    if (-not $root -or -not (Get-Member -InputObject $root -Name 'hooks' -ErrorAction SilentlyContinue)) { return $events }
+    if (-not $root.hooks) { return $events }
+    foreach ($prop in $root.hooks.PSObject.Properties) {
+        foreach ($g in @($prop.Value)) {
+            if (-not $g) { continue }
+            foreach ($hk in @($g.hooks)) {
+                if (-not $hk) { continue }
+                if ([string]$hk.command -like '*hook-client.js*') { $events += $prop.Name }
+            }
+        }
+    }
+    return $events
+}
+
+<#
+  install.json が無い（manifest 保存に対応する前の）既存導入からの初回更新用に、
+  現在の settings.json / hooks.json から実効オプションを推定する。
+#>
+function Get-BackfillEstimate {
+    $claudeDir      = Join-Path $env:USERPROFILE '.claude'
+    $settingsPath   = Join-Path $claudeDir 'settings.json'
+    $codexDir       = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    $codexHooksPath = Join-Path $codexDir 'hooks.json'
+
+    $claudeEvents = Get-OurHookEvents (Read-JsonFileSafe $settingsPath)
+    $codexEvents  = Get-OurHookEvents (Read-JsonFileSafe $codexHooksPath)
+
+    $toolEvents = @('PreToolUse', 'PostToolUse')
+    $claudeHasToolEvents = @($claudeEvents | Where-Object { $toolEvents -contains $_ }).Count -gt 0
+    $codexHasToolEvents  = @($codexEvents  | Where-Object { $toolEvents -contains $_ }).Count -gt 0
+
+    return [pscustomobject]@{
+        IncludeToolEvents = ($claudeHasToolEvents -or $codexHasToolEvents)
+        SkipClaude        = ($claudeEvents.Count -eq 0)
+        SkipCodex         = ($codexEvents.Count -eq 0)
+    }
 }
 
 # --- 1. リポジトリの最新化 ---
@@ -223,11 +297,45 @@ if ($wasRunning) {
 # --- 3. フックとスタートアップの再生成 ---
 Write-Step 'フック定義とスタートアップ登録を作り直します'
 
+# オプションは install.ps1 の実行時に install.json へ記録される。
+# このスクリプトで明示的に指定されなかったスイッチだけ、その記録値（または、記録が
+# 無い旧導入の場合は現状からの推定値）で補う。$PSBoundParameters に無いキーは
+# 「このスイッチは指定されていない」ことを意味する（未指定と $false の明示指定を区別する）。
+$explicitIncludeToolEvents = $PSBoundParameters.ContainsKey('IncludeToolEvents')
+$explicitSkipClaude        = $PSBoundParameters.ContainsKey('SkipClaude')
+$explicitSkipCodex         = $PSBoundParameters.ContainsKey('SkipCodex')
+
+$effIncludeToolEvents = $IncludeToolEvents.IsPresent
+$effSkipClaude        = $SkipClaude.IsPresent
+$effSkipCodex         = $SkipCodex.IsPresent
+
+$manifest = Read-InstallManifest $ManifestPath
+if ($manifest) {
+    Write-Ok "導入時のオプションを引き継ぎます: $ManifestPath"
+    if (-not $explicitIncludeToolEvents -and (Get-Member -InputObject $manifest -Name 'includeToolEvents' -ErrorAction SilentlyContinue)) {
+        $effIncludeToolEvents = [bool]$manifest.includeToolEvents
+    }
+    if (-not $explicitSkipClaude -and (Get-Member -InputObject $manifest -Name 'skipClaude' -ErrorAction SilentlyContinue)) {
+        $effSkipClaude = [bool]$manifest.skipClaude
+    }
+    if (-not $explicitSkipCodex -and (Get-Member -InputObject $manifest -Name 'skipCodex' -ErrorAction SilentlyContinue)) {
+        $effSkipCodex = [bool]$manifest.skipCodex
+    }
+} elseif ((-not $explicitIncludeToolEvents) -or (-not $explicitSkipClaude) -or (-not $explicitSkipCodex)) {
+    Write-Warn2 'install.json が無いため現状から推定しました'
+    $estimate = Get-BackfillEstimate
+    if (-not $explicitIncludeToolEvents) { $effIncludeToolEvents = $estimate.IncludeToolEvents }
+    if (-not $explicitSkipClaude)        { $effSkipClaude        = $estimate.SkipClaude }
+    if (-not $explicitSkipCodex)         { $effSkipCodex         = $estimate.SkipCodex }
+}
+
+# スタートアップ登録は記録に頼らず、VBS の実在という物理的な事実で判定する
+# （手動でショートカットを消す／作るなど、記録と食い違いうるため）。
 $startupVbs = Join-Path ([Environment]::GetFolderPath('Startup')) 'VOICEVOX Coding.vbs'
 $installArgs = @{}
-if ($IncludeToolEvents) { $installArgs['IncludeToolEvents'] = $true }
-if ($SkipClaude)        { $installArgs['SkipClaude'] = $true }
-if ($SkipCodex)         { $installArgs['SkipCodex'] = $true }
+if ($effIncludeToolEvents) { $installArgs['IncludeToolEvents'] = $true }
+if ($effSkipClaude)        { $installArgs['SkipClaude'] = $true }
+if ($effSkipCodex)         { $installArgs['SkipCodex'] = $true }
 if (Test-Path $startupVbs) { $installArgs['RegisterStartup'] = $true }
 
 & (Join-Path $PSScriptRoot 'install.ps1') @installArgs
