@@ -171,6 +171,17 @@ test('logLevel を error に絞ってもログ基盤自身の障害通知は残�
   await logger.close();
 });
 
+test('ローテーションが固着していても close() は期限内に返る', async () => {
+  const logPath = tmpLogPath();
+  const logger = new Logger(() => 'info', { path: logPath });
+  logger.info('a');
+  logger.rotating = true; // ストレージ障害でローテーションが終わらない状況を模擬
+  const t0 = Date.now();
+  await logger.close();
+  // main.js の 2 秒のフォールバック exit より先に返ること
+  assert.ok(Date.now() - t0 < 1900, `close() に ${Date.now() - t0}ms かかった`);
+});
+
 test('close() は二重に呼んでも例外にならない', async () => {
   const logPath = tmpLogPath();
   const logger = new Logger(() => 'info', { path: logPath });

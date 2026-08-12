@@ -273,7 +273,8 @@ export class Logger {
     this.rotating = true;
     let failure = null;
     try {
-      for (let attempt = 0; attempt < MAX_ROTATE_ATTEMPTS && this.bytes > this.maxBytes; attempt++) {
+      // close() が始まったら再試行を続けない（終了は 2 秒の期限内に収める）
+      for (let attempt = 0; attempt < MAX_ROTATE_ATTEMPTS && this.bytes > this.maxBytes && !this.closed; attempt++) {
         const oldStream = this.stream;
         this.stream = null;
         if (oldStream) await this.#endStream(oldStream);
@@ -323,15 +324,19 @@ export class Logger {
   }
 
   async #doClose() {
-    // ローテーションの途中なら完了を待ってから閉じる
-    while (this.rotating) {
+    // close() 全体で 1 つの期限を共有する。ローテーションの途中なら完了を
+    // 期限まで待つ（closed フラグを見てローテーション側も再試行をやめる）。
+    // 待ちきれなければ諦めて進む。ストレージ障害でここが延びても、
+    // main.js の 2 秒のフォールバック exit より先に抜けられるようにする。
+    const deadline = Date.now() + CLOSE_FLUSH_TIMEOUT_MS;
+    while (this.rotating && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     this.#flushPending();
     const stream = this.stream;
     this.stream = null;
     if (!stream) return;
-    // 終了時は main.js の 2 秒フォールバック exit より先に破棄と警告を終える
-    await this.#endStream(stream, CLOSE_FLUSH_TIMEOUT_MS);
+    // 残り時間で flush を待つ（最低 200ms は与えて、正常系の end を確実に通す）
+    await this.#endStream(stream, Math.max(200, deadline - Date.now()));
   }
 }

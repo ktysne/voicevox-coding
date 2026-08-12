@@ -4,7 +4,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkMutationRequest } from '../src/daemon/server.js';
+import { checkMutationRequest, isRejectedDuringShutdown } from '../src/daemon/server.js';
 
 const PORT = 7591;
 const TOKEN = 'a'.repeat(64);
@@ -123,4 +123,24 @@ test('/api/* は application/x-www-form-urlencoded をトークンがあって�
   });
   assert.equal(r.ok, false);
   assert.equal(r.status, 415);
+});
+
+// ---------------------------------------------------------------- 終了処理中のガード
+
+test('終了処理中は状態変更 API を拒否する', () => {
+  assert.equal(isRejectedDuringShutdown({ shuttingDown: true }, 'POST', '/api/engine/start'), true);
+  assert.equal(isRejectedDuringShutdown({ shuttingDown: true }, 'POST', '/api/skip'), true);
+});
+
+test('終了処理中でも /api/shutdown と GET は通す（安全性の検証は従来どおり後段が行う）', () => {
+  assert.equal(isRejectedDuringShutdown({ shuttingDown: true }, 'POST', '/api/shutdown'), false);
+  assert.equal(isRejectedDuringShutdown({ shuttingDown: true }, 'GET', '/api/state'), false);
+  // /api/shutdown がガードを素通りしても、悪意ある Origin は checkMutationRequest が拒否する
+  const r = check('/api/shutdown', { origin: 'https://evil.example', 'content-type': 'application/json' });
+  assert.equal(r.ok, false);
+});
+
+test('終了処理中でなければ拒否しない', () => {
+  assert.equal(isRejectedDuringShutdown({ shuttingDown: false }, 'POST', '/api/engine/start'), false);
+  assert.equal(isRejectedDuringShutdown(undefined, 'POST', '/api/engine/start'), false);
 });
