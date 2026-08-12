@@ -157,13 +157,25 @@ function Read-InstallManifest([string]$path) {
 #>
 function Read-JsonFileStrict([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
+    $stop = { throw "設定ファイルを読み取れないため更新を中断しました（壊れている可能性があります。修復するか退避してから再実行してください）: $path" }
+    $raw = $null
     try {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        return $raw | ConvertFrom-Json
-    } catch {
-        throw "設定ファイルを読み取れないため更新を中断しました（壊れている可能性があります。修復するか退避してから再実行してください）: $path"
-    }
+    } catch { & $stop }
+    # 存在するのに空・空白のみは破損とみなす（正当な設定なら最低でも {} がある）
+    if ([string]::IsNullOrWhiteSpace($raw)) { & $stop }
+    $parsed = $null
+    try {
+        $parsed = $raw | ConvertFrom-Json
+    } catch { & $stop }
+    # ルートがオブジェクトでない（配列・数値・文字列など）のも破損とみなす
+    if ($parsed -isnot [System.Management.Automation.PSCustomObject]) { & $stop }
+    # hooks があるのにオブジェクトでない場合、推定が「フック 0 件」へ倒れて
+    # 意図的な Skip と誤認するため、これも破損として中断する
+    if ((Get-Member -InputObject $parsed -Name 'hooks' -ErrorAction SilentlyContinue) `
+        -and $null -ne $parsed.hooks `
+        -and $parsed.hooks -isnot [System.Management.Automation.PSCustomObject]) { & $stop }
+    return $parsed
 }
 
 <#

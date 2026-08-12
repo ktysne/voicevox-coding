@@ -250,10 +250,13 @@ async function main() {
   else warn('設定ファイル', `${CONFIG_PATH} がありません（デーモン初回起動時に作られます）`);
 
   // --- 導入構成（install.ps1 が保存した期待構成） ---
-  const rawManifest = readJson(MANIFEST_PATH);
-  const manifest = normalizeInstallManifest(rawManifest);
+  // 「ファイルが無い」と「壊れている・形式が不正」を区別する。診断ツールなので、
+  // 存在するのに使えない manifest は必ず警告する（JSON の破損も readJson が null に
+  // 畳んでしまうため、存在確認を別に行う）
+  const manifestExists = fs.existsSync(MANIFEST_PATH);
+  const manifest = manifestExists ? normalizeInstallManifest(readJson(MANIFEST_PATH)) : null;
   if (manifest) ok('導入構成', `${MANIFEST_PATH} を期待構成として使用します`);
-  else if (rawManifest) warn('導入構成', `${MANIFEST_PATH} の形式が不正なため無視します（scripts\\install.ps1 の再実行で作り直せます）`);
+  else if (manifestExists) warn('導入構成', `${MANIFEST_PATH} が壊れているか形式が不正なため無視します（scripts\\install.ps1 の再実行で作り直せます）`);
 
   const port = config?.daemon?.port ?? 7591;
   const baseUrl = config?.engine?.baseUrl ?? 'http://127.0.0.1:50021';

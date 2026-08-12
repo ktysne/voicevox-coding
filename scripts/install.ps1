@@ -286,6 +286,50 @@ function Save-InstallManifest {
     Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
 
+<#
+  対象ファイルから我々のフック (hook-client.js) をすべて解除する。
+  -SkipClaude / -SkipCodex へ切り替えた更新で、以前に登録したフックが
+  残って読み上げが続いてしまわないようにするために使う。
+  他のフックは保ち、変更が無ければ何もしない（バックアップも作らない）。
+#>
+function Remove-AllOurHooks([string]$path, [string]$label) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+    if ([string]::IsNullOrWhiteSpace($raw)) { return }
+    $root = $raw | ConvertFrom-Json -AsHashtable
+    if (-not $root.ContainsKey('hooks') -or $root.hooks -isnot [hashtable]) { return }
+
+    $removed = 0
+    $hooks = $root['hooks']
+    foreach ($ev in @($hooks.Keys)) {
+        $kept = @()
+        foreach ($g in @($hooks[$ev])) {
+            if ($null -eq $g) { continue }
+            $inner = @()
+            foreach ($hk in @($g.hooks)) {
+                if ($null -eq $hk) { continue }
+                if ([string]$hk.command -like '*hook-client.js*') { $removed++; continue }
+                $inner += $hk
+            }
+            if ($inner.Count -gt 0) {
+                $ng = [ordered]@{}
+                if ($g.matcher) { $ng['matcher'] = $g.matcher }
+                $ng['hooks'] = $inner
+                $kept += $ng
+            }
+        }
+        if ($kept.Count -gt 0) { $hooks[$ev] = @($kept) } else { $hooks.Remove($ev) }
+    }
+    if ($removed -eq 0) { return }
+    if ($hooks.Count -eq 0) { $root.Remove('hooks') }
+
+    $backup = Backup-File $path
+    if ($backup) { Write-Ok "バックアップ: $backup" }
+    Set-Content -LiteralPath $path -Value ($root | ConvertTo-Json -Depth 30) -Encoding UTF8 -NoNewline
+    Write-Ok "$label のフックを $removed 件解除しました（対象外に切り替えたため）"
+    if ($backup) { Remove-OldBackups $path }
+}
+
 # ------------------------------------------------------------------ 開始
 
 Write-Host ''
@@ -352,6 +396,9 @@ if (-not $SkipClaude) {
     }
 } else {
     Write-Warn2 'Claude Code はスキップしました'
+    # 対象外へ切り替えた場合、残っている我々のフックは解除する
+    # （残すと読み上げが続き、doctor も対象外として検査しないため盲点になる）
+    Remove-AllOurHooks (Join-Path $ClaudeDir 'settings.json') 'Claude Code'
 }
 
 # --- Codex ---
@@ -400,6 +447,7 @@ if (-not $SkipCodex) {
     Write-Warn2 'Codex はフックの信頼を明示的に承認する必要があります。codex を起動して /hooks から承認してください。'
 } else {
     Write-Warn2 'Codex はスキップしました'
+    Remove-AllOurHooks (Join-Path $CodexDir 'hooks.json') 'Codex'
 }
 
 # --- スタートアップ登録 ---
