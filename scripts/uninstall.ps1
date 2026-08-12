@@ -27,15 +27,21 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     }
     $forward = @()
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-        if ($kv.Value -is [switch] -and -not $kv.Value.IsPresent) { continue }
-        $forward += "-$($kv.Key)"
-        if ($kv.Value -isnot [switch]) { $forward += [string]$kv.Value }
+        if ($kv.Value -is [switch]) {
+            # 明示的な -Name:$false も失わずに転送する（未指定と明示 false の区別を
+            # pwsh 側でも保つ。-File への -Name:$false 渡しは PowerShell が公式に対応）
+            $forward += "-$($kv.Key):`$$($kv.Value.IsPresent)"
+        } else {
+            $forward += "-$($kv.Key)"
+            $forward += [string]$kv.Value
+        }
     }
     & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forward
     exit $LASTEXITCODE
 }
 
 $InstallDir = Join-Path $env:USERPROFILE '.voicevox-coding'
+$HookScript = Join-Path $InstallDir 'hook-client.js'
 $ClaudeDir  = Join-Path $env:USERPROFILE '.claude'
 $CodexDir   = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 
@@ -50,6 +56,16 @@ function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow 
   削除に失敗しても uninstall 全体は失敗させず、警告だけ出して続行する。
   install.ps1 の同名関数と同じロジックだが、モジュール共有はせずそれぞれに持たせている。
 #>
+<#
+  コマンド文字列が「我々が登録したフック」かどうかの判定。
+  'hook-client.js' の部分一致では他製品の similar-hook-client.js まで
+  巻き込んで削除しかねないため、配置先の絶対パスで厳密に識別する。
+#>
+function Test-OurHookCommand([string]$command) {
+    if ([string]::IsNullOrEmpty($command)) { return $false }
+    return $command.IndexOf($HookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
 function Remove-OldBackups([string]$path, [int]$Keep = 5) {
     $dir  = Split-Path -Parent $path
     $name = Split-Path -Leaf $path
@@ -113,7 +129,7 @@ function Remove-OurHooks([string]$path) {
             $inner = @()
             foreach ($hk in @($g.hooks)) {
                 if ($null -eq $hk) { continue }
-                if ([string]$hk.command -like '*hook-client.js*') { $removed++; continue }
+                if (Test-OurHookCommand ([string]$hk.command)) { $removed++; continue }
                 $inner += $hk
             }
             if ($inner.Count -gt 0) {

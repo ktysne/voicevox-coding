@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/daemon/main.js",
     "console": "node src/daemon/main.js --open",
-    "test": "node --test test/textfilter.test.mjs test/message-stream.test.mjs test/doctor.test.mjs test/queue.test.mjs test/player.test.mjs test/codex-commentary-monitor.test.mjs test/server-guard.test.mjs test/dictionary.test.mjs test/ps1-encoding.test.mjs test/config.test.mjs test/voicevox.test.mjs test/tray-worker.test.mjs test/logger.test.mjs test/tray.test.mjs test/backup-retention.test.mjs",
+    "test": "node --test test/textfilter.test.mjs test/message-stream.test.mjs test/doctor.test.mjs test/queue.test.mjs test/player.test.mjs test/codex-commentary-monitor.test.mjs test/server-guard.test.mjs test/dictionary.test.mjs test/ps1-encoding.test.mjs test/config.test.mjs test/voicevox.test.mjs test/tray-worker.test.mjs test/logger.test.mjs test/tray.test.mjs test/backup-retention.test.mjs test/install-hooks.test.mjs",
     "doctor": "node scripts/doctor.mjs",
     "review:codex": "node tools/cross-review.js codex",
     "review:codex:fix": "node tools/cross-review.js codex --fix",

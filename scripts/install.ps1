@@ -44,23 +44,40 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     }
     $forward = @()
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-        if ($kv.Value -is [switch] -and -not $kv.Value.IsPresent) { continue }
-        $forward += "-$($kv.Key)"
-        if ($kv.Value -isnot [switch]) { $forward += [string]$kv.Value }
+        if ($kv.Value -is [switch]) {
+            # 明示的な -Name:$false も失わずに転送する（未指定と明示 false の区別を
+            # pwsh 側でも保つ。-File への -Name:$false 渡しは PowerShell が公式に対応）
+            $forward += "-$($kv.Key):`$$($kv.Value.IsPresent)"
+        } else {
+            $forward += "-$($kv.Key)"
+            $forward += [string]$kv.Value
+        }
     }
     & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forward
     exit $LASTEXITCODE
 }
 
-$RepoRoot   = Split-Path -Parent $PSScriptRoot
-$InstallDir = Join-Path $env:USERPROFILE '.voicevox-coding'
-$HookScript = Join-Path $InstallDir 'hook-client.js'
-$ClaudeDir  = Join-Path $env:USERPROFILE '.claude'
-$CodexDir   = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+$RepoRoot     = Split-Path -Parent $PSScriptRoot
+$InstallDir   = Join-Path $env:USERPROFILE '.voicevox-coding'
+$HookScript   = Join-Path $InstallDir 'hook-client.js'
+$ManifestPath = Join-Path $InstallDir 'install.json'
+$ClaudeDir    = Join-Path $env:USERPROFILE '.claude'
+$CodexDir     = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 
 function Write-Step($msg)  { Write-Host "  $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)    { Write-Host "  OK   $msg" -ForegroundColor Green }
 function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow }
+
+<#
+  コマンド文字列が「我々が登録したフック」かどうかの判定。
+  'hook-client.js' の部分一致だけでは、他製品の similar-hook-client.js のような
+  フックまで巻き込んで削除しかねないため、我々が配置した絶対パスで厳密に識別する
+  （Windows のパスは大文字小文字を区別しないので OrdinalIgnoreCase で比較する）。
+#>
+function Test-OurHookCommand([string]$command) {
+    if ([string]::IsNullOrEmpty($command)) { return $false }
+    return $command.IndexOf($HookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
 
 function Get-NodePath {
     $cmd = Get-Command node.exe -ErrorAction SilentlyContinue
@@ -198,7 +215,7 @@ function Merge-Hook {
         foreach ($hk in @($g.hooks)) {
             if ($null -eq $hk) { continue }
             $cmdText = [string]$hk.command
-            if ($cmdText -like '*hook-client.js*') { continue }   # 我々のもの → 捨てて再登録
+            if (Test-OurHookCommand $cmdText) { continue }   # 我々のもの → 捨てて再登録
             $inner += $hk
         }
         if ($inner.Count -gt 0) {
@@ -213,6 +230,117 @@ function Merge-Hook {
     return $Root
 }
 
+<#
+  対象イベントから我々のフックだけを取り除く。他のフックは残し、
+  空になったイベントキーは消す。-IncludeToolEvents を外した更新で、
+  以前に登録した高頻度フック（PreToolUse / PostToolUse）が
+  発火し続けないようにするために使う。
+#>
+function Remove-OurHook {
+    param(
+        [hashtable]$Root,
+        [string]$EventName
+    )
+    if (-not $Root.ContainsKey('hooks') -or $Root.hooks -isnot [hashtable]) { return $Root }
+    $hooks = $Root['hooks']
+    if (-not $hooks.ContainsKey($EventName)) { return $Root }
+
+    $kept = @()
+    foreach ($g in @($hooks[$EventName])) {
+        if ($null -eq $g) { continue }
+        $inner = @()
+        foreach ($hk in @($g.hooks)) {
+            if ($null -eq $hk) { continue }
+            if (Test-OurHookCommand ([string]$hk.command)) { continue }
+            $inner += $hk
+        }
+        if ($inner.Count -gt 0) {
+            $ng = [ordered]@{}
+            if ($g.matcher) { $ng['matcher'] = $g.matcher }
+            $ng['hooks'] = $inner
+            $kept += $ng
+        }
+    }
+    if ($kept.Count -gt 0) { $hooks[$EventName] = @($kept) } else { $hooks.Remove($EventName) }
+    return $Root
+}
+
+<#
+  「期待する導入構成」を manifest (install.json) に保存する。
+  update.ps1 はこれを読み、明示指定されなかったオプションを引き継ぐ。
+  doctor.mjs はこれを読み、導入形態に応じて検査の要否を判定する。
+  一時ファイルへ書いてから置き換えるので、書き込み中に落ちても既存の manifest は壊れない。
+#>
+function Save-InstallManifest {
+    param(
+        [string]$Path,
+        [bool]$IncludeToolEvents,
+        [bool]$SkipClaude,
+        [bool]$SkipCodex,
+        [bool]$RegisterStartup
+    )
+
+    $manifest = [ordered]@{
+        schemaVersion     = 1
+        savedAt           = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+        includeToolEvents = $IncludeToolEvents
+        skipClaude        = $SkipClaude
+        skipCodex         = $SkipCodex
+        registerStartup   = $RegisterStartup
+    }
+    $json = $manifest | ConvertTo-Json -Depth 5
+
+    $dir = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $tmp = "$Path.tmp-$([guid]::NewGuid().ToString('N'))"
+    Set-Content -LiteralPath $tmp -Value $json -Encoding UTF8 -NoNewline
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+}
+
+<#
+  対象ファイルから我々のフック (hook-client.js) をすべて解除する。
+  -SkipClaude / -SkipCodex へ切り替えた更新で、以前に登録したフックが
+  残って読み上げが続いてしまわないようにするために使う。
+  他のフックは保ち、変更が無ければ何もしない（バックアップも作らない）。
+#>
+function Remove-AllOurHooks([string]$path, [string]$label) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+    if ([string]::IsNullOrWhiteSpace($raw)) { return }
+    $root = $raw | ConvertFrom-Json -AsHashtable
+    if (-not $root.ContainsKey('hooks') -or $root.hooks -isnot [hashtable]) { return }
+
+    $removed = 0
+    $hooks = $root['hooks']
+    foreach ($ev in @($hooks.Keys)) {
+        $kept = @()
+        foreach ($g in @($hooks[$ev])) {
+            if ($null -eq $g) { continue }
+            $inner = @()
+            foreach ($hk in @($g.hooks)) {
+                if ($null -eq $hk) { continue }
+                if (Test-OurHookCommand ([string]$hk.command)) { $removed++; continue }
+                $inner += $hk
+            }
+            if ($inner.Count -gt 0) {
+                $ng = [ordered]@{}
+                if ($g.matcher) { $ng['matcher'] = $g.matcher }
+                $ng['hooks'] = $inner
+                $kept += $ng
+            }
+        }
+        if ($kept.Count -gt 0) { $hooks[$ev] = @($kept) } else { $hooks.Remove($ev) }
+    }
+    if ($removed -eq 0) { return }
+    if ($hooks.Count -eq 0) { $root.Remove('hooks') }
+
+    $backup = Backup-File $path
+    if ($backup) { Write-Ok "バックアップ: $backup" }
+    Set-Content -LiteralPath $path -Value ($root | ConvertTo-Json -Depth 30) -Encoding UTF8 -NoNewline
+    Write-Ok "$label のフックを $removed 件解除しました（対象外に切り替えたため）"
+    if ($backup) { Remove-OldBackups $path }
+}
+
 # ------------------------------------------------------------------ 開始
 
 Write-Host ''
@@ -221,6 +349,10 @@ Write-Host ('=' * 50)
 
 $node = Get-NodePath
 Write-Ok "node.exe: $node"
+
+if ($SkipClaude -and $SkipCodex) {
+    Write-Warn2 'フックの登録対象がありません（-SkipClaude と -SkipCodex が両方指定されています）'
+}
 
 # --- フッククライアントの配置 ---
 Write-Step 'フッククライアントを配置します'
@@ -251,6 +383,13 @@ if (-not $SkipClaude) {
         $matcher = if ($ev -in @('PreToolUse', 'PostToolUse')) { '*' } else { $null }
         $settings = Merge-Hook -Root $settings -EventName $ev -Command $cmd -Matcher $matcher -Async -TimeoutSec 10
     }
+    if (-not $IncludeToolEvents) {
+        # 以前の導入で登録したツールイベントが残っていると高頻度で発火し続ける。
+        # 今回の指定に合わせて取り除く（他のフックには触れない）
+        foreach ($ev in @('PreToolUse', 'PostToolUse')) {
+            $settings = Remove-OurHook -Root $settings -EventName $ev
+        }
+    }
 
     # 書き込む内容が既存ファイルと完全一致するなら、バックアップも書き込みも行わない。
     # これにより定例の update ではバックアップ世代がそもそも増えない。
@@ -268,6 +407,9 @@ if (-not $SkipClaude) {
     }
 } else {
     Write-Warn2 'Claude Code はスキップしました'
+    # 対象外へ切り替えた場合、残っている我々のフックは解除する
+    # （残すと読み上げが続き、doctor も対象外として検査しないため盲点になる）
+    Remove-AllOurHooks (Join-Path $ClaudeDir 'settings.json') 'Claude Code'
 }
 
 # --- Codex ---
@@ -284,6 +426,11 @@ if (-not $SkipCodex) {
         $matcher = if ($ev -in @('PreToolUse', 'PostToolUse')) { '*' } else { $null }
         $timeout = if ($ev -eq 'SessionEnd') { 3 } else { 5 }
         $codexHooks = Merge-Hook -Root $codexHooks -EventName $ev -Command $cmd -Matcher $matcher -TimeoutSec $timeout
+    }
+    if (-not $IncludeToolEvents) {
+        foreach ($ev in @('PreToolUse', 'PostToolUse')) {
+            $codexHooks = Remove-OurHook -Root $codexHooks -EventName $ev
+        }
     }
 
     # 書き込む内容が既存ファイルと完全一致するなら、バックアップも書き込みも行わない。
@@ -311,6 +458,7 @@ if (-not $SkipCodex) {
     Write-Warn2 'Codex はフックの信頼を明示的に承認する必要があります。codex を起動して /hooks から承認してください。'
 } else {
     Write-Warn2 'Codex はスキップしました'
+    Remove-AllOurHooks (Join-Path $CodexDir 'hooks.json') 'Codex'
 }
 
 # --- スタートアップ登録 ---
@@ -335,6 +483,18 @@ sh.Run """$node"" ""$mainJs""", 0, False
     Write-Ok "$startupDir\VOICEVOX Coding.vbs"
     Write-Ok 'サインイン時にデーモンが起動し、タスクトレイに常駐します'
 }
+
+# --- 導入構成の記録 ---
+# ここまで到達した時点でフック登録はすべて成功している
+# （途中で失敗すれば $ErrorActionPreference = 'Stop' によりここには来ない）。
+# 失敗した実行で既存の期待構成を壊さないよう、保存は最後にまとめて行う。
+Write-Step '導入構成を記録します'
+Save-InstallManifest -Path $ManifestPath `
+    -IncludeToolEvents $IncludeToolEvents.IsPresent `
+    -SkipClaude $SkipClaude.IsPresent `
+    -SkipCodex $SkipCodex.IsPresent `
+    -RegisterStartup $RegisterStartup.IsPresent
+Write-Ok $ManifestPath
 
 Write-Host ''
 Write-Host '次の手順' -ForegroundColor White
