@@ -56,19 +56,25 @@ function Remove-OldBackups([string]$path, [int]$Keep = 5) {
     if (-not (Test-Path -LiteralPath $dir)) { return }
 
     $pattern = '^' + [regex]::Escape($name) + '\.bak-\d{8}-\d{6}(-\d+)?$'
+    # 並びは「タイムスタンプの降順 → 同一秒の枝番の数値降順」。名前の文字列降順だと
+    # 枝番が二桁になったとき -9 が -10 より新しい扱いになり、最新の世代を消してしまう
     $backups = @(
         Get-ChildItem -LiteralPath $dir -File -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -match $pattern } |
-            Sort-Object Name -Descending
+            ForEach-Object {
+                [void]($_.Name -match '\.bak-(\d{8}-\d{6})(?:-(\d+))?$')
+                [pscustomobject]@{ File = $_; Stamp = $Matches[1]; Seq = [int]($Matches[2] ?? 1) }
+            } |
+            Sort-Object -Property Stamp, Seq -Descending
     )
 
     if ($backups.Count -le $Keep) { return }
 
     foreach ($old in $backups[$Keep..($backups.Count - 1)]) {
         try {
-            Remove-Item -LiteralPath $old.FullName -Force
+            Remove-Item -LiteralPath $old.File.FullName -Force
         } catch {
-            Write-Warn2 "古いバックアップを削除できませんでした: $($old.FullName) ($($_.Exception.Message))"
+            Write-Warn2 "古いバックアップを削除できませんでした: $($old.File.FullName) ($($_.Exception.Message))"
         }
     }
 }

@@ -112,6 +112,30 @@ Remove-OldBackups $target
   }
 });
 
+test('同一秒の枝番が二桁になっても、数値順で新しい 5 世代が残る', { skip: !pwshOk }, () => {
+  const { dir } = runHarness(`
+$target = Join-Path $WORK 'settings.json'
+Set-Content -LiteralPath $target -Value '{}'
+# 同一秒に 12 世代（無印 = 1 番目、-2 〜 -12）。文字列降順だと -9 が -10 より
+# 新しい扱いになり、本来最新の -10 〜 -12 が消えてしまう
+Set-Content -LiteralPath (Join-Path $WORK 'settings.json.bak-20260101-000000') -Value 'g1'
+foreach ($n in 2..12) {
+  Set-Content -LiteralPath (Join-Path $WORK ("settings.json.bak-20260101-000000-" + $n)) -Value ("g" + $n)
+}
+Remove-OldBackups $target
+`);
+  const names = listNames(dir);
+  // 数値順で新しい 5 世代（-8 〜 -12）が残る
+  for (const n of [8, 9, 10, 11, 12]) {
+    assert.ok(names.includes(`settings.json.bak-20260101-000000-${n}`), `-${n} が消えている`);
+  }
+  // 古い側（無印と -2 〜 -7）は消える
+  assert.ok(!names.includes('settings.json.bak-20260101-000000'), '無印が残っている');
+  for (const n of [2, 3, 4, 5, 6, 7]) {
+    assert.ok(!names.includes(`settings.json.bak-20260101-000000-${n}`), `-${n} が残っている`);
+  }
+});
+
 test('同一秒のバックアップは上書きせず一意化され、一意化された世代も整理対象になる', { skip: !pwshOk }, () => {
   const { dir, stdout } = runHarness(`
 $target = Join-Path $WORK 'hooks.json'
