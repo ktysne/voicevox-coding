@@ -63,7 +63,10 @@ function Remove-OldBackups([string]$path, [int]$Keep = 5) {
             Where-Object { $_.Name -match $pattern } |
             ForEach-Object {
                 [void]($_.Name -match '\.bak-(\d{8}-\d{6})(?:-(\d+))?$')
-                [pscustomobject]@{ File = $_; Stamp = $Matches[1]; Seq = [int]($Matches[2] ?? 1) }
+                # ?? は PowerShell 7 専用。5.1 は自己再起動より前にファイル全体を
+                # パースするため、ここで使うと -File 起動が構文エラーで壊れる
+                $seq = if ($Matches[2]) { [int]$Matches[2] } else { 1 }
+                [pscustomobject]@{ File = $_; Stamp = $Matches[1]; Seq = $seq }
             } |
             Sort-Object -Property Stamp, Seq -Descending
     )

@@ -70,6 +70,20 @@ function listNames(dir) {
   return fs.readdirSync(dir).filter((f) => f !== 'harness.ps1').sort();
 }
 
+test('スクリプトは Windows PowerShell 5.1 でも構文解析できる', { skip: process.platform !== 'win32' }, () => {
+  // install / uninstall / update は 5.1 から起動されると pwsh へ自己再起動するが、
+  // 5.1 は再起動の分岐に到達する前にファイル全体をパースする。
+  // そのため 7 専用の構文（?? や ?. など）が 1 箇所でもあると -File 起動ごと壊れる。
+  for (const script of ['install.ps1', 'uninstall.ps1', 'update.ps1']) {
+    const p = path.join(ROOT, 'scripts', script);
+    const r = spawnSync('powershell.exe', ['-NoProfile', '-Command',
+      `$errs = $null; [void][System.Management.Automation.Language.Parser]::ParseFile('${p.replace(/'/g, "''")}', [ref]$null, [ref]$errs); $errs.Count`,
+    ], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `powershell.exe の実行に失敗: ${r.stderr}`);
+    assert.equal(r.stdout.trim(), '0', `${script} が Windows PowerShell 5.1 で解析できない`);
+  }
+});
+
 test('世代整理は厳密一致する古い世代だけを消し、似た名前は巻き込まない', { skip: !pwshOk }, () => {
   const { dir } = runHarness(`
 $target = Join-Path $WORK 'settings.json'
