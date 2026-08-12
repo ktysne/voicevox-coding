@@ -27,6 +27,31 @@ const MAX_LIST_PAUSE_SEC = 10;
 // UI で設定できる範囲なら履歴が残っており、極端な値で保持期間が汚染されることもない。
 const MAX_DEDUPE_WINDOW_SEC = 120;
 
+// WAV キャッシュの索引（cacheIndex）をディスクと作り直す間隔。外部からの削除や
+// 上限の縮小などで索引が実体とずれても、ここで再同期される（ヒステリシス）。
+const CACHE_INDEX_RESYNC_MS = 10 * 60 * 1000;
+
+// キャッシュヒット時、ディスクの mtime を touch する最短間隔。毎ヒットで
+// utimes を呼ぶと I/O が増えるので、間引いて「おおまかに」利用時刻を残す。
+const CACHE_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+
+/**
+ * キャッシュの保持数。手編集で数値以外が入っても既定値へ倒す。
+ * NaN のまま比較すると size <= NaN が常に偽になり、整理が全エントリ
+ * （直前に合成した再生予定の WAV を含む）を削除してしまう。
+ * 0 以下は「無制限」（maxChars などの 0 と同じ扱い）。「全部消す」と
+ * 解釈すると、書き込み直後の再生予定 WAV まで削除して再生に失敗する。
+ */
+function cacheMaxEntriesOf(value) {
+  const v = Number(value ?? 300);
+  if (!Number.isFinite(v)) return 300;
+  // 切り下げてから判定する。0.5 のような正の小数を先に正数判定すると、
+  // 切り下げ後に 0（全消し）へ化けてしまう
+  const n = Math.floor(v);
+  if (n <= 0) return Infinity;
+  return n;
+}
+
 /** 同一文の抑止時間（ミリ秒）。手編集で数値以外や極端な値が入っても読み上げを止めない。 */
 function dedupeWindowMs(sec) {
   const v = Number(sec);
@@ -141,6 +166,45 @@ export class SpeechQueue extends EventEmitter {
     this.skipRequested = false;
     this.recent = new Map(); // dedupe 用: key -> 最後に受理した時刻
     this.seq = 0;
+    // WAV キャッシュの索引。key はファイルパス、value は { lastUsedMs, touchedAt }。
+    // lastUsedMs は削除順の判定に使う「実際に使われた時刻」、touchedAt は
+    // ディスクの mtime を最後に touch した時刻（間引き判定用）。
+    // null の間は #ensureCacheIndex() が初回の全走査で組み立てる。
+    this.cacheIndex = null;
+    this.cacheIndexScannedAt = 0;
+    // 合成済みでまだ再生に使い終わっていない WAV。整理の削除対象から除外する。
+    // 上限が小さいと、先読み合成に伴う整理が「再生待ち・再生中」のファイルを
+    // 最古として消してしまい、ワーカーの Load が file not found になるため。
+    // 同一テキストの連続チャンクは同じキャッシュファイルを共有するので、
+    // Set ではなく参照カウント（Map<file, count>）で持つ。
+    // 追加は #synthesizeChunk、除去は #discardAudio（すべての消費経路が通る）。
+    this.protectedWavs = new Map();
+    // キャッシュの走査・整理の失敗を「直るまで 1 回だけ」warn で知らせるためのフラグ。
+    // 再試行のたびに warn を繰り返さない（続報は debug に落とす）
+    this.cacheScanWarned = false;
+    this.cachePruneWarned = false;
+  }
+
+  /** 再生に使い終わるまで WAV を整理から守る（参照カウントを増やす）。 */
+  #protectWav(file) {
+    this.protectedWavs.set(file, (this.protectedWavs.get(file) ?? 0) + 1);
+  }
+
+  /** 保護を 1 つ外し、参照が無くなったら整理の対象へ戻す。 */
+  #unprotectWav(file) {
+    const count = this.protectedWavs.get(file) ?? 0;
+    if (count <= 1) this.protectedWavs.delete(file);
+    else this.protectedWavs.set(file, count - 1);
+  }
+
+  /** キャッシュ整理まわりの失敗を、直るまで 1 回だけ warn で知らせる（続報は debug）。 */
+  #warnCacheIssue(flag, message) {
+    if (this[flag]) {
+      this.log?.debug?.(message);
+      return;
+    }
+    this[flag] = true;
+    this.log?.warn?.(message);
   }
 
   get state() {
@@ -276,6 +340,11 @@ export class SpeechQueue extends EventEmitter {
     if (useCache && fs.existsSync(file)) {
       try {
         const buf = fs.readFileSync(file);
+        this.#recordCacheHit(file);
+        this.#protectWav(file);
+        // 整理は書き込み時だけでなくヒット時にも確認する。上限を実行中に
+        // 縮小した後の発話がヒットばかりだと、いつまでも古い上限のまま残る
+        this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
         return { file, durationMs: wavDurationMs(buf) };
       } catch {
         // キャッシュが壊れていたら作り直す
@@ -295,13 +364,24 @@ export class SpeechQueue extends EventEmitter {
       } catch {}
       throw err;
     }
-    if (useCache) this.#pruneCache(cfg.daemon?.cacheMaxEntries ?? 300);
+    if (useCache) {
+      this.#recordCacheWrite(file);
+      // いま書いた WAV はこれから player.play() へ渡すので、整理の対象から守る
+      this.#protectWav(file);
+      this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
+    }
     return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache };
   }
 
   /** 一時 WAV を削除する。再生ワーカーは PLAY 時に全体をメモリへ読むので、再生後の削除は安全。 */
   #discardAudio(audio) {
-    if (!audio?.ephemeral) return;
+    if (!audio) return;
+    // 再生に使い終わった（または使わないことが確定した）ので、整理の保護を外す。
+    // 保護中は削除候補が無くて上限超過が残ることがあるため、外した直後に
+    // 整理を再試行する（キューが空になると次の発話まで機会が無い）
+    this.#unprotectWav(audio.file);
+    this.#maybePruneCache(cacheMaxEntriesOf(this.getConfig().daemon?.cacheMaxEntries));
+    if (!audio.ephemeral) return;
     fs.unlink(audio.file, (err) => {
       // 一時的な EBUSY/EPERM (ウイルス対策など) は起動時掃除が拾うが、無通知にはしない
       if (err && err.code !== 'ENOENT') this.log?.warn(`一時 WAV を削除できません: ${err.message}`);
@@ -338,23 +418,174 @@ export class SpeechQueue extends EventEmitter {
     }
   }
 
-  #pruneCache(maxEntries) {
+  /**
+   * CACHE_DIR を全走査し、有効な（tmp- でない）.wav の mtime を集める。
+   * 索引の構築・再同期の両方で使う唯一の全走査経路。
+   * ディレクトリが無い（ENOENT）のは正常で空の Map、それ以外の失敗
+   * （一時的な EPERM/EBUSY 等）は null を返す。呼び出し側は null のとき
+   * 既存の索引を維持し、次の機会に再試行する（空で確定させると、既知の
+   * エントリを失ったまま最大 10 分間、上限超過を見逃してしまう）。
+   */
+  #scanDiskCacheFiles() {
+    let files;
     try {
-      const files = fs
-        .readdirSync(CACHE_DIR)
-        .filter((f) => f.endsWith('.wav'))
-        .map((f) => {
-          const p = path.join(CACHE_DIR, f);
-          return { p, mtime: fs.statSync(p).mtimeMs };
-        });
-      if (files.length <= maxEntries) return;
-      files.sort((a, b) => a.mtime - b.mtime);
-      for (const f of files.slice(0, files.length - maxEntries)) {
-        try {
-          fs.unlinkSync(f.p);
-        } catch {}
+      files = fs.readdirSync(CACHE_DIR);
+    } catch (err) {
+      if (err?.code === 'ENOENT') return new Map(); // CACHE_DIR がまだ無いのは正常
+      this.#warnCacheIssue('cacheScanWarned', `キャッシュの一覧を取得できません（整理を見送ります）: ${err.message}`);
+      return null;
+    }
+    const map = new Map();
+    for (const f of files) {
+      if (!f.endsWith('.wav') || f.startsWith('tmp-')) continue;
+      const p = path.join(CACHE_DIR, f);
+      try {
+        map.set(p, fs.statSync(p).mtimeMs);
+      } catch (err) {
+        // 列挙後に消えていた（ENOENT）のは正常。それ以外（一時的な EPERM/EBUSY 等）を
+        // 「存在しない」と同一視すると、再同期で既知のエントリまで索引から消えるので、
+        // 走査全体を失敗扱いにして既存の索引を維持する
+        if (err?.code === 'ENOENT') continue;
+        this.#warnCacheIssue('cacheScanWarned', `キャッシュの情報を取得できません（整理を見送ります）(${p}): ${err.message}`);
+        return null;
       }
-    } catch {}
+    }
+    this.cacheScanWarned = false; // 走査が成功したら、次の失敗をまた warn で知らせる
+    return map;
+  }
+
+  /**
+   * 索引が未構築なら、ディスクの mtime を初期値として組み立てる。
+   * 走査に失敗したときは索引を確定させず（this.cacheIndex は null のまま）、
+   * 使い捨ての空 Map を返して次の機会に組み立て直す。
+   */
+  #ensureCacheIndex() {
+    if (this.cacheIndex) return this.cacheIndex;
+    const disk = this.#scanDiskCacheFiles();
+    if (disk === null) return new Map();
+    const index = new Map();
+    for (const [file, mtimeMs] of disk) {
+      index.set(file, { lastUsedMs: mtimeMs, touchedAt: 0, touching: false });
+    }
+    this.cacheIndex = index;
+    this.cacheIndexScannedAt = Date.now();
+    return this.cacheIndex;
+  }
+
+  /**
+   * 索引をディスクと作り直す。ただし、既に索引にあるエントリ
+   * （プロセス内で覚えた利用順や touch の状態）は保持し、実体に無いものを除去、
+   * 索引に無い実体ファイルだけを mtime で追加する。
+   * 走査に失敗したときは既存の索引と scannedAt を維持する（次の整理で再試行）。
+   */
+  #resyncCacheIndex() {
+    const disk = this.#scanDiskCacheFiles();
+    if (disk === null) return;
+    const merged = new Map();
+    for (const [file, mtimeMs] of disk) {
+      merged.set(file, this.cacheIndex?.get(file) ?? { lastUsedMs: mtimeMs, touchedAt: 0, touching: false });
+    }
+    this.cacheIndex = merged;
+    this.cacheIndexScannedAt = Date.now();
+  }
+
+  /** キャッシュヒット時に呼ぶ。利用時刻を索引へ反映し、間引きつつディスクの mtime も touch する。 */
+  #recordCacheHit(file) {
+    const index = this.#ensureCacheIndex();
+    const now = Date.now();
+    const entry = index.get(file);
+    const prevTouchedAt = entry?.touchedAt ?? 0;
+    // touching は「utimes の応答待ち」の印。応答を待たずに同じファイルへ何度も
+    // 発行すると、完了が逆順に届いたとき古い時刻で mtime を巻き戻し得る
+    const touching = entry?.touching === true;
+    const shouldTouch = !touching && now - prevTouchedAt >= CACHE_TOUCH_INTERVAL_MS;
+    index.set(file, { lastUsedMs: now, touchedAt: prevTouchedAt, touching: touching || shouldTouch });
+    if (shouldTouch) {
+      // 再起動後も利用順がおおよそ保たれるよう、ディスク側にも粗く残す。
+      // 結果を待たない fire-and-forget（失敗しても読み上げは止めない）。
+      // touchedAt は成功が確認できてから進める。先に進めると、一時的な
+      // EPERM/EBUSY のとき次の間引き間隔まで再試行されず、無通知のまま
+      // 再起動後の利用順（LRU）が失われる。
+      const sec = now / 1000;
+      fs.utimes(file, sec, sec, (err) => {
+        // 応答待ちの間に #resyncCacheIndex が Map を差し替えていることがあるので、
+        // 完了時点の現行索引を見る（古い Map へ書いても現行状態に反映されない）
+        const current = this.cacheIndex?.get(file);
+        if (!current) return; // その間に整理などで消えていた
+        this.cacheIndex.set(file, {
+          ...current,
+          touching: false,
+          // 古い完了で新しい時刻を巻き戻さない
+          touchedAt: err ? current.touchedAt : Math.max(current.touchedAt, now),
+        });
+        if (err) this.log?.debug?.(`キャッシュの利用時刻を反映できません (${file}): ${err.message}`);
+      });
+    }
+  }
+
+  /** 書き込み完了（rename 後）に呼ぶ。索引へ最新の利用時刻を記録する。 */
+  #recordCacheWrite(file) {
+    const index = this.#ensureCacheIndex();
+    const now = Date.now();
+    const touching = index.get(file)?.touching === true;
+    index.set(file, { lastUsedMs: now, touchedAt: now, touching });
+  }
+
+  /**
+   * 索引が上限を超えたときだけ、古い順に削除して上限まで戻す。
+   * protectedWavs（合成済みでまだ再生に使い終わっていない WAV）は削除しない。
+   * lastUsedMs が最新なので通常は対象にならないが、上限が小さいときの
+   * 先読み合成に伴う整理では「再生待ちの前チャンク」が最古になり得るのと、
+   * より古い候補の削除が EPERM 等で失敗し続けると代替候補として順番が
+   * 回ってくるため、明示的に除外する。
+   */
+  #maybePruneCache(maxEntries) {
+    this.#ensureCacheIndex();
+
+    // 時間経過による再同期はサイズ判定より先に行う。索引が実体より少なく
+    // 見えている場合（初回走査の部分的な失敗、外部からの WAV 追加など）、
+    // サイズ判定で先に戻ると実ファイル数が上限を超えたまま放置されるため。
+    // 外部削除・上限の縮小・同名再保存とのずれもここで追随する。
+    if (Date.now() - this.cacheIndexScannedAt >= CACHE_INDEX_RESYNC_MS) {
+      this.#resyncCacheIndex();
+    }
+
+    // 走査の失敗が続いている間は索引が確定していない（null）。整理は諦めて
+    // 次の機会に任せる（合成した WAV 自体は書けているので、読み上げは止めない）
+    const current = this.cacheIndex;
+    if (!current) return;
+    if (current.size <= maxEntries) {
+      // 上限以内に収まっている（外部削除や上限変更を含む）なら復旧扱い。
+      // 次の削除障害をまた warn で知らせる
+      this.cachePruneWarned = false;
+      return;
+    }
+
+    const entries = [...current.entries()].sort((a, b) => a[1].lastUsedMs - b[1].lastUsedMs);
+    let failed = 0;
+    for (const [file] of entries) {
+      if (current.size <= maxEntries) break;
+      if (this.protectedWavs.has(file)) continue;
+      try {
+        fs.unlinkSync(file);
+        current.delete(file);
+      } catch (err) {
+        // 実体が既に無いなら索引からだけ外す。それ以外（ウイルス対策の一時的な
+        // EPERM/EBUSY 等）は索引に残して次回の整理で再試行し、ここでは代わりに
+        // 次の候補を消して実ファイル数を上限へ近づける。索引から外してしまうと、
+        // 実体が残ったまま追跡できなくなり、以後は正常なキャッシュばかりが
+        // 削除され続ける。
+        if (err?.code === 'ENOENT') current.delete(file);
+        else failed += 1;
+      }
+    }
+    if (failed > 0) {
+      // 恒久的に失敗して上限を維持できない（ディスクが増え続ける）場合を
+      // 既定のログレベル (info) でも無通知にしない。直るまで 1 回だけ warn
+      this.#warnCacheIssue('cachePruneWarned', `キャッシュを ${failed} 件削除できませんでした（次回の整理で再試行します）`);
+    } else {
+      this.cachePruneWarned = false;
+    }
   }
 
   async #drain() {
