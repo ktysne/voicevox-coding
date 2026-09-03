@@ -83,6 +83,8 @@ npm run doctor
 エンジン、デーモン、両方のフックの登録状態、Codex の信頼状態をまとめて点検する。
 Codex Desktop 内のターミナルではなく、通常の PowerShell から実行する（Codex Desktop ではサンドボックス用の別の `CODEX_HOME` が使われるため）。
 
+Codex の検査は導入形態に従う。`-SkipCodex` で導入した場合は対象外として中立表示になり、Codex への問い合わせも行わない。`install.json` が無い旧導入では、`hooks.json` も `codex` CLI も見当たらない場合に限り「未導入」として警告にとどめる（それ以外は従来どおり検査する）。
+
 ここまで通れば、あとは Claude Code か Codex を普段どおり使うだけで読み上げが始まる。
 
 ---
@@ -110,7 +112,9 @@ PowerShell のプロンプトから実行する。
 4. 停止したデーモンを起動し直す
 
 スタートアップ登録の有無は自動で判定して引き継ぐ。
-導入時に `-IncludeToolEvents` などのオプションを指定していた場合は、更新時にも同じオプションを付ける。
+`-IncludeToolEvents` / `-SkipClaude` / `-SkipCodex` などのオプションは、導入時に `%USERPROFILE%\.voicevox-coding\install.json` へ記録され、更新時は自動で引き継がれる。
+変えたいときだけ、更新時にそのオプションを明示的に指定すればよい。
+`install.json` が無い（manifest 保存に対応する前に導入した）場合、初回更新時は現在の `settings.json` / `hooks.json` の登録状況から推定する。
 npm パッケージへの依存はないので、`npm install` は不要である。
 
 停止トークンを取得できない場合（`runtime.json` を書き出さない版のデーモンからの初回更新など）は、本デーモンのプロセスだと確認したうえで自動的に停止して続行する。
