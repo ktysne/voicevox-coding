@@ -226,11 +226,13 @@ export class SpeechQueue extends EventEmitter {
 
   /**
    * padMs はチャンクへ継ぎ足す無音の長さ（ミリ秒）。既定の 0 のときは今までと
-   * 完全に同じキーにして、既存キャッシュ（間の仕組みを知らない頃に作られたもの）を
+   * 完全に同じキーにして、padMs なしで作られた既存キャッシュを
    * 無効化しない。0 より大きいときだけキーの末尾へ足す。
+   * 本文とサフィックスの境界が曖昧にならないよう、区切りには本文に現れない
+   * `\u0000` を使う。
    */
   #cacheKey(text, speaker, voice, padMs = 0) {
-    const suffix = padMs > 0 ? `|pause:${padMs}` : '';
+    const suffix = padMs > 0 ? `\u0000pause:${padMs}` : '';
     return crypto
       .createHash('sha1')
       .update(`${speaker}|${JSON.stringify(voiceForCacheKey(voice))}|${text}${suffix}`)
@@ -338,7 +340,7 @@ export class SpeechQueue extends EventEmitter {
     const useCache = cfg.daemon?.cacheEnabled !== false;
     // 項目の切れ目のチャンクだけ、間のぶんの無音を音声データへ継ぎ足す。
     // こうすると再生後に HOLD（無音ループ）を挟まずに次の PLAY へ直行でき、
-    // 音声デバイスの開閉回数が増えない。
+    // 無音ループの開始と停止を挟まずに済む。
     const padMs = utterance.chunks[index]?.pauseAfter ? (utterance.pauseMs ?? 0) : 0;
     const key = this.#cacheKey(text, utterance.speaker, utterance.voice, padMs);
     // キャッシュ無効時は発話専用の一時ファイルにする。再生後に削除するので蓄積しない。
@@ -709,7 +711,7 @@ export class SpeechQueue extends EventEmitter {
           // 直行できる。#synthesizeChunk はテキストが空などの理由で null を返すことがあるため、
           // settled だけでは「解決したが音声が無い」場合を「用意できている」と誤判定してしまう。
           // 発話をまたぐ先読みはしていないので、次発話待ちのときは「用意できていない」扱いにする。
-          // 次の音声が手元にあるのに HOLD を挟むと、そのぶん音声デバイスの開閉が増えて逆効果になる。
+          // 次の音声が手元にあるのに HOLD を挟むと、無音ループの開始と停止が余分に入る。
           const nextReady = hasNextChunk && utterance.prefetch?.index === i + 1
             && utterance.prefetch.settled && Boolean(utterance.prefetch.value);
           const shouldHold = hasNext && (needsPause || !nextReady);
@@ -729,9 +731,9 @@ export class SpeechQueue extends EventEmitter {
 
             // 箇条書き項目の切れ目では、次のチャンクへ移る前に少しだけ待って間を作る。
             // 音声データへ間を継ぎ足せていれば needsPause が false になり、ここは通らない
-            // （間は再生時間に含まれている）。HOLD の無音ループが流れている状態でだけ待つ
-            // （音声デバイスを掴んだままなので間のあとの出だしが欠けない）。HOLD に失敗した
-            // ときは黙って待たず、間を諦めて次のチャンクへ進む。
+            // （間は再生時間に含まれている）。HOLD の無音ループが再生中のときだけ待つ。
+            // 待っている間も無音が出力されるため、間のあとの音声の出だしが欠けない。
+            // HOLD に失敗したときは黙って待たず、間を諦めて次のチャンクへ進む。
             if (holdStarted && needsPause) {
               await this.#wait(utterance.pauseMs);
             }

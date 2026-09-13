@@ -17,7 +17,8 @@ function buildWav({
   channels = 1,
   extraChunk = null,
 } = {}) {
-  const tail = extraChunk ? 8 + extraChunk.size : 0;
+  const dataPad = dataSize % 2;
+  const tail = dataPad + (extraChunk ? 8 + extraChunk.size + (extraChunk.size % 2) : 0);
   const buf = Buffer.alloc(44 + dataSize + tail);
   buf.write('RIFF', 0, 'ascii');
   buf.write('WAVE', 8, 'ascii');
@@ -33,8 +34,9 @@ function buildWav({
   buf.writeUInt32LE(dataSize, 40);
   buf.fill(0xaa, 44, 44 + dataSize);
   if (extraChunk) {
-    buf.write(extraChunk.id, 44 + dataSize, 'ascii');
-    buf.writeUInt32LE(extraChunk.size, 44 + dataSize + 4);
+    const extraOffset = 44 + dataSize + dataPad;
+    buf.write(extraChunk.id, extraOffset, 'ascii');
+    buf.writeUInt32LE(extraChunk.size, extraOffset + 4);
   }
   buf.writeUInt32LE(buf.length - 8, 4);
   return buf;
@@ -58,6 +60,19 @@ test('appendWavSilence は 8bit PCM の無音を 0x80 で埋める', () => {
   const out = appendWavSilence(buf, 100);
   assert.ok(out);
   assert.ok(out.subarray(48).every((b) => b === 0x80));
+});
+
+test('appendWavSilence は奇数長の 8bit PCM で旧パディングを捨てて新しいパディングを付ける', () => {
+  const buf = buildWav({ dataSize: 3, byteRate: 2000, blockAlign: 1, bitsPerSample: 8 });
+  buf[47] = 0x55; // 旧 data パディングを無音としてコピーしないことを確認する
+  const out = appendWavSilence(buf, 1); // 2 バイトを継ぎ足し、data サイズを 5 にする
+  assert.ok(out);
+  assert.deepEqual(out.subarray(44, 47), Buffer.from([0xaa, 0xaa, 0xaa]));
+  assert.deepEqual(out.subarray(47, 49), Buffer.from([0x80, 0x80]));
+  assert.equal(out[49], 0); // 奇数になった data の末尾に RIFF パディングを付ける
+  assert.equal(out.readUInt32LE(40), 5);
+  assert.equal(out.readUInt32LE(4), 42);
+  assert.equal(out.length, 50);
 });
 
 test('appendWavSilence は data の後ろに別チャンクが続く WAV では null を返す', () => {
