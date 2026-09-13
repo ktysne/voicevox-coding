@@ -1484,10 +1484,10 @@ test('間があるチャンクとないチャンクでキャッシュキーが�
   const files1 = cacheFilesFor([label]);
   const existing1 = new Set(files1.filter((file) => fs.existsSync(file)));
 
-  // 境界あり: 最初のチャンクに pauseAfter が立ち、pauseMs (200ms) がキーに乗る。
+  // 境界あり: 最初のチャンクに pauseAfter が立ち、pauseMs (20ms) がキーに乗る。
   const player2 = new FakePlayer();
   const queue2 = makeQueue(player2, { chunkChars: 100, cacheEnabled: true });
-  const files2 = cacheFilesFor([label], 1, {}, 200);
+  const files2 = cacheFilesFor([label], 1, {}, 20);
   const existing2 = new Set(files2.filter((file) => fs.existsSync(file)));
 
   try {
@@ -1499,7 +1499,7 @@ test('間があるチャンクとないチャンクでキャッシュキーが�
       speaker: 1,
       voice: {},
       queuePolicy: { policy: 'enqueue' },
-      listPauseSec: 0.2,
+      listPauseSec: 0.02,
     });
     await waitIdle(queue1);
     await waitIdle(queue2);
