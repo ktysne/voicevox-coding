@@ -39,6 +39,30 @@ const WAV = (() => {
   return buf;
 })();
 
+// data の後ろに別チャンク (JUNK) が続く WAV。appendWavSilence が「扱えない形式」として
+// null を返すことを再現するのに使う（wavDurationMs はこれまでどおり読めるので速く終わる）。
+const BROKEN_WAV = (() => {
+  const dataSize = 2;
+  const junkSize = 0;
+  const buf = Buffer.alloc(44 + dataSize + 8 + junkSize);
+  buf.write('RIFF', 0, 'ascii');
+  buf.writeUInt32LE(36 + dataSize + 8 + junkSize, 4);
+  buf.write('WAVE', 8, 'ascii');
+  buf.write('fmt ', 12, 'ascii');
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(24000, 24);
+  buf.writeUInt32LE(48000, 28);
+  buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34);
+  buf.write('data', 36, 'ascii');
+  buf.writeUInt32LE(dataSize, 40);
+  buf.write('JUNK', 44 + dataSize, 'ascii');
+  buf.writeUInt32LE(junkSize, 44 + dataSize + 4);
+  return buf;
+})();
+
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 class FakePlayer {
@@ -77,10 +101,12 @@ async function waitIdle(queue) {
   assert.fail('SpeechQueue did not become idle');
 }
 
-function cacheFilesFor(texts, speaker = 1, voice = {}) {
+// padMs > 0 のときだけ #cacheKey と同じ `|pause:${padMs}` サフィックスをキーへ足す。
+function cacheFilesFor(texts, speaker = 1, voice = {}, padMs = 0) {
+  const suffix = padMs > 0 ? `|pause:${padMs}` : '';
   return texts.map((text) => path.join(
     CACHE_DIR,
-    `${crypto.createHash('sha1').update(`${speaker}|${JSON.stringify(voice)}|${text}`).digest('hex')}.wav`,
+    `${crypto.createHash('sha1').update(`${speaker}|${JSON.stringify(voice)}|${text}${suffix}`).digest('hex')}.wav`,
   ));
 }
 
@@ -163,7 +189,9 @@ function makeCacheQueue(player, { maxEntries = 300, chunkChars = 100 } = {}) {
   return new SpeechQueue(engine, player, config, { warn() {} });
 }
 
-test('連続チャンクではチャンク間に HOLD を入れる', async () => {
+test('次の音声が用意できていればチャンク間に HOLD を挟まない', async () => {
+  // FakePlayer のエンジンは即座に解決するので、再生中に行う先読みは次の PLAY までに必ず間に合う。
+  // 次の音声が手元にあるなら HOLD で音声デバイスを開き直す必要が無い。
   const player = new FakePlayer();
   const queue = makeQueue(player, { chunkChars: 100 });
   const firstChunk = `${'あ'.repeat(99)}。`;
@@ -173,10 +201,32 @@ test('連続チャンクではチャンク間に HOLD を入れる', async () =>
   try {
     queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
     await waitIdle(queue);
-    assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'play']);
+    assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'play']);
   } finally {
     cleanupCache(files, existing);
   }
+});
+
+test('先読みが間に合わないときはチャンク間に HOLD を挟む', async () => {
+  const player = new FakePlayer();
+  let callCount = 0;
+  // 2 回目の合成 (2 チャンク目の先読み) だけ遅らせ、1 チャンク目の再生完了までに
+  // 先読みが解決しない状況を再現する。
+  const engine = {
+    synthesize: async () => {
+      callCount += 1;
+      if (callCount === 2) await sleep(50);
+      return { wav: WAV };
+    },
+  };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: false, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} });
+  mock.method(fs, 'unlink', (file, cb) => cb?.(null));
+  const firstChunk = `${'あ'.repeat(99)}。`;
+  const text = `${firstChunk}い。`;
+  queue.enqueue({ target: 'test', event: 'test', text, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+  assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'play']);
 });
 
 test('単発発話の末尾では HOLD を入れない', async () => {
@@ -508,8 +558,9 @@ test('項目の切れ目では次のチャンクまで間を置く (#15)', async
     listPauseSec: 0.15,
   });
   await waitIdle(queue);
-  // 間は HOLD (無音ループ) を掛けたまま待つ
-  assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'play']);
+  // 間は WAV の末尾へ継ぎ足された無音として入るので、HOLD は挟まれず PLAY が連続する。
+  // 間のぶんは #wait(durationMs) の対象時間が伸びることで表れる。
+  assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'play']);
   const gap = player.playAt[1] - player.playAt[0];
   assert.ok(gap >= 120, `間が短すぎます: ${gap}ms`);
 });
@@ -527,7 +578,7 @@ test('listPauseSec が 0 なら間を置かない (#15)', async () => {
     listPauseSec: 0,
   });
   await waitIdle(queue);
-  assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'play']);
+  assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'play']);
   // 間なしの実測は 10ms 未満。負荷の高い環境でも揺れないよう、余裕を持って見る。
   const gap = player.playAt[1] - player.playAt[0];
   assert.ok(gap < 120, `間が入っています: ${gap}ms`);
@@ -740,7 +791,7 @@ test('実行中に窓を短くすると、判定は現在の設定ですぐ効�
   await waitIdle(queue);
 });
 
-test('HOLD に失敗したときは間を置かずに次のチャンクへ進む (#15)', async () => {
+test('WAV へ無音を継ぎ足せず、かつ HOLD にも失敗したときは間を諦めて次のチャンクへ進む (#15)', async () => {
   class NoHoldPlayer extends FakePlayer {
     async hold() {
       this.calls.push(['hold']);
@@ -748,7 +799,12 @@ test('HOLD に失敗したときは間を置かずに次のチャンクへ進む
     }
   }
   const player = new NoHoldPlayer();
-  const queue = makeQueue(player, { chunkChars: 100, cacheEnabled: false });
+  // BROKEN_WAV は data の後ろに別チャンクが続く形式なので、appendWavSilence は
+  // 継ぎ足せず null を返す（後段は HOLD による間へフォールバックする）。
+  const engine = { synthesize: async () => ({ wav: BROKEN_WAV }) };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: false, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} });
+  mock.method(fs, 'unlink', (file, cb) => cb?.(null));
   queue.enqueue({
     target: 'test',
     event: 'test',
@@ -1331,4 +1387,75 @@ test('キャッシュヒットのたびに touch せず、5 分間隔で間引�
   // ミリ秒をそのまま渡すと極端に未来の日付になるバグを防ぐための確認。
   assert.equal(utimesCalls[0].atime, now / 1000);
   assert.equal(utimesCalls[0].mtime, now / 1000);
+});
+
+test('無音を継ぎ足せなかった音声は間つきのキーではなく間なしのキーで保存する (#15)', async () => {
+  // 間つきのキーのまま残すと、次回そのキーへキャッシュヒットしたときに実際には無音が
+  // 入っていないのに pausePadded: true を返し、HOLD へのフォールバックが働かず間が
+  // 丸ごと消えてしまう。継ぎ足せなかった中身は間なしの音声そのものなので、間なしの
+  // キー（padMs=0）で保存されることを確かめる。
+  mock.method(fs, 'readdirSync', () => []);
+  const player = new FakePlayer();
+  // BROKEN_WAV は data の後ろに別チャンクが続く形式なので appendWavSilence は必ず null を返す。
+  const engine = { synthesize: async () => ({ wav: BROKEN_WAV }) };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: true, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} });
+  const label = '継ぎ足せない項目';
+  const pausedFile = cacheFilesFor([label], 1, {}, 300)[0]; // 間つきのキー（本来は使われないはず）
+  const noPauseFile = cacheFilesFor([label])[0]; // 間なしのキー
+  const existing = new Set([pausedFile, noPauseFile].filter((f) => fs.existsSync(f)));
+  try {
+    queue.enqueue({
+      target: 'test',
+      event: 'test',
+      text: `${label}${LIST_BOUNDARY}\n次`,
+      speaker: 1,
+      voice: {},
+      queuePolicy: { policy: 'enqueue' },
+      listPauseSec: 0.3,
+    });
+    await waitIdle(queue);
+    assert.equal(player.calls[0][1], noPauseFile);
+    assert.notEqual(player.calls[0][1], pausedFile);
+  } finally {
+    cleanupCache([pausedFile, noPauseFile], existing);
+  }
+});
+
+test('間があるチャンクとないチャンクでキャッシュキーが分かれる (#15)', async () => {
+  mock.method(fs, 'readdirSync', () => []);
+  const label = '同じ文言のテスト';
+
+  // 境界なし: pauseAfter が立たないので padMs は常に 0（従来どおりのキー）。
+  const player1 = new FakePlayer();
+  const queue1 = makeQueue(player1, { chunkChars: 100, cacheEnabled: true });
+  const files1 = cacheFilesFor([label]);
+  const existing1 = new Set(files1.filter((file) => fs.existsSync(file)));
+
+  // 境界あり: 最初のチャンクに pauseAfter が立ち、pauseMs (200ms) がキーに乗る。
+  const player2 = new FakePlayer();
+  const queue2 = makeQueue(player2, { chunkChars: 100, cacheEnabled: true });
+  const files2 = cacheFilesFor([label], 1, {}, 200);
+  const existing2 = new Set(files2.filter((file) => fs.existsSync(file)));
+
+  try {
+    queue1.enqueue({ target: 'test', event: 'test', text: label, speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+    queue2.enqueue({
+      target: 'test',
+      event: 'test',
+      text: `${label}${LIST_BOUNDARY}\n次`,
+      speaker: 1,
+      voice: {},
+      queuePolicy: { policy: 'enqueue' },
+      listPauseSec: 0.2,
+    });
+    await waitIdle(queue1);
+    await waitIdle(queue2);
+    assert.notEqual(files1[0], files2[0]);
+    assert.equal(player1.calls[0][1], files1[0]);
+    assert.equal(player2.calls[0][1], files2[0]);
+  } finally {
+    cleanupCache(files1, existing1);
+    cleanupCache(files2, existing2);
+  }
 });

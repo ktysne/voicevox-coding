@@ -10,7 +10,7 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { CACHE_DIR } from './config.js';
 import { VOICE_PARAMS } from './catalog.js';
-import { wavDurationMs } from './player.js';
+import { wavDurationMs, appendWavSilence } from './player.js';
 import { LIST_BOUNDARY, DEFAULT_LIST_PAUSE_SEC, stripListBoundaries } from './textfilter.js';
 
 const SENTENCE_SPLIT = /(?<=[。．！？!?\n])/;
@@ -224,10 +224,16 @@ export class SpeechQueue extends EventEmitter {
     };
   }
 
-  #cacheKey(text, speaker, voice) {
+  /**
+   * padMs はチャンクへ継ぎ足す無音の長さ（ミリ秒）。既定の 0 のときは今までと
+   * 完全に同じキーにして、既存キャッシュ（間の仕組みを知らない頃に作られたもの）を
+   * 無効化しない。0 より大きいときだけキーの末尾へ足す。
+   */
+  #cacheKey(text, speaker, voice, padMs = 0) {
+    const suffix = padMs > 0 ? `|pause:${padMs}` : '';
     return crypto
       .createHash('sha1')
-      .update(`${speaker}|${JSON.stringify(voiceForCacheKey(voice))}|${text}`)
+      .update(`${speaker}|${JSON.stringify(voiceForCacheKey(voice))}|${text}${suffix}`)
       .digest('hex');
   }
 
@@ -330,10 +336,14 @@ export class SpeechQueue extends EventEmitter {
     if (!text) return null;
     const cfg = this.getConfig();
     const useCache = cfg.daemon?.cacheEnabled !== false;
-    const key = this.#cacheKey(text, utterance.speaker, utterance.voice);
+    // 項目の切れ目のチャンクだけ、間のぶんの無音を音声データへ継ぎ足す。
+    // こうすると再生後に HOLD（無音ループ）を挟まずに次の PLAY へ直行でき、
+    // 音声デバイスの開閉回数が増えない。
+    const padMs = utterance.chunks[index]?.pauseAfter ? (utterance.pauseMs ?? 0) : 0;
+    const key = this.#cacheKey(text, utterance.speaker, utterance.voice, padMs);
     // キャッシュ無効時は発話専用の一時ファイルにする。再生後に削除するので蓄積しない。
     // (キャッシュキーは hex なので tmp- と衝突しない)
-    const file = useCache
+    let file = useCache
       ? path.join(CACHE_DIR, `${key}.wav`)
       : path.join(CACHE_DIR, `tmp-${process.pid}-${utterance.id}-${index}.wav`);
 
@@ -345,13 +355,31 @@ export class SpeechQueue extends EventEmitter {
         // 整理は書き込み時だけでなくヒット時にも確認する。上限を実行中に
         // 縮小した後の発話がヒットばかりだと、いつまでも古い上限のまま残る
         this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
-        return { file, durationMs: wavDurationMs(buf) };
+        // キーに padMs が入っている以上、ヒットしたファイルは既に無音を継ぎ足し済み。
+        return { file, durationMs: wavDurationMs(buf), pausePadded: padMs > 0 };
       } catch {
         // キャッシュが壊れていたら作り直す
       }
     }
 
-    const { wav } = await this.engine.synthesize(text, utterance.speaker, utterance.voice);
+    let { wav } = await this.engine.synthesize(text, utterance.speaker, utterance.voice);
+    let pausePadded = false;
+    if (padMs > 0) {
+      // 継ぎ足せない（壊れた WAV や対応外の形式）場合は null が返る。
+      // その場合はそのまま使い、後段が従来の HOLD 待ちへフォールバックする。
+      const padded = appendWavSilence(wav, padMs);
+      if (padded) {
+        wav = padded;
+        pausePadded = true;
+      } else if (useCache) {
+        // 継ぎ足せなかった中身は間なしの音声そのものなので、間つきのキー (padMs 入り) では
+        // なく間なしのキーで保存し直す。間つきのキーのまま残すと、次回そのキーへキャッシュ
+        // ヒットしたときに実際には無音が入っていないのに pausePadded: true を返してしまい、
+        // HOLD へのフォールバックが働かず間が丸ごと消えてしまう。
+        const noPauseKey = this.#cacheKey(text, utterance.speaker, utterance.voice, 0);
+        file = path.join(CACHE_DIR, `${noPauseKey}.wav`);
+      }
+    }
     fs.mkdirSync(CACHE_DIR, { recursive: true });
     const tmp = `${file}.tmp`;
     try {
@@ -370,7 +398,8 @@ export class SpeechQueue extends EventEmitter {
       this.#protectWav(file);
       this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
     }
-    return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache };
+    // durationMs は継ぎ足したあとの wav から求める（間のぶんも再生時間に含める）。
+    return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache, pausePadded };
   }
 
   /** 一時 WAV を削除する。再生ワーカーは PLAY 時に全体をメモリへ読むので、再生後の削除は安全。 */
@@ -639,13 +668,19 @@ export class SpeechQueue extends EventEmitter {
           // 再生している間に次チャンクを先に合成しておく。
           // 失敗は rejection のまま保持し、消費時 (このループの先頭の catch) で
           // 通常の合成失敗と同じ扱い (警告ログ + error イベント) にする。
-          // ここで .catch(() => {}) を付けるのは、誰にも await されないまま
-          // 発話が終了・スキップされた場合の unhandledRejection を防ぐためだけで、
-          // 実際の結果 (reject) は変えない。
+          // settled/value は、次の PLAY までに先読みが間に合ったかを判定するために持たせる
+          // (#drain の HOLD 要否判定で使う)。reject したものは「用意できていない」扱いにする。
+          // then() の第二引数を付けるのは、誰にも await されないまま発話が終了・スキップ
+          // された場合の unhandledRejection を防ぐためだけで、実際の結果 (reject) は変えない。
+          // 消費時 (このループの先頭、await pre.promise) では本来の reject をそのまま受け取る。
           if (i + 1 < utterance.chunks.length) {
             const promise = this.#synthesizeChunk(utterance, i + 1);
-            promise.catch(() => {});
-            utterance.prefetch = { index: i + 1, promise };
+            const pre = { index: i + 1, promise, settled: false, value: undefined };
+            promise.then((value) => {
+              pre.settled = true;
+              pre.value = value;
+            }, () => {});
+            utterance.prefetch = pre;
           }
 
           try {
@@ -662,10 +697,23 @@ export class SpeechQueue extends EventEmitter {
           await this.#wait(audio.durationMs ?? 1500);
           this.#discardAudio(audio);
 
-          // 次チャンクまたは次発話がある間だけ、再生完了直後から無音をループする。
+          // 次チャンクまたは次発話がある間だけ、再生完了直後から無音をループする候補になる。
           // skip/clear 後は STOP 済みなので HOLD を開始しない。
-          const hasNext = i + 1 < utterance.chunks.length || this.queue.length > 0;
-          if (!this.skipRequested && hasNext) {
+          const hasNextChunk = i + 1 < utterance.chunks.length;
+          const hasNext = hasNextChunk || this.queue.length > 0;
+          // 音声データの末尾へ間を継ぎ足せていれば、HOLD を挟まずに次の PLAY へ直行できる
+          // （間そのものは再生済みの音声に含まれている）。継ぎ足せなかったときだけ、
+          // 従来どおり HOLD の無音ループで間を作る。
+          const needsPause = !audio.pausePadded && utterance.pauseMs > 0 && utterance.chunks[i].pauseAfter;
+          // 次チャンクの先読みが解決済みで、かつ実際に音声を持っているなら、そのまま次の PLAY に
+          // 直行できる。#synthesizeChunk はテキストが空などの理由で null を返すことがあるため、
+          // settled だけでは「解決したが音声が無い」場合を「用意できている」と誤判定してしまう。
+          // 発話をまたぐ先読みはしていないので、次発話待ちのときは「用意できていない」扱いにする。
+          // 次の音声が手元にあるのに HOLD を挟むと、そのぶん音声デバイスの開閉が増えて逆効果になる。
+          const nextReady = hasNextChunk && utterance.prefetch?.index === i + 1
+            && utterance.prefetch.settled && Boolean(utterance.prefetch.value);
+          const shouldHold = hasNext && (needsPause || !nextReady);
+          if (!this.skipRequested && shouldHold) {
             let holdStarted = false;
             try {
               await this.player.hold();
@@ -680,10 +728,11 @@ export class SpeechQueue extends EventEmitter {
             }
 
             // 箇条書き項目の切れ目では、次のチャンクへ移る前に少しだけ待って間を作る。
-            // HOLD の無音ループが流れている状態でだけ待つ（音声デバイスを掴んだままなので
-            // 間のあとの出だしが欠けない）。HOLD に失敗したときは黙って待たず、
-            // 間を諦めて次のチャンクへ進む。
-            if (holdStarted && utterance.pauseMs > 0 && utterance.chunks[i].pauseAfter) {
+            // 音声データへ間を継ぎ足せていれば needsPause が false になり、ここは通らない
+            // （間は再生時間に含まれている）。HOLD の無音ループが流れている状態でだけ待つ
+            // （音声デバイスを掴んだままなので間のあとの出だしが欠けない）。HOLD に失敗した
+            // ときは黙って待たず、間を諦めて次のチャンクへ進む。
+            if (holdStarted && needsPause) {
               await this.#wait(utterance.pauseMs);
             }
           }

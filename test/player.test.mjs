@@ -1,7 +1,92 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { Player } from '../src/daemon/player.js';
+import { Player, appendWavSilence } from '../src/daemon/player.js';
+
+/**
+ * テスト用の最小 WAV (PCM) を組み立てる。data の後ろへ extraChunk を続けると、
+ * appendWavSilence が「data の後ろに別チャンクが続く」形として弾く対象になる。
+ * 元データは 0xAA で埋め、継ぎ足した無音 (0 または 0x80) と見分けられるようにする。
+ */
+function buildWav({
+  dataSize = 4,
+  byteRate = 48000,
+  blockAlign = 2,
+  bitsPerSample = 16,
+  sampleRate = 24000,
+  channels = 1,
+  extraChunk = null,
+} = {}) {
+  const tail = extraChunk ? 8 + extraChunk.size : 0;
+  const buf = Buffer.alloc(44 + dataSize + tail);
+  buf.write('RIFF', 0, 'ascii');
+  buf.write('WAVE', 8, 'ascii');
+  buf.write('fmt ', 12, 'ascii');
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20); // AudioFormat = PCM
+  buf.writeUInt16LE(channels, 22);
+  buf.writeUInt32LE(sampleRate, 24);
+  buf.writeUInt32LE(byteRate, 28);
+  buf.writeUInt16LE(blockAlign, 32);
+  buf.writeUInt16LE(bitsPerSample, 34);
+  buf.write('data', 36, 'ascii');
+  buf.writeUInt32LE(dataSize, 40);
+  buf.fill(0xaa, 44, 44 + dataSize);
+  if (extraChunk) {
+    buf.write(extraChunk.id, 44 + dataSize, 'ascii');
+    buf.writeUInt32LE(extraChunk.size, 44 + dataSize + 4);
+  }
+  buf.writeUInt32LE(buf.length - 8, 4);
+  return buf;
+}
+
+test('appendWavSilence は無音を末尾へ継ぎ足し、data と RIFF のサイズを書き直す', () => {
+  const buf = buildWav({ dataSize: 4, byteRate: 48000, blockAlign: 2, bitsPerSample: 16 });
+  const out = appendWavSilence(buf, 100);
+  assert.ok(out);
+  // 100ms 分 = 48000 * 0.1 = 4800 バイト（blockAlign=2 の倍数なのでそのまま入る）
+  assert.equal(out.length, buf.length + 4800);
+  assert.equal(out.readUInt32LE(40), 4 + 4800); // data チャンクのサイズ
+  assert.equal(out.readUInt32LE(4), out.length - 8); // RIFF のサイズ
+  assert.deepEqual(out.subarray(44, 48), buf.subarray(44, 48)); // 元データはそのまま残る
+  assert.ok(out.subarray(48, 48 + 4800).every((b) => b === 0)); // 継ぎ足しは 16bit なので 0 埋め
+  assert.equal(buf.length, 48); // 元の buf は書き換えない
+});
+
+test('appendWavSilence は 8bit PCM の無音を 0x80 で埋める', () => {
+  const buf = buildWav({ dataSize: 4, byteRate: 24000, blockAlign: 1, bitsPerSample: 8 });
+  const out = appendWavSilence(buf, 100);
+  assert.ok(out);
+  assert.ok(out.subarray(48).every((b) => b === 0x80));
+});
+
+test('appendWavSilence は data の後ろに別チャンクが続く WAV では null を返す', () => {
+  const buf = buildWav({ dataSize: 2, extraChunk: { id: 'JUNK', size: 0 } });
+  assert.equal(appendWavSilence(buf, 100), null);
+});
+
+test('appendWavSilence は RIFF として読めないデータでは null を返す', () => {
+  assert.equal(appendWavSilence(Buffer.from('not a wav'), 100), null);
+});
+
+test('appendWavSilence は silenceMs が正の有限数でなければ null を返す', () => {
+  const buf = buildWav();
+  assert.equal(appendWavSilence(buf, 0), null);
+  assert.equal(appendWavSilence(buf, -10), null);
+  assert.equal(appendWavSilence(buf, NaN), null);
+  assert.equal(appendWavSilence(buf, Infinity), null);
+});
+
+test('appendWavSilence は byteRate や blockAlign が壊れていれば null を返す', () => {
+  assert.equal(appendWavSilence(buildWav({ byteRate: 0 }), 100), null);
+  assert.equal(appendWavSilence(buildWav({ blockAlign: 0 }), 100), null);
+});
+
+test('appendWavSilence は切り下げると 0 バイトになる短い無音では null を返す', () => {
+  // rawBytes = round(byteRate * silenceMs / 1000) が blockAlign 未満なら切り下げで 0 になる
+  const buf = buildWav({ byteRate: 100, blockAlign: 100 });
+  assert.equal(appendWavSilence(buf, 1), null);
+});
 
 // 実ワーカー（PowerShell）は起動できないので、stdin/stdout を偽装した子プロセスで置き換える。
 // 応答は明示的に emitLine() したときだけ返るため、タイムアウトと遅延応答を再現できる。

@@ -39,6 +39,77 @@ export function wavDurationMs(buf) {
   }
 }
 
+/**
+ * WAV データの末尾へ無音を継ぎ足した新しい Buffer を返す。
+ * 項目の切れ目の間を HOLD（無音ループ）ではなく音声データ自体に持たせることで、
+ * 間の前後で音声デバイスを開き直さずに済む（#drain 側で使う）。
+ * 元の buf は書き換えない。
+ *
+ * 次のいずれかに該当するときは継ぎ足さず null を返す。呼び出し側は
+ * 従来どおり HOLD で間を作る経路へフォールバックする。
+ *   ・buf が WAV として読めない、または fmt / data チャンクが見つからない
+ *   ・data チャンクの後ろに別のチャンクが続く形式（data の終端がファイル末尾と一致しない）
+ *   ・silenceMs が有限の正の数でない
+ *   ・byteRate や blockAlign が 0 以下（壊れた fmt チャンク）
+ *   ・継ぎ足す無音が blockAlign の倍数へ切り下げると 0 バイトになる（間が短すぎる）
+ */
+export function appendWavSilence(buf, silenceMs) {
+  try {
+    if (!Number.isFinite(silenceMs) || silenceMs <= 0) return null;
+    if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') return null;
+
+    let offset = 12;
+    let byteRate = null;
+    let blockAlign = null;
+    let bitsPerSample = null;
+    let dataOffset = null;
+    let dataSize = null;
+    while (offset + 8 <= buf.length) {
+      const id = buf.toString('ascii', offset, offset + 4);
+      const size = buf.readUInt32LE(offset + 4);
+      if (id === 'fmt ') {
+        byteRate = buf.readUInt32LE(offset + 16);
+        blockAlign = buf.readUInt16LE(offset + 20);
+        bitsPerSample = buf.readUInt16LE(offset + 22);
+      } else if (id === 'data') {
+        dataOffset = offset + 8;
+        dataSize = size;
+        break;
+      }
+      offset += 8 + size + (size % 2);
+    }
+    if (byteRate === null || dataOffset === null) return null;
+    if (!(byteRate > 0) || !(blockAlign > 0)) return null;
+
+    // data の後ろに別のチャンクが続く形（パディングバイトを除いてファイル末尾と一致しない）
+    // は扱わない。継ぎ足す位置が data の直後で確実にファイル末尾になる場合だけ対応する。
+    const pad = dataSize % 2;
+    if (dataOffset + dataSize + pad !== buf.length) return null;
+
+    // 無音のバイト数は blockAlign の倍数へ切り下げる。フレームの途中で切れたバイト列は
+    // 波形として不正になるため。切り下げて 0 になるほど短い間なら継ぎ足す意味がない。
+    const rawBytes = Math.round((byteRate * silenceMs) / 1000);
+    const silenceBytes = Math.floor(rawBytes / blockAlign) * blockAlign;
+    if (silenceBytes <= 0) return null;
+
+    // 無音の埋め値は 16bit 以上の PCM では 0（無音 = 振幅 0）。
+    // 8bit PCM だけは無符号形式で中央値 0x80 が無音に当たる。
+    const fillByte = bitsPerSample <= 8 ? 0x80 : 0x00;
+
+    const newDataSize = dataSize + silenceBytes;
+    const newPad = newDataSize % 2;
+    const out = Buffer.alloc(dataOffset + newDataSize + newPad);
+    buf.copy(out, 0, 0, dataOffset + dataSize); // ヘッダ一式 + 元の音声データ
+    out.fill(fillByte, dataOffset + dataSize, dataOffset + newDataSize);
+    // data チャンクのサイズと RIFF のサイズ（オフセット 4）を継ぎ足したぶん増やして書き直す
+    out.writeUInt32LE(newDataSize, dataOffset - 4);
+    out.writeUInt32LE(out.length - 8, 4);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 export class Player extends EventEmitter {
   /**
    * @param {object} [logger]
