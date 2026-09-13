@@ -9,3 +9,7 @@ Thumbs.db
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# ai-cross-review のローカル状態と生成物 (往復回数、レビュー出力、PR コメント本文)
+.cross-review-state.json
+.cross-review/
