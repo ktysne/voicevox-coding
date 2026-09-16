@@ -40,9 +40,9 @@
 //   スクリプトが `approval_policy=never` を明示していない場合は bridge を使わず直接起動へ戻し、
 //   「Codex の承認は never 固定」を保つ。スクリプトが無い環境でも従来どおり直接起動する
 //   (`--no-codex-agent` で明示的に直接起動へ戻せる)。
-// - Codex が利用上限に達したときは、レビューを失敗で終わらせず subagent 経路と同じプロンプトを
-//   ファイルへ書き出し、終了コード 75 で「客観サブエージェントへ渡してください」と促す
-//   (`--no-fallback` で従来どおりの失敗終了に戻せる)。
+// - GPT 側が利用上限やモデルの混雑などで使えないときは、レビューを失敗で終わらせず subagent 経路と
+//   同じプロンプトをファイルへ書き出し、終了コード 75 で「客観サブエージェントへ渡してください」
+//   と促す (`--no-fallback` で従来どおりの失敗終了に戻せる)。
 // - リモートコントロール環境では codex/claude スタンドアロン CLI を spawn できない。その場合は
 //   reviewer に `subagent` を指定すると、外部プロセスを起動せず、組み立てたレビュープロンプト
 //   (観点 + スコープ + 差分本文 + モード別指示) を stdout に出すだけにする。呼び出し側 (Claude) が
@@ -65,7 +65,7 @@
 //   writeState) に置く。ファイルが壊れているときは警告して無視し、書き戻さない (記録を消さない)。
 //   書き込みは必ず「書く直前に読み直した状態」を基にする。レビュアーの実行中に別プロセスが
 //   dismiss や別ブランチのレビュー完了を書いていることがあり、起動前のスナップショットで
-//   上書きするとその更新が消えるため。往復を CLI が観測できない経路 (利用上限フォールバック) は
+//   上書きするとその更新が消えるため。往復を CLI が観測できない経路 (GPT 側使用不能のフォールバック) は
 //   記録せず、レビューを終えた利用者が `state --mark` で進める。
 // - 既定 base は「前回レビュー SHA → PR の base ブランチ → origin/main → ローカル main」の順で
 //   解決する。前者ほど差分が小さく、かつ人の指定なしで決まる情報だから。決めた base と解決方法は
@@ -166,7 +166,7 @@ const CODEX_SANDBOX_WORKSPACE_WRITE = 'workspace-write';
 const APPROVAL_NEVER_MARKER = 'approval_policy=never';
 
 // codex-agent.sh の終了コード。3 = bridge が未導入 (codex コマンドや定義が無い、codex_enabled: false)、
-// 75 = Codex が利用上限で実行できなかった。
+// 75 = GPT 側の事情 (利用上限やモデルの混雑など) で実行できなかった。
 const CODEX_AGENT_EXIT_MISSING = 3;
 const USAGE_LIMIT_EXIT_CODE = 75;
 
@@ -174,10 +174,10 @@ const USAGE_LIMIT_EXIT_CODE = 75;
 // 429 は単語境界で照合し、ID や桁数の一致で誤検出しないようにする。
 const USAGE_LIMIT_PATTERN = /usage limit|rate limit|too many requests|\b429\b/i;
 
-// 利用上限の判定に使う出力の保持量 (末尾のみ)。ログ全体を溜め込まないための上限。
+// 終了理由と直接起動時の利用上限判定に使う出力の保持量 (末尾のみ)。ログ全体を溜め込まないための上限。
 const OUTPUT_TAIL_LIMIT = 64 * 1024;
 
-// レビュー出力を `.cross-review/` へ保存するために保持する量の上限。上限判定の末尾 64KB とは別に、
+// レビュー出力を `.cross-review/` へ保存するために保持する量の上限。終了分類用の末尾 64KB とは別に、
 // 保存用は全文を溜める。青天井にすると異常出力でメモリを食い潰すため上限を設け、
 // 超えた分は先頭を捨てて末尾を残す (保存時に切り詰めた旨を書き添える)。
 const OUTPUT_CAPTURE_LIMIT = 4 * 1024 * 1024;
@@ -353,11 +353,21 @@ function toExcludePathspecs(patterns) {
   return patterns.map((p) => `:(exclude,glob,top)**/${p}`);
 }
 
-// レビューのみ (既定) の追加指示。ファイルを変更させない。
+// レビューのみ (既定) の追加指示。ファイルを変更させず、指摘ごとに推奨の対応方法を添えさせる。
+// 対応方法まで書かせるのは、主セッションが指摘の裏取りと同時に直し方の妥当性を判断でき、
+// 指摘だけから直し方を組み立て直す手間を省けるため。対応を指摘の解消に必要な範囲へ絞らせるのは、
+// レビュアーが指摘に便乗して大きな作り込みを勧めやすいため。
+// 観点 (.cross-review.md) ではなくモード別指示に置くのは、取り込み先の観点ファイルの内容によらず、
+// すべてのレビュアー経路 (codex / claude / subagent) へ同じ出力形式を求めるため。
 const REVIEW_ONLY_INSTRUCTION = [
   '【モード: レビューのみ】',
-  'ファイルは変更しないでください。指摘のみを重大度 (blocker / 要修正 / 提案) 付きで列挙し、',
+  'ファイルは変更しないでください。指摘を重大度 (blocker / 要修正 / 提案) 付きで列挙し、',
   '問題が無ければその旨を明記してください。',
+  '指摘がある場合は、各指摘に推奨の対応方法を添えてください。',
+  '- 直す箇所と直し方を、呼び出し側がそのまま着手できる粒度で書く。',
+  '- 対応は指摘の解消に必要な範囲に留め、無関係なリファクタや作り込みを含めない。',
+  '- 仕様判断や設計選択が要る場合は、推奨案とその理由を書き、他に取り得る案があれば併記する。',
+  '- 詳述せず一覧にまとめた指摘は、対応方法を一行で添える。',
 ].join('\n');
 
 // --fix の追加指示。検出事項を作業ツリーへ直接修正させる (相互レビューフロー 3B)。
@@ -366,8 +376,8 @@ const FIX_INSTRUCTION = [
   '検出した問題は、作業ツリーのファイルを直接編集して修正してください。',
   '- 修正は差分に現れた変更へのフィードバックに限定し、無関係なリファクタはしない。',
   '- レビュー観点 (.cross-review.md) に挙げた禁則・不変条件を壊さない。',
-  '- 仕様判断・設計選択などユーザの確認が要る事項は修正せず、指摘として残す。',
-  '- 最後に「修正したファイルと内容・理由」「未修正で残した指摘」を日本語で要約する。',
+  '- 仕様判断や設計選択などユーザの確認が要る事項は修正せず、推奨の対応方法 (推奨案とその理由、他に取り得る案) を添えて指摘として残す。',
+  '- 最後に「修正したファイルと内容・理由」「未修正で残した指摘と推奨の対応方法」を日本語で要約する。',
   '構文チェック / lint / テスト / プロジェクト固有の整合性チェックは呼び出し側が後で実行する。',
 ].join('\n');
 
@@ -425,7 +435,7 @@ const USAGE = [
   '  state --reset     現在のブランチの記録を消す',
   '  state --mark      往復を 1 回分記録する (round を 1 増やし、直前レビュー SHA を現在の HEAD にする)。',
   '                    --uncommitted を付けると SHA を据え置く (--uncommitted のレビュー後に使う)。',
-  '                    利用上限フォールバックのプロンプトを客観サブエージェントへ渡してレビューを',
+  '                    GPT 側使用不能のフォールバックプロンプトを客観サブエージェントへ渡してレビューを',
   '                    終えた後など、CLI がレビューの成立を観測できないときに手で記録する',
   '  dismiss "<要約>"  非対応と判断した指摘を記録する (以降のレビュープロンプトに',
   '                    「再指摘しない」節として添えられる。同じ要約は重複追加しない)',
@@ -456,14 +466,15 @@ const USAGE = [
   '  --codex-agent <name>  bridge (codex-agent.sh) で使う定義名を明示 (既定: レビューのみ codex-review /',
   '                        --fix は codex-subagent。--fix と食い違う定義名はエラー)',
   '  --no-codex-agent      bridge を使わず codex を直接起動する (従来の起動方法)',
-  '  --no-fallback         Codex が利用上限でも subagent 代替へ切り替えず、そのまま失敗終了する',
+  '  --no-fallback         GPT 側が使えなくても (利用上限やモデルの混雑など) subagent 代替へ切り替えず、',
+  '                        そのまま失敗終了する',
   '  --no-pr-check         レビュー実行前の PR 存在確認 (gh pr view) を省く',
   '  --reviewer <name>     comment: 対象のレビュアーを明示 (省略時はブランチ別ディレクトリのメタ情報から自動選択)',
   '  --verify <path>       comment: 検証コマンドの出力ファイルを「確認内容」節へ入れる (末尾 200 行まで)',
   '  --out <path>          comment: 生成した本文の書き出し先 (既定はブランチ別ディレクトリの round-<N>-comment.md)',
   '  --post <N>            comment: 生成本文を gh pr comment <N> --body-file - で投稿する (1 以上の整数)',
   '  --clean-legacy        artifacts: .cross-review 直下の旧形式出力を削除する',
-  '  --fallback-prompt <path> 利用上限時に出力する代替プロンプトの書き出し先',
+  '  --fallback-prompt <path> GPT 側使用不能時に出力する代替プロンプトの書き出し先',
   '                        (既定: OS の一時ディレクトリ/cross-review-fallback-<pid>.md)',
   '  -h, --help            このヘルプを表示',
   '',
@@ -472,7 +483,9 @@ const USAGE = [
   '  モデル・推論 effort・認証ホーム・サンドボックスは定義 ~/.claude/gpt-agents/<name>.md に従います。',
   '  bridge 経由はスクリプトが approval_policy=never を明示している場合に限ります (無ければ直接起動)。',
   '  定義の codex_sandbox が --fix の有無と食い違う場合は起動せずエラー終了します。',
-  '利用上限時: Codex が利用上限に達したら subagent 代替のプロンプトをファイルへ書き出し、終了コード 75 で終わります',
+  'GPT 側使用不能時: Codex が利用上限やモデルの混雑などで使えないときは、subagent 代替のプロンプトを',
+  '  ファイルへ書き出し、終了コード 75 で終わります。bridge 経由は終了コード 75 で判定し、理由を最後の',
+  '  codex-agent: result= 行から読みます。直接起動は非ゼロ終了と出力の上限の語で判定します',
   '  (--no-fallback で無効化)。このとき往復は記録しません (レビューの成立を CLI が観測できないため)。',
   '  サブエージェントでのレビューを終えたら state --mark で記録してください。',
   'レビュー観点: リポジトリ直下の .cross-review.md を読み込みます',
@@ -506,7 +519,7 @@ const USAGE = [
   '  node tools/cross-review.js codex --no-codex-agent',
   '      (bridge を使わず codex を直接起動する)',
   '  node tools/cross-review.js codex --no-fallback',
-  '      (利用上限でも subagent 代替へ切り替えない)',
+  '      (GPT 側が使えなくても subagent 代替へ切り替えない)',
   '  node tools/cross-review.js state',
   '      (現在のブランチの往復回数・直前レビュー SHA・非対応指摘を表示)',
   '  node tools/cross-review.js state --mark',
@@ -565,7 +578,7 @@ function parseArgs(argv) {
     //   文字列 = --codex-agent <name> (使う定義名を明示)
     // --codex-agent と --no-codex-agent を併記した場合は後に書いたほうが勝つ。
     codexAgent: null,
-    noFallback: false, // --no-fallback で利用上限時の subagent 代替への切り替えを無効化する
+    noFallback: false, // --no-fallback で GPT 側使用不能時の subagent 代替への切り替えを無効化する
     fallbackPromptPath: null, // --fallback-prompt の書き出し先 (未指定なら一時ディレクトリ)
     noPrCheck: false, // --no-pr-check でレビュー実行前の PR 存在確認を省く
     // comment サブコマンド用。round は対象の往復番号、reviewerName は `--reviewer`
@@ -1116,7 +1129,7 @@ function readState(deps = {}) {
 }
 
 // 状態ファイルを書く。書けなくてもレビュー自体は続けたいので、失敗は警告 1 行で false を返す。
-// 書き込みの差し替えは deps.writeStateFile。deps.writeFile (利用上限時の代替プロンプト) とは
+// 書き込みの差し替えは deps.writeStateFile。deps.writeFile (GPT 側使用不能時の代替プロンプト) とは
 // 別の口にして、片方のテスト注入がもう片方を巻き込まないようにする。
 function writeState(state, deps = {}) {
   const writeFile = deps.writeStateFile || ((p, body) => fs.writeFileSync(p, body, 'utf8'));
@@ -1543,7 +1556,7 @@ function roundFileNames(round, reviewer) {
 }
 
 // `.cross-review/` へ 1 ファイル書く既定の実装 (ディレクトリが無ければ作る)。
-// 状態ファイル (writeStateFile) や利用上限の代替プロンプト (writeFile) とは別の口にして、
+// 状態ファイル (writeStateFile) や GPT 側使用不能の代替プロンプト (writeFile) とは別の口にして、
 // 片方のテスト注入がもう片方を巻き込まないようにする。
 function defaultReviewFileWriter(filePath, body) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -1596,12 +1609,15 @@ const VIA_LABELS = {
 
 // 判断ファイルの雛形。主セッションが指摘ごとに裏取りと対応を書くための形。
 // 指摘が複数あるときは同じ形の節を並べる。
+// 推奨対応を対応と別の行に置くのは、レビュアーが勧めた直し方と実際に採った直し方の違いを
+// PR コメント上で追えるようにするため。
 const TRIAGE_TEMPLATE = [
   '### 指摘 1（<重大度>）: <要約>',
   '> <レビュアーの指摘の引用>',
   '',
+  '**推奨対応**: <レビュアーが示した対応方法>',
   '**裏取り**: <妥当 / 誤り / 過剰 と理由>',
-  '**対応**: <対応内容とコミット、または非対応の理由>',
+  '**対応**: <対応内容とコミット (推奨対応と変えた場合はその理由)、または非対応の理由>',
 ].join('\n');
 
 // 桁区切りを入れた数値表記。文字数を人向けに書くときに使う。Intl (toLocaleString) は
@@ -1865,7 +1881,7 @@ function codexAgentInvocation(script, opts, deps = {}) {
 // 主変更点 (どのレビュアーをどのサンドボックスで呼ぶか) を spawn 抜きで検証できるよう、
 // runReview の配線部分を分離する。stdin に渡すプロンプトは prompt をそのまま使う。
 // codex は codex-agent.sh (bridge) があればそれを経由し (via: 'agent')、無ければ
-// codex を直接起動する (via: 'direct')。via は利用上限の判定 (isUsageLimitExit) と
+// codex を直接起動する (via: 'direct')。via は終了分類 (classifyReviewerExit) と
 // bridge 未導入時の再起動判断に使う。deps は resolveCodexAgentScript / codexAgentInvocation へ
 // 渡す (env / homedir / exists / readFile / warn) ほか、bridge へ渡す作業ディレクトリ
 // (deps.cwd) を差し替える。
@@ -1950,7 +1966,7 @@ function resolveReviewerCommandForSpawn(cmd, deps = {}) {
 // 置換文字 (U+FFFD) を混ぜずに復元する (塊ごとに toString('utf8') すると、3 バイト文字が
 // 2 分割された時点で壊れ、保存した全文を PR コメントへ転載したときに文字化けとして残る)。
 // 保持するのは 2 種類で、用途が違うので上限も別:
-//   - outputTail: 利用上限の判定に使う末尾 OUTPUT_TAIL_LIMIT
+//   - outputTail: 終了分類に使う末尾 OUTPUT_TAIL_LIMIT
 //   - output:     `.cross-review/` へ保存する全文。OUTPUT_CAPTURE_LIMIT を超えたら先頭を捨て、
 //                 捨てたことを truncated で知らせる (保存側が注記を足せるようにするため)
 // 使い方: push(ストリーム名, chunk) で流し込み、終了時に end() で decoder の残りを回収する。
@@ -1991,10 +2007,10 @@ function createStreamCollector() {
 
 // レビュアー CLI を起動し、stdin にプロンプトを流し込む。出力は端末へそのまま流す。
 // Windows では起動直前に where.exe で実体を解決し、可能なら shell を使わずに起動する。
-// stdio を pipe にするのは、端末へ転送しつつ末尾を保持して利用上限の判定に使うため
+// stdio を pipe にするのは、端末へ転送しつつ末尾を保持して終了分類に使うため
 // (受け取った塊をそのまま書き出すので、見た目は stdio:'inherit' と変わらない)。
 // onExit は終了時に 1 回だけ { code, outputTail, output, truncated, error } で呼ぶ
-// (runReview が outputTail を上限判定に、output を `.cross-review/` への保存に使い、
+// (runReview が outputTail を終了分類に、output を `.cross-review/` への保存に使い、
 //  truncated なら保存本文の先頭へ切り詰めの注記を足す)。
 function spawnReviewer(cmd, args, stdinText, onExit) {
   const resolved = resolveReviewerCommandForSpawn(cmd);
@@ -2047,19 +2063,39 @@ function spawnReviewer(cmd, args, stdinText, onExit) {
   return child;
 }
 
-// レビュアーの終了が「Codex の利用上限」かどうかを判定する純粋関数。
-//   - bridge 経由 (via: 'agent') は codex-agent.sh が上限を終了コード 75 に写像するのでそれだけを見る。
-//   - 直接起動 (via: 'direct') は終了コードに上限専用の値が無いため、非ゼロ終了かつ
-//     出力の末尾に上限を示す語があるときに限って上限と判定する。
-// 正常終了 (0) とシグナル終了 (code == null) は上限として扱わない。
-function isUsageLimitExit(result) {
+// レビュアーの終了をフォールバック対象と原因へ分類する純粋関数。
+//   - bridge 経由 (via: 'agent') は終了コード 75 のときだけ、最後の result 行で原因を分類する。
+//   - 直接起動 (via: 'direct') は終了コードに専用の値が無いため、非ゼロ終了かつ出力の末尾に
+//     利用上限を示す語があるときだけ rate-limited と分類する。
+// 正常終了 (0) とシグナル終了 (code == null) はフォールバック対象にしない。
+function classifyReviewerExit(result) {
   const { via, code, outputTail } = result || {};
-  if (via === 'agent') return code === USAGE_LIMIT_EXIT_CODE;
-  if (code === 0 || code == null) return false;
-  return USAGE_LIMIT_PATTERN.test(String(outputTail || ''));
+  if (via === 'agent') {
+    if (code !== USAGE_LIMIT_EXIT_CODE) return { fallback: false, cause: null };
+    const resultPrefix = 'codex-agent: result=';
+    const resultLines = String(outputTail || '')
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith(resultPrefix));
+    const lastResultLine = resultLines.at(-1);
+    const resultValue = lastResultLine ? lastResultLine.slice(resultPrefix.length).match(/^\S+/)?.[0] : null;
+    const cause = resultValue === 'rate-limited' || resultValue === 'unavailable'
+      ? resultValue
+      : 'unknown';
+    return { fallback: true, cause };
+  }
+  if (code === 0 || code == null) return { fallback: false, cause: null };
+  if (USAGE_LIMIT_PATTERN.test(String(outputTail || ''))) {
+    return { fallback: true, cause: 'rate-limited' };
+  }
+  return { fallback: false, cause: null };
 }
 
-// 利用上限時に出す代替プロンプトの書き出し先を決める。--fallback-prompt があればそれ、
+// 互換用。classifyReviewerExit(result).fallback を返す。
+function isUsageLimitExit(result) {
+  return classifyReviewerExit(result).fallback;
+}
+
+// GPT 側使用不能時に出す代替プロンプトの書き出し先を決める。--fallback-prompt があればそれ、
 // 無ければ一時ディレクトリに pid 付きのファイル名を作る (同時実行でぶつからないように)。
 function resolveFallbackPromptPath(opts, deps = {}) {
   if (opts && opts.fallbackPromptPath) return opts.fallbackPromptPath;
@@ -2068,13 +2104,14 @@ function resolveFallbackPromptPath(opts, deps = {}) {
   return path.join(tmp, `cross-review-fallback-${pid}.md`);
 }
 
-// 利用上限時のフォールバック。subagent 経路と同じプロンプト本文をファイルへ書き出し、
+// GPT 側使用不能時のフォールバック。subagent 経路と同じプロンプト本文をファイルへ書き出し、
 // 次に何をすればよいかを stderr に出して終了コードを 75 にする。
 // stdout はレビュアーの出力で使われているので、プロンプト本文を stdout に混ぜない。
 // 戻り値は書き出したパス (書けなければ null)。
 function emitFallbackPrompt(prompt, opts, deps = {}) {
   const writeErr = deps.err || ((s) => process.stderr.write(s));
   const writeFile = deps.writeFile || ((p, body) => fs.writeFileSync(p, body, 'utf8'));
+  const cause = deps.cause || 'rate-limited';
   const promptPath = resolveFallbackPromptPath(opts, deps);
   try {
     writeFile(promptPath, `${prompt}\n`);
@@ -2083,12 +2120,27 @@ function emitFallbackPrompt(prompt, opts, deps = {}) {
     process.exitCode = 1;
     return null;
   }
+  const notices = {
+    'rate-limited': {
+      terminal: 'Codex の利用上限のため subagent 代替に切り替えます。',
+      comment: 'Codex を直接実行できないため (利用上限) subagent 代替で確認した',
+    },
+    unavailable: {
+      terminal: 'GPT 側が一時的に使えないため (モデルの混雑など) subagent 代替に切り替えます。',
+      comment: 'Codex を直接実行できないため (GPT 側の一時的な使用不能) subagent 代替で確認した',
+    },
+    unknown: {
+      terminal: 'GPT 側が使えないため (理由不明、終了コード 75) subagent 代替に切り替えます。',
+      comment: 'Codex を直接実行できないため (理由不明の GPT 側使用不能) subagent 代替で確認した',
+    },
+  };
+  const notice = notices[cause] || notices['rate-limited'];
   writeErr(
-    `[cross-review] Codex の利用上限のため subagent 代替に切り替えます。プロンプト: ${promptPath}\n`
+    `[cross-review] ${notice.terminal}プロンプト: ${promptPath}\n`
     + '  その内容を Claude の客観サブエージェント (読み取り専用。--fix 時は書込権限付き) へ渡してください。\n'
     // --uncommitted のレビューだったなら、記録でも SHA を据え置く (経路によって状態遷移が食い違わないように)。
     + `  サブエージェントでのレビューが終わったら \`node tools/cross-review.js state --mark${opts.mode === 'uncommitted' ? ' --uncommitted' : ''}\` で往復を記録してください。\n`
-    + '  PR コメントには「Codex を直接実行できないため (利用上限) subagent 代替で確認した」と残してください。\n',
+    + `  PR コメントには「${notice.comment}」と残してください。\n`,
   );
   process.exitCode = USAGE_LIMIT_EXIT_CODE;
   return promptPath;
@@ -2245,7 +2297,7 @@ function runReview(opts, deps = {}) {
   //      利用者がその場でサブエージェントへ渡す前提で数える)。
   //   2. レビュアー CLI が終了コード 0 で終わったとき (bridge → 直接起動のやり直しがある場合は
   //      やり直した後の結果で判断する)。
-  // 起動失敗 (ENOENT 等)、非ゼロ終了、--no-fallback の失敗終了、利用上限フォールバックでは
+  // 起動失敗 (ENOENT 等)、非ゼロ終了、--no-fallback の失敗終了、GPT 側使用不能のフォールバックでは
   // 記録しない。記録してしまうと次回の既定 base がその時点の SHA になり、未レビューの差分が
   // 「差分なし」になって再試行できなくなるため。フォールバック後の記録は、サブエージェントでの
   // レビューを終えた利用者が `state --mark` で行う。
@@ -2321,7 +2373,7 @@ function runReview(opts, deps = {}) {
     saveRound(recordRound(), { body: prompt, isPrompt: true, via: 'subagent' });
     return null;
   }
-  // レビュアーを起動し、終了コードで「bridge 未導入」「利用上限」を切り分ける。
+  // レビュアーを起動し、終了コードで「bridge 未導入」「GPT 側使用不能」を切り分ける。
   // 起動を関数にするのは、bridge 未導入のときに同じプロンプトで直接起動をやり直すため。
   const start = (invocation) => {
     writeOut(invocation.notice);
@@ -2348,10 +2400,15 @@ function runReview(opts, deps = {}) {
         });
         return;
       }
-      // 上限フォールバックは codex 経路だけの仕組み (claude CLI 経路は対象外。subagent はここに来ない)。
+      // 使用不能時のフォールバックは codex 経路だけの仕組み (claude CLI 経路は対象外。subagent はここに来ない)。
       if (resolvedOpts.reviewer !== 'codex') return;
       if (opts.noFallback) return; // --no-fallback は従来どおり失敗終了 (終了コードはそのまま)。
-      if (!isUsageLimitExit({ via: invocation.via, code: exit.code, outputTail: exit.outputTail })) return;
+      const classification = classifyReviewerExit({
+        via: invocation.via,
+        code: exit.code,
+        outputTail: exit.outputTail,
+      });
+      if (!classification.fallback) return;
       // 往復は記録しない。CLI はサブエージェントがレビューを終えたかを観測できないので、
       // 書き出した時点で記録すると、プロンプトを渡さずに再実行したとき未レビューの差分が
       // 「差分なし」になって再試行できなくなる。記録は `state --mark` で利用者が行う。
@@ -2360,6 +2417,7 @@ function runReview(opts, deps = {}) {
         writeFile: deps.writeFile,
         tmpdir: deps.tmpdir,
         pid: deps.pid,
+        cause: classification.cause,
       });
     });
   };
@@ -2368,7 +2426,7 @@ function runReview(opts, deps = {}) {
 
 // `state` サブコマンド。現在の枝の記録を JSON で表示し、--reset ならその枝の記録を消し、
 // --mark なら往復を 1 回分記録する (round を 1 増やし、直前レビュー SHA を現在の HEAD にする)。
-// --mark があるのは、利用上限フォールバックのように CLI がレビューの成立を観測できない経路で、
+// --mark があるのは、GPT 側使用不能のフォールバックのように CLI がレビューの成立を観測できない経路で、
 // レビューを終えた利用者が往復を進められるようにするため。
 // deps は runReview と同じ流儀で gitRun / 出力 / 状態ファイルの読み書きを差し替えられる。
 function runStateCommand(opts, deps = {}) {
@@ -2777,6 +2835,7 @@ module.exports = {
   readCodexAgentDefinition,
   checkCodexAgentSandbox,
   scriptPinsApprovalNever,
+  classifyReviewerExit,
   isUsageLimitExit,
   resolveFallbackPromptPath,
   emitFallbackPrompt,
