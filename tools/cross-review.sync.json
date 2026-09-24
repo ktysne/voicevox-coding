@@ -3,7 +3,7 @@
     "repo": "https://github.com/ktysne/ai-cross-review.git",
     "ref": "main"
   },
-  "lastSyncedCommit": "cd65dfdc3fb14745626d70564adfa7f92e88fd0c",
+  "lastSyncedCommit": "9d94fede83391cb7b732e17fd744bae8644e3c82",
   "lastSyncedRef": "main",
   "files": [
     {
@@ -36,6 +36,8 @@
     "2026-09-phase2-codex-agent-launch.md",
     "2026-09-phase3-state-and-diff-guard.md",
     "2026-09-phase4-pr-comment.md",
-    "2026-09-phase5-global-skill-and-manifest-check.md"
+    "2026-09-phase5-global-skill-and-manifest-check.md",
+    "2026-09-global-skill-codex-subagent.md",
+    "2026-09-review-choice-control.md"
   ]
 }
