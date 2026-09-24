@@ -8,7 +8,7 @@
 // 使い方:
 //   node tools/cross-review.js codex            # 現在のブランチ (既定 base との差分) を Codex がレビュー
 //   node tools/cross-review.js claude           # 同上を Claude がレビュー
-//   node tools/cross-review.js subagent         # 外部 CLI を起動せずレビュープロンプトを stdout に出す (リモートコントロール用)
+//   node tools/cross-review.js subagent         # 外部 CLI を起動せずレビュープロンプトを stdout に出す (CLI を起動できない環境用)
 //   node tools/cross-review.js codex --fix      # Codex がレビューに加え検出事項を直接修正 (作業ツリー編集)
 //   node tools/cross-review.js codex --fix --instructions notes.md  # レビュアーの指摘 (notes.md) を渡して Codex に修正させる
 //   node tools/cross-review.js codex --uncommitted    # 未コミットの作業ツリー差分をレビュー
@@ -43,7 +43,7 @@
 // - GPT 側が利用上限やモデルの混雑などで使えないときは、レビューを失敗で終わらせず subagent 経路と
 //   同じプロンプトをファイルへ書き出し、終了コード 75 で「客観サブエージェントへ渡してください」
 //   と促す (`--no-fallback` で従来どおりの失敗終了に戻せる)。
-// - リモートコントロール環境では codex/claude スタンドアロン CLI を spawn できない。その場合は
+// - クラウド実行環境などでは codex/claude スタンドアロン CLI を spawn できない。その場合は
 //   reviewer に `subagent` を指定すると、外部プロセスを起動せず、組み立てたレビュープロンプト
 //   (観点 + スコープ + 差分本文 + モード別指示) を stdout に出すだけにする。呼び出し側 (Claude) が
 //   その出力を Agent ツールの客観レビュー用サブエージェントへ渡してレビューさせる
@@ -426,7 +426,7 @@ const USAGE = [
   'レビュアー:',
   '  codex      codex スタンドアロン CLI でレビュー (既定 read-only、--fix で workspace-write)',
   '  claude     claude スタンドアロン CLI でレビュー (claude -p)',
-  '  subagent   外部 CLI を起動せず、レビュープロンプトを stdout に出力 (リモートコントロール用)。',
+  '  subagent   外部 CLI を起動せず、レビュープロンプトを stdout に出力 (CLI を起動できない環境用)。',
   '             codex/claude CLI を spawn できない環境向け。出力を Agent ツールの客観レビュー用',
   '             サブエージェントへ渡してレビューさせる。--fix も可 (FIX 指示付きで出力)。',
   '',
@@ -514,7 +514,7 @@ const USAGE = [
   '  node tools/cross-review.js codex --fix --uncommitted --instructions notes.md',
   '      (レビュー指摘 notes.md を渡し、未コミット差分を Codex に修正させる)',
   '  node tools/cross-review.js subagent --uncommitted',
-  '      (リモートコントロール用: 未コミット差分のレビュープロンプトを stdout に出力し、',
+  '      (CLI を起動できない環境用: 未コミット差分のレビュープロンプトを stdout に出力し、',
   '       Agent ツールの客観サブエージェントへ渡す)',
   '  node tools/cross-review.js codex --no-codex-agent',
   '      (bridge を使わず codex を直接起動する)',
@@ -825,7 +825,7 @@ function parseArgs(argv) {
   } else if (!out.help && !out.error) {
     out.reviewer = rest[0] || null;
     // reviewer: codex / claude は外部スタンドアロン CLI を起動する。subagent は外部 CLI を起動せず、
-    // 組み立てたレビュープロンプトを stdout に出すだけ (リモートコントロール環境で codex/claude CLI を
+    // 組み立てたレビュープロンプトを stdout に出すだけ (クラウド実行環境などで codex/claude CLI を
     // spawn できないとき、その出力を Claude が Agent ツールの客観レビュー用サブエージェントへ渡す)。
     if (out.reviewer !== 'codex' && out.reviewer !== 'claude' && out.reviewer !== 'subagent') {
       out.error = `レビュアーは codex / claude / subagent を指定してください (指定: ${out.reviewer || 'なし'})`;
@@ -1905,12 +1905,12 @@ function reviewerInvocation(opts, deps = {}) {
   if (opts.reviewer === 'subagent') {
     // 外部 CLI を起動しない (emit:true)。組み立てたレビュープロンプトを stdout に出すだけで、
     // 実際のレビューは呼び出し側 (Claude) が Agent ツールで起動する客観サブエージェントが行う。
-    // リモートコントロール環境 (codex/claude CLI を spawn できない) のフォールバック。
+    // CLI を起動できない環境 (codex/claude CLI を spawn できない) のフォールバック。
     return {
       emit: true,
       notice: opts.fix
-        ? 'リモートコントロール用: レビュー + 修正プロンプトを stdout に出力します (書込権限付きの客観サブエージェントへ渡してください)。\n'
-        : 'リモートコントロール用: レビュープロンプトを stdout に出力します (客観サブエージェントへ渡してください)。\n',
+        ? 'CLI を起動できない環境用: レビュー + 修正プロンプトを stdout に出力します (書込権限付きの客観サブエージェントへ渡してください)。\n'
+        : 'CLI を起動できない環境用: レビュープロンプトを stdout に出力します (客観サブエージェントへ渡してください)。\n',
     };
   }
   return { cmd: 'claude', args: ['-p'], notice: 'Claude でレビューを実行します...\n' };

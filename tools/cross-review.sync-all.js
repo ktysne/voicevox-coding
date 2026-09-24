@@ -31,10 +31,10 @@
 //   検査が回らなかった (雛形が無い / 読めない / 構造不正) ときは集計行にも「マニフェスト検査スキップ」を
 //   出し、未登録 0 件の正常な検査と見分けられるようにする。
 // - --global-skill は、相互レビューの汎用ルールを各リポジトリの CLAUDE.md へ写す運用をやめ、ホームの
-//   グローバル SKILL 1 箇所に集約するための配布口。配布元はこの checkout の SKILL で、配布先は
-//   GLOBAL_SKILL_TARGETS に持つ。Codex 側 (~/.codex/skills/) はレビュー時にこの写しを読むため、古いままだと
-//   旧ルールで動く。ただし Codex を入れていない環境にディレクトリを作らないよう、requireDir がある配布先は
-//   その親ディレクトリが既にあるときだけ配る。
+//   グローバル SKILL へ配るための配布口。配布元はこの checkout の SKILL で、配布先は GLOBAL_SKILL_TARGETS
+//   に持つ。Codex はレビュー時に ~/.codex/skills/ の、Codex サブエージェントは修正適用や実装委譲の際に
+//   ~/.codex-subagent/skills/ の写しを読むため、古いままだと旧ルールで動く。requireDir がある配布先は、Codex を使わない環境に
+//   ディレクトリを作らないよう、その親ディレクトリが既にあるときだけ配る。
 // - 1 プロジェクトの失敗 (マニフェスト不正、上流取得失敗等) で全体を止めない。各プロジェクトを独立に回し、
 //   最後に集計を出す。終了コードは「いずれかが失敗」または「--check でいずれかにドリフト」で 1。
 // - 副作用 (ディレクトリ走査、runSync 実行) は deps で差し替え可能にし、純粋なロジック (引数解析、
@@ -56,9 +56,11 @@ const SKIP_DIRS = new Set(['node_modules', '.git']);
 const SKILL_SOURCE = ['.claude', 'skills', 'cross-review', 'SKILL.md'];
 // --global-skill の配布先 (ホームからの相対)。requireDir が非 null の配布先は、そのディレクトリが
 // 既にあるときだけ配る (そのツールを入れていない環境に配布先ディレクトリを作らないため)。
+// .codex と .codex-subagent は claude-codex-bridge の既定の codex_home。定義側で別名にした環境は対象外として配らない。
 const GLOBAL_SKILL_TARGETS = [
   { to: ['.claude', 'skills', 'cross-review', 'SKILL.md'], requireDir: null },
   { to: ['.codex', 'skills', 'cross-review', 'SKILL.md'], requireDir: ['.codex', 'skills'] },
+  { to: ['.codex-subagent', 'skills', 'cross-review', 'SKILL.md'], requireDir: ['.codex-subagent', 'skills'] },
 ];
 // planGlobalSkill が返す状態の表示名。
 const GLOBAL_STATUS_LABEL = { create: '新規', update: '更新', unchanged: '一致', skip: '対象外' };
@@ -75,13 +77,13 @@ const USAGE = [
   '  --ref <ref>     取り込む上流 ref を全プロジェクト共通で上書き (ブランチ / タグ / コミット)',
   '  --depth <n>     走査の最大深さ (既定 4)',
   '  --list          検出したプロジェクトを列挙するだけ (同期しない)',
-  '  --global-skill  相互レビュー SKILL をホームのグローバル配置 (~/.claude/skills、~/.codex/skills) へ配る',
+  '  --global-skill  相互レビュー SKILL をホームのグローバル配置 (~/.claude/skills、~/.codex/skills、~/.codex-subagent/skills) へ配る',
   '  -h, --help      このヘルプを表示',
   '',
   '判定: cross-review.sync.json (同期マニフェスト) を持つディレクトリを導入プロジェクトとみなす。',
   '--check では各プロジェクトのマニフェスト検査 (sync --check-manifest) も併せて回す。',
   '--global-skill は単独 (--root 無し) でも動き、そのときはプロジェクト走査をせずグローバル配布だけを行う。',
-  '~/.codex/skills/ は既に存在するときだけ配る (Codex 未導入の環境にディレクトリを作らないため)。',
+  '~/.codex/skills/ と ~/.codex-subagent/skills/ は既に存在するときだけ配る (未導入の環境にディレクトリを作らないため)。',
   '',
   '例:',
   '  node tools/cross-review.sync-all.js --root /Develop --check   # /Develop 配下のドリフト検査',
