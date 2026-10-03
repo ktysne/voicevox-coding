@@ -72,6 +72,13 @@ CLI 経由（`npm run review:*`）で回すには `codex` / `claude` が PATH �
 指定は選択肢 1 と 2 のどちらを使うかにだけ効き、軽微な例外（選択肢 3）の判断には影響しません。
 指定は同じセッションの同じブランチのあいだ有効です。
 指定があるときは対話中でも 3 択の提示を省いて指定の経路で実行し、報告に「指定により別ベンダー（または同ベンダー）で実行」と一言書きます。
+3 択を提示する前（レビューを回す直前に毎回）に `node tools/cross-review.js route` を実行します。
+`default` なら従来どおりに進め、`codex` または `claude` なら会話での指定と同じに扱い、3 択を省いてそのベンダーでレビューします（実装者が Claude で値が `claude` の場合も省きます）。
+値はレビュアーのベンダー名です。実装者が Claude のときは `codex` が選択肢 1、`claude` が選択肢 2 に対応し、実装者が Codex のときは `codex` が選択肢 2、`claude` が選択肢 1 に対応します。
+経路設定で選んだ場合は、報告に「agent-cockpit の経路設定により Codex（または Claude）でレビュー」と一言書きます。
+会話や依頼文での指定は、そのセッションの事情をより細かく反映しているため、経路設定より優先します。
+軽微な例外（選択肢 3）の判断と codex 経路の終了コード 75 によるフォールバックは変わりません。
+自走中は経路設定も指定として扱い、設定の変更は次に回すレビューから有効にします（実行中のレビューは止めません）。
 指定した経路が codex 経路で、利用上限などにより使えないときは、CLI のフォールバック（終了コード 75）に従って subagent（Claude の客観サブエージェント）で回し、切り替えたことを報告に書きます。
 Claude 側の経路にはこのフォールバックが無いので、使えなければ報告に書いて判断を仰ぎます（自走中は判断待ちの事項として載せます）。
 
@@ -300,6 +307,7 @@ node tools/cross-review.js subagent      # CLI を起動せずレビュー用プ
 - 申し送り（`--instructions <path>`）：レビュアー個別の重点指摘を**観点とは別系統**で足します（`REVIEWER_NOTES_HEADER` の見出し付きでプロンプトに追加。`.cross-review.md` は置き換えない）。  
   `--uncommitted` の未追跡収集からは、申し送りファイル自体を**絶対パスの突き合わせで除外**します。  
 - 差分の間引き：ロックファイル、生成物（`package-lock.json` / `*.min.js` / `*.map` ほか）を**既定で除外**し、巨大なファイル差分は **stat 要約に置換**してトークンを節約します（`.cross-review-ignore` で除外を追加、`--no-exclude` で無効化、`--max-file-diff-kb` で置換しきい値。詳細は後述「差分の除外と要約」）。  
+- `route` は agent-cockpit の `routing.json` からレビュー経路を読み、`codex` / `claude` / `default` のいずれかを stdout に出します。  
 - 状態（往復回数、直前レビュー SHA、非対応と判断した指摘）：ブランチ単位で `.cross-review-state.json` に持ちます。  
   `state` / `state --reset` / `dismiss "<要約>"` サブコマンドで参照、初期化、追加します（`--no-state` で読み書きを無効化）。詳細は後述「状態ファイル」。  
 - 差分サイズが閾値を超えたときは、ファイル要約のしきい値を段階的に下げて**縮退**を試し、それでも収まらないときだけ中断します（`--strict-diff-guard` で従来の即中断に戻せます）。  
@@ -311,6 +319,15 @@ node tools/cross-review.js subagent      # CLI を起動せずレビュー用プ
 - 既定 base の解決で使う fetch と `gh` の呼び出しは、環境変数 `CROSS_REVIEW_NO_FETCH=1` で省けます（オフライン作業向け）。  
 - 引数解析、差分生成、プロンプト生成、観点解決、申し送り注入は `tests/cross-review.test.js`（vitest）が担保します。  
   このテストは**取り込み先では任意**で、vitest を使うときだけ同梱します（同梱しなくても engine の振る舞いは upstream のテストが担保）。
+
+### agent-cockpit の経路設定（`route`）
+
+`node tools/cross-review.js route` は agent-cockpit の `routing.json` から `review` の値を読み、`codex`、`claude`、`default` のいずれかを改行付きで stdout に出します。
+`AGENT_COCKPIT_HOME` が空でなければそのディレクトリの `routing.json` を読み、空ならホームディレクトリの `.agent-cockpit/routing.json` を読みます。
+ファイルが無い、読めない、JSON が壊れている、トップレベルがオブジェクトでない、または `review` が無いか有効な値でない場合は、何も通知せず `default` を出して終了コード 0 で終わります。
+経路設定の正本は agent-cockpit の [routing.json 設計（「経路の設定」）](https://github.com/ktysne/agent-cockpit/blob/main/docs/design/server.md) です。
+agent-cockpit が無い環境では設定ファイルが無いため `default` になり、従来のレビュー手順から変わりません。
+このコマンドは状態ファイルやネットワークを使わず、ファイルも書きません。
 
 ### codex の起動は bridge（codex-agent.sh）を経由する
 

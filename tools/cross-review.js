@@ -422,7 +422,7 @@ function joinReviewerNotes(instructions, dismissedSection) {
 const USAGE = [
   'Claude ↔ Codex 相互レビュー CLI ブリッジ',
   '',
-  '使い方: node tools/cross-review.js <codex|claude|subagent|state|dismiss|comment|artifacts> [options]',
+  '使い方: node tools/cross-review.js <codex|claude|subagent|route|state|dismiss|comment|artifacts> [options]',
   '',
   'レビュアー:',
   '  codex      codex スタンドアロン CLI でレビュー (既定 read-only、--fix で workspace-write)',
@@ -430,6 +430,7 @@ const USAGE = [
   '  subagent   外部 CLI を起動せず、レビュープロンプトを stdout に出力 (CLI を起動できない環境用)。',
   '             codex/claude CLI を spawn できない環境向け。出力を Agent ツールの客観レビュー用',
   '             サブエージェントへ渡してレビューさせる。--fix も可 (FIX 指示付きで出力)。',
+  '  route      agent-cockpit の routing.json からレビュアーを読み、codex / claude / default を出力',
   '',
   'サブコマンド (状態ファイル .cross-review-state.json の操作):',
   '  state             現在のブランチの往復回数・直前レビュー SHA・非対応指摘・最後の結論を JSON で表示',
@@ -552,7 +553,7 @@ function parseNonNegativeInt(value) {
 // パス区切りや `..` を含む値は弾く。
 const SAFE_REVIEWER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
-// process.argv.slice(2) を受け取り、サブコマンド (レビュアー / state / dismiss / comment) と
+// process.argv.slice(2) を受け取り、サブコマンド (レビュアー / route / state / dismiss / comment) と
 // 差分スコープを解釈する。
 function parseArgs(argv) {
   const args = argv.slice();
@@ -798,6 +799,37 @@ function parseArgs(argv) {
     } else if (out.round == null) {
       out.error = 'comment には --round <N> が必要です (例: comment --round 1)';
     }
+  } else if (!out.help && !out.error && rest[0] === 'route') {
+    out.command = 'route';
+    const optionsNotForRoute = [
+      out.fix && '--fix',
+      out.instructionsPath != null && '--instructions',
+      out.noExclude && '--no-exclude',
+      out.noState && '--no-state',
+      out.strictDiffGuard && '--strict-diff-guard',
+      out.reset && '--reset',
+      out.mark && '--mark',
+      out.baseExplicit && '--base',
+      out.maxDiffKb != null && '--max-diff-kb',
+      out.maxFileDiffKb != null && '--max-file-diff-kb',
+      out.codexAgent != null && (out.codexAgent === false ? '--no-codex-agent' : '--codex-agent'),
+      out.noFallback && '--no-fallback',
+      out.fallbackPromptPath != null && '--fallback-prompt',
+      out.noPrCheck && '--no-pr-check',
+      out.round != null && '--round',
+      out.outcome != null && '--outcome',
+      out.reviewerName != null && '--reviewer',
+      out.verifyPath != null && '--verify',
+      out.outPath != null && '--out',
+      out.postNumber != null && '--post',
+      out.cleanLegacy && '--clean-legacy',
+      out.mode !== 'base' && '--uncommitted',
+    ].filter(Boolean);
+    if (rest.length > 1) {
+      out.error = `route に余分な引数を指定できません: ${rest.slice(1).join(' ')}`;
+    } else if (optionsNotForRoute.length > 0) {
+      out.error = `${optionsNotForRoute.join(' / ')} は route サブコマンドでは使えません`;
+    }
   } else if (!out.help && !out.error && (rest[0] === 'state' || rest[0] === 'dismiss' || rest[0] === 'artifacts')) {
     // レビュアー以外のサブコマンド。状態ファイルだけを扱うので、レビュアーは決めない。
     out.command = rest[0];
@@ -1041,6 +1073,36 @@ function shortSha(sha) {
 function resolveStatePath(deps = {}) {
   const scriptDir = deps.scriptDir || __dirname;
   return path.join(scriptDir, '..', STATE_FILENAME);
+}
+
+function resolveRoutingPath(deps = {}) {
+  const env = deps.env || process.env;
+  const home = deps.homedir || os.homedir();
+  const cockpitHome = env.AGENT_COCKPIT_HOME;
+  return path.join(cockpitHome || path.join(home, '.agent-cockpit'), 'routing.json');
+}
+
+// 経路の設定の正本は agent-cockpit の routing.json。agent-cockpit を入れていない環境で
+// 毎回警告を出さないよう、読めないときや値が不正なときは黙って default に倒す。
+function readReviewRoute(deps = {}) {
+  const readFile = deps.readFile || ((p) => fs.readFileSync(p, 'utf8'));
+  let routing;
+  try {
+    // 手で編集したときに BOM が付くことがあり、JSON.parse は BOM を受け付けない。
+    routing = JSON.parse(String(readFile(resolveRoutingPath(deps))).replace(/^\uFEFF/, ''));
+  } catch {
+    return 'default';
+  }
+  if (!routing || typeof routing !== 'object' || Array.isArray(routing)) return 'default';
+  return routing.review === 'codex' || routing.review === 'claude' || routing.review === 'default'
+    ? routing.review
+    : 'default';
+}
+
+function runRouteCommand(opts, deps = {}) {
+  const writeOut = deps.out || ((s) => process.stdout.write(s));
+  writeOut(`${readReviewRoute(deps)}\n`);
+  return null;
 }
 
 // 1 ブランチ分の初期状態。
@@ -2924,6 +2986,10 @@ function main() {
     runStateCommand(opts);
     return;
   }
+  if (opts.command === 'route') {
+    runRouteCommand(opts);
+    return;
+  }
   if (opts.command === 'dismiss') {
     runDismissCommand(opts);
     return;
@@ -2966,6 +3032,9 @@ module.exports = {
   buildDismissedSection,
   joinReviewerNotes,
   resolveStatePath,
+  resolveRoutingPath,
+  readReviewRoute,
+  runRouteCommand,
   emptyBranchState,
   normalizeState,
   branchStateOf,
