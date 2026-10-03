@@ -464,6 +464,7 @@ const USAGE = [
   '  --strict-diff-guard   差分サイズ超過時に段階的縮退を試さず、従来どおり即中断する',
   '  --no-state            状態ファイル (.cross-review-state.json) の読み書きを行わない (CI 等)',
   '  --no-exclude          既定除外も含めすべての除外を無効化 (緊急時の逃げ道)',
+  '  --override-route <理由> agent-cockpit の経路設定を上書きしてレビューを実行する',
   '  --instructions <path> レビュアーからの申し送り・重点指摘ファイルをプロンプトへ添付',
   '                        (観点 .cross-review.md は置き換えず追加。--fix と併用で指摘を直接修正させる)',
   '  --codex-agent <name>  bridge (codex-agent.sh) で使う定義名を明示 (既定: レビューのみ codex-review /',
@@ -572,6 +573,7 @@ function parseArgs(argv) {
     baseRef: 'main',
     baseExplicit: false, // --base / --base= が指定されたか (既定 base 解決をスキップする判定に使う)
     fix: false,
+    routeOverrideReason: null,
     instructionsPath: null,
     maxDiffKb: null, // --max-diff-kb の値 (未指定は null。閾値の最終解決は resolveMaxDiffKb)
     maxFileDiffKb: null, // --max-file-diff-kb の値 (未指定は null。最終解決は resolveMaxFileDiffKb)
@@ -620,6 +622,14 @@ function parseArgs(argv) {
       out.noFallback = true;
     } else if (a === '--no-pr-check') {
       out.noPrCheck = true;
+    } else if (a === '--override-route' || a.startsWith('--override-route=')) {
+      const v = a === '--override-route' ? args[i + 1] : a.slice('--override-route='.length);
+      if (!v || v.startsWith('-')) {
+        out.error = '--override-route には理由が必要です';
+      } else {
+        out.routeOverrideReason = v;
+        if (a === '--override-route') i++;
+      }
     } else if (a === '--round' || a.startsWith('--round=')) {
       const v = a === '--round' ? args[i + 1] : a.slice('--round='.length);
       const n = parseNonNegativeInt(v);
@@ -787,7 +797,9 @@ function parseArgs(argv) {
   if (!out.help && !out.error && rest[0] === 'comment') {
     // PR コメント本文を生成する。--outcome があれば生成後に状態ファイルへ結論を記録する。
     out.command = 'comment';
-    if (out.noState) {
+    if (out.routeOverrideReason != null) {
+      out.error = '--override-route はレビュアーのサブコマンドでのみ使えます';
+    } else if (out.noState) {
       // --no-state は comment で受け付けず、指定を黙って無視しない。
       out.error = '--no-state は state / dismiss / comment サブコマンドとは併用できません';
     } else if (out.cleanLegacy) {
@@ -823,6 +835,7 @@ function parseArgs(argv) {
       out.outPath != null && '--out',
       out.postNumber != null && '--post',
       out.cleanLegacy && '--clean-legacy',
+      out.routeOverrideReason != null && '--override-route',
       out.mode !== 'base' && '--uncommitted',
     ].filter(Boolean);
     if (rest.length > 1) {
@@ -833,7 +846,9 @@ function parseArgs(argv) {
   } else if (!out.help && !out.error && (rest[0] === 'state' || rest[0] === 'dismiss' || rest[0] === 'artifacts')) {
     // レビュアー以外のサブコマンド。状態ファイルだけを扱うので、レビュアーは決めない。
     out.command = rest[0];
-    if (out.noState) {
+    if (out.routeOverrideReason != null) {
+      out.error = '--override-route はレビュアーのサブコマンドでのみ使えます';
+    } else if (out.noState) {
       out.error = '--no-state は state / dismiss / comment サブコマンドとは併用できません';
     } else if (out.command === 'dismiss') {
       if (out.reset) {
@@ -909,6 +924,9 @@ function parseArgs(argv) {
     } else if (out.cleanLegacy && out.command !== 'artifacts') {
       out.error = '--clean-legacy は artifacts サブコマンドでのみ使えます';
     }
+  }
+  if (!out.help && !out.error && out.command !== 'review' && out.command !== 'route' && out.routeOverrideReason != null) {
+    out.error = '--override-route はレビュアーのサブコマンドでのみ使えます';
   }
   return out;
 }
@@ -1766,12 +1784,17 @@ function buildMetaSummary(meta) {
 //   - verify:  検証コマンドの出力 (無ければ節ごと省く)。長ければ末尾 VERIFY_TAIL_LINES 行に切る。
 // 見出しは運用で使ってきた「## クロスレビュー N 往復目: <レビュアー> の指摘と対応」に合わせる。
 function buildRoundComment({ round, reviewer, meta, triage, verify } = {}) {
+  const routeOverride = meta && meta.routeOverride;
   const parts = [
     `## クロスレビュー ${round} 往復目: ${reviewerDisplayName(reviewer)} の指摘と対応`,
     '',
     buildMetaSummary(meta),
-    '',
   ];
+  if (routeOverride) {
+    const reason = String(routeOverride.reason).replace(/[\r\n]+/g, ' ');
+    parts.push(`経路設定の上書き: 設定 ${routeOverride.route} を上書きした (理由: ${reason})`);
+  }
+  parts.push('');
   const triageBody = triage == null ? '' : String(triage).replace(/\s+$/, '');
   parts.push(
     triageBody || '（判断ファイルが未記入のため、指摘と対応の節は空です）',
@@ -2257,12 +2280,41 @@ function emitFallbackPrompt(prompt, opts, deps = {}) {
 // 既定は実 git / 実 spawn。codex 経路でも「観点 + 差分本文 + モード指示」を stdin に渡すのが
 // 中核なので、その配線を結合テストで固定できるようにする。
 function runReview(opts, deps = {}) {
+  const writeErr = deps.err || ((s) => process.stderr.write(s));
+  // deps.env は差分閾値などの注入口で AGENT_COCKPIT_HOME を含まないため、経路設定の場所は process.env で解決する。
+  // 経路設定を差し替えるときは deps.reviewRoute か deps.routingReadFile を使う。
+  const reviewRoute = typeof deps.reviewRoute === 'function'
+    ? deps.reviewRoute()
+    : readReviewRoute({ homedir: deps.homedir, readFile: deps.routingReadFile });
+  const routeMismatch = (reviewRoute === 'codex' && opts.reviewer !== 'codex')
+    || (reviewRoute === 'claude' && opts.reviewer === 'codex');
+  let routeOverride = null;
+  if (routeMismatch && opts.routeOverrideReason) {
+    routeOverride = { route: reviewRoute, reason: opts.routeOverrideReason };
+    const reason = String(opts.routeOverrideReason).replace(/[\r\n]+/g, ' ');
+    writeErr(`[cross-review] 経路設定 ${reviewRoute} を上書きして ${opts.reviewer} で実行します (理由: ${reason})\n`);
+  } else if (routeMismatch) {
+    const suggestedReviewer = reviewRoute === 'codex'
+      ? 'codex'
+      : opts.fix ? 'subagent' : 'claude';
+    const suggestedOptions = [
+      ...(opts.fix ? ['--fix'] : []),
+      ...(opts.mode === 'uncommitted' ? ['--uncommitted'] : []),
+    ];
+    const command = `node tools/cross-review.js ${suggestedReviewer}${suggestedOptions.length ? ` ${suggestedOptions.join(' ')}` : ''}`;
+    const note = reviewRoute === 'claude'
+      ? opts.fix ? ' (claude CLI 経路は --fix 非対応のため)' : ' (CLI を使えないときは subagent)'
+      : '';
+    writeErr(`[cross-review] 経路設定 ${reviewRoute} に反する ${opts.reviewer} の起動を拒否します。使うべきコマンド: ${command}${note}。会話で別の指定があるときは --override-route <理由> を付けてください。\n`);
+    process.exitCode = 2;
+    return null;
+  }
+
   const gitRun = deps.gitRun || defaultGitRunner;
   const spawnFn = deps.spawnFn || spawnReviewer;
   // 人向け通知は writeErr、機械が拾う本文 (subagent のプロンプト) は writeOut に分離する。
   // deps.out / deps.err で差し替え可能にし、subagent 経路の stdout 本文をテストから検証する。
   const writeOut = deps.out || ((s) => process.stdout.write(s));
-  const writeErr = deps.err || ((s) => process.stderr.write(s));
   // 観点は deps.checklist 指定があれば優先、無ければ .cross-review.md / 汎用観点を解決する。
   const checklist = deps.checklist != null ? deps.checklist : loadChecklist(deps);
   // 申し送り (--instructions) は観点とは別系統。deps.instructions 指定があれば優先、
@@ -2455,6 +2507,7 @@ function runReview(opts, deps = {}) {
         diffKb: Number(diffKb.toFixed(1)),
         headSha,
         recordedAt: nowIso(),
+        ...(routeOverride ? { routeOverride } : {}),
         ...(truncated ? { outputTruncated: true } : {}),
       },
     }, invDeps);
