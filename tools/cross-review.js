@@ -13,9 +13,9 @@
 //   node tools/cross-review.js codex --fix --instructions notes.md  # レビュアーの指摘 (notes.md) を渡して Codex に修正させる
 //   node tools/cross-review.js codex --uncommitted    # 未コミットの作業ツリー差分をレビュー
 //   node tools/cross-review.js claude --base develop  # 比較先ブランチを変更
-//   node tools/cross-review.js state            # この枝の往復回数・直前レビュー SHA・非対応指摘を表示
+//   node tools/cross-review.js state            # この枝の往復回数・直前レビュー SHA・非対応指摘・最後の結論を表示
 //   node tools/cross-review.js dismiss "<要約>" # 非対応と判断した指摘を記録し、以降再指摘させない
-//   node tools/cross-review.js comment --round 1  # 判断ファイルと検証出力から PR コメント本文を生成
+//   node tools/cross-review.js comment --round 1 --outcome converged  # 本文を生成して結論を記録
 //   npm run review:codex                        # = node tools/cross-review.js codex
 //   npm run review:codex:fix                    # = node tools/cross-review.js codex --fix
 //   npm run review:claude -- --uncommitted      # npm 経由で追加引数を渡す (-- が必要)
@@ -58,10 +58,10 @@
 //   (.cross-review.md) を置き換えず、それに加えてプロンプトへ添える別系統。一方のレビュアーが
 //   出した指摘をファイルに書き、`codex --fix --instructions <path>` で他方に直接修正させる用途を
 //   一級でサポートする (この目的で CROSS_REVIEW_CHECKLIST を流用すると観点が消えるため非推奨)。
-// - 往復回数、直前レビュー時の HEAD、非対応と判断した指摘は、リポジトリ直下の
+// - 往復回数、直前レビュー時の HEAD、非対応と判断した指摘、最後に判断した結論は、リポジトリ直下の
 //   `.cross-review-state.json` にブランチ単位で記録する。これらはブランチごとに決まる値で、
 //   会話の外に置かないと妥当性確認のたびに人が SHA を控え直すことになるため。状態遷移は純粋関数
-//   (nextState / withDismissed / withoutBranch) に閉じ、読み書きだけを I/O 側 (readState /
+//   (nextState / withDismissed / withTriage / withoutBranch) に閉じ、読み書きだけを I/O 側 (readState /
 //   writeState) に置く。ファイルが壊れているときは警告して無視し、書き戻さない (記録を消さない)。
 //   書き込みは必ず「書く直前に読み直した状態」を基にする。レビュアーの実行中に別プロセスが
 //   dismiss や別ブランチのレビュー完了を書いていることがあり、起動前のスナップショットで
@@ -74,7 +74,8 @@
 //   (subagent 経路は渡したプロンプト) と実行経路のメタ情報を保存する。PR コメントの定型は
 //   主セッションが書く判断ファイルと検証出力からの機械的な変換なので、材料を会話の外へ残しておく。
 //   保存の失敗はレビューを失敗にしない (出力は端末に出ているため)。`comment` は判断ファイルが
-//   揃ったときだけ本文を生成し、既定では `gh pr comment --body-file` のコマンド例を出す。
+//   揃ったときだけ本文を生成し、`--outcome` 指定時は本文生成後に結論を記録する。
+//   既定では `gh pr comment --body-file` のコマンド例を出す。
 //   `--post` 指定時は生成本文をいったん保存してから同じメモリ本文を標準入力で投稿し、
 //   投稿に失敗した場合は保存した本文を削除する。
 // - レビュー実行前に PR の有無を `gh pr view` で確かめ、無いと分かったときだけ警告する。
@@ -110,7 +111,7 @@ const CHECKLIST_FILENAME = '.cross-review.md';
 // 除外パターンファイル名。観点 (.cross-review.md) と同じ解決順で探す。
 const IGNORE_FILENAME = '.cross-review-ignore';
 
-// 状態ファイル名。ブランチ単位で「往復回数 / 直前レビュー時の HEAD / 非対応と判断した指摘」を持つ。
+// 状態ファイル名。ブランチ単位で往復回数、直前レビュー SHA、非対応指摘、最後の結論を持つ。
 // 観点と違い cwd では探さず、スクリプト位置からリポジトリ直下に固定して解決する
 // (サブディレクトリから起動しても同じ枝の記録を読み書きするため。resolveStatePath 参照)。
 // git 管理下に置かない前提なので、取り込み先でも .gitignore へ追加する。
@@ -431,7 +432,7 @@ const USAGE = [
   '             サブエージェントへ渡してレビューさせる。--fix も可 (FIX 指示付きで出力)。',
   '',
   'サブコマンド (状態ファイル .cross-review-state.json の操作):',
-  '  state             現在のブランチの往復回数・直前レビュー SHA・非対応指摘を JSON で表示',
+  '  state             現在のブランチの往復回数・直前レビュー SHA・非対応指摘・最後の結論を JSON で表示',
   '  state --reset     現在のブランチの記録を消す',
   '  state --mark      往復を 1 回分記録する (round を 1 増やし、直前レビュー SHA を現在の HEAD にする)。',
   '                    --uncommitted を付けると SHA を据え置く (--uncommitted のレビュー後に使う)。',
@@ -445,6 +446,7 @@ const USAGE = [
   '                        (round-<N>-triage.md)、検証出力を定型に整形し、gh pr comment --body-file 用の',
   '                        ファイルを書き出す (既定では投稿しない。コマンド例は stderr に出る)',
   '                        --post <PR番号> を付けると生成本文を gh pr comment へ直接投稿する',
+  '                        --outcome <fixing|converged|halted> を付けると結論も状態ファイルへ記録する',
   '  artifacts --clean-legacy  .cross-review 直下に残る旧形式の出力だけを削除する',
   '',
   'options:',
@@ -473,6 +475,7 @@ const USAGE = [
   '  --verify <path>       comment: 検証コマンドの出力ファイルを「確認内容」節へ入れる (末尾 200 行まで)',
   '  --out <path>          comment: 生成した本文の書き出し先 (既定はブランチ別ディレクトリの round-<N>-comment.md)',
   '  --post <N>            comment: 生成本文を gh pr comment <N> --body-file - で投稿する (1 以上の整数)',
+  '  --outcome <value>     comment: fixing / converged / halted の結論を本文生成後に状態へ記録する',
   '  --clean-legacy        artifacts: .cross-review 直下の旧形式出力を削除する',
   '  --fallback-prompt <path> GPT 側使用不能時に出力する代替プロンプトの書き出し先',
   '                        (既定: OS の一時ディレクトリ/cross-review-fallback-<pid>.md)',
@@ -497,7 +500,7 @@ const USAGE = [
   '  (--base 明示時と --uncommitted 時はこの解決を行いません)。',
   '  環境変数 CROSS_REVIEW_NO_FETCH=1 で fetch と gh の呼び出しを省きます (オフライン作業向け)。',
   '状態ファイル: <スクリプト>/../.cross-review-state.json にブランチ単位で往復回数・直前レビュー SHA・',
-  '  非対応と判断した指摘を記録します (git 管理外を想定。--no-state で無効化)。',
+  '  非対応と判断した指摘・最後に判断した結論を記録します (git 管理外を想定。--no-state で無効化)。',
   'レビュー出力: 往復を記録できたときだけ、開始時のブランチ名を安全化した',
   '  <スクリプト>/../.cross-review/branch-<slug>-<hash>/ へ保存します',
   '  (codex / claude はレビュアーの出力を round-<N>-<reviewer>.md、subagent は渡したプロンプトを',
@@ -521,15 +524,15 @@ const USAGE = [
   '  node tools/cross-review.js codex --no-fallback',
   '      (GPT 側が使えなくても subagent 代替へ切り替えない)',
   '  node tools/cross-review.js state',
-  '      (現在のブランチの往復回数・直前レビュー SHA・非対応指摘を表示)',
+  '      (現在のブランチの往復回数・直前レビュー SHA・非対応指摘・最後の結論を表示)',
   '  node tools/cross-review.js state --mark',
   '      (サブエージェントでのレビューを終えた後に、往復を 1 回分記録する)',
   '  node tools/cross-review.js dismiss "運用上到達しない入力への指摘"',
   '      (非対応と判断した指摘を記録し、以降のレビューで再指摘させない)',
-  '  node tools/cross-review.js comment --round 1 --verify verify.log',
-  '      (1 往復目の PR コメント本文を生成する。生成後 gh pr comment --body-file で投稿する)',
-  '  node tools/cross-review.js comment --round 1 --post 42',
-  '      (生成した本文を PR #42 へ標準入力経由で投稿する)',
+  '  node tools/cross-review.js comment --round 1 --verify verify.log --outcome converged',
+  '      (1 往復目の結論を記録し、PR コメント本文を生成する)',
+  '  node tools/cross-review.js comment --round 1 --post 42 --outcome fixing',
+  '      (本文を PR #42 へ投稿してから、対応中の結論を記録する)',
   '  node tools/cross-review.js artifacts --clean-legacy',
   '      (旧形式の平置き出力を削除する)',
 ].join('\n');
@@ -584,6 +587,7 @@ function parseArgs(argv) {
     // comment サブコマンド用。round は対象の往復番号、reviewerName は `--reviewer`
     // (省略時はブランチ別ディレクトリのメタ情報から自動で選ぶ)。
     round: null,
+    outcome: null,
     reviewerName: null,
     verifyPath: null, // --verify の検証出力ファイル
     outPath: null, // --out の書き出し先 (未指定はブランチ別ディレクトリの round-<N>-comment.md)
@@ -625,6 +629,17 @@ function parseArgs(argv) {
       } else {
         out.round = n;
         if (a === '--round') i++;
+      }
+    } else if (a === '--outcome' || a.startsWith('--outcome=')) {
+      const v = a === '--outcome' ? args[i + 1] : a.slice('--outcome='.length);
+      if (!v || v.startsWith('-')) {
+        out.error = '--outcome には fixing / converged / halted を指定してください';
+      } else if (!TRIAGE_OUTCOMES.has(v)) {
+        out.error = '--outcome には fixing / converged / halted を指定してください';
+        if (a === '--outcome') i++;
+      } else {
+        out.outcome = v;
+        if (a === '--outcome') i++;
       }
     } else if (a === '--reviewer' || a.startsWith('--reviewer=')) {
       const v = a === '--reviewer' ? args[i + 1] : a.slice('--reviewer='.length);
@@ -769,11 +784,10 @@ function parseArgs(argv) {
     }
   }
   if (!out.help && !out.error && rest[0] === 'comment') {
-    // PR コメント本文の生成。保存済みのメタ情報と判断ファイルを読むだけで、
-    // レビュアーの起動も状態ファイルの更新も行わない。
+    // PR コメント本文を生成する。--outcome があれば生成後に状態ファイルへ結論を記録する。
     out.command = 'comment';
     if (out.noState) {
-      // comment は状態ファイルを読み書きしない。指定しても効かないので黙って無視しない。
+      // --no-state は comment で受け付けず、指定を黙って無視しない。
       out.error = '--no-state は state / dismiss / comment サブコマンドとは併用できません';
     } else if (out.cleanLegacy) {
       out.error = '--clean-legacy は artifacts サブコマンドでのみ使えます';
@@ -810,6 +824,7 @@ function parseArgs(argv) {
         out.verifyPath != null ? '--verify' : null,
         out.outPath != null ? '--out' : null,
         out.postNumber != null ? '--post' : null,
+        out.outcome != null ? '--outcome' : null,
       ].filter(Boolean);
       if (commentOnly.length > 0) {
         out.error = `${commentOnly.join(' / ')} は comment サブコマンドでのみ使えます`;
@@ -855,6 +870,7 @@ function parseArgs(argv) {
       out.verifyPath != null ? '--verify' : null,
       out.outPath != null ? '--out' : null,
       out.postNumber != null ? '--post' : null,
+      out.outcome != null ? '--outcome' : null,
     ].filter(Boolean);
     if (given.length > 0) {
       out.error = `${given.join(' / ')} は comment サブコマンドでのみ使えます`;
@@ -1029,7 +1045,18 @@ function resolveStatePath(deps = {}) {
 
 // 1 ブランチ分の初期状態。
 function emptyBranchState() {
-  return { round: 0, lastReviewedSha: null, dismissed: [] };
+  return { round: 0, lastReviewedSha: null, dismissed: [], lastTriage: null };
+}
+
+const TRIAGE_OUTCOMES = new Set(['fixing', 'converged', 'halted']);
+
+function normalizeLastTriage(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (!Number.isSafeInteger(value.round) || value.round < 1) return null;
+  // 読み手は PR の head と完全一致で比べるので、短縮 SHA は受けない (SHA-1 は 40 桁、SHA-256 は 64 桁)。
+  if (typeof value.sha !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/i.test(value.sha)) return null;
+  if (!TRIAGE_OUTCOMES.has(value.outcome)) return null;
+  return { round: value.round, sha: value.sha.toLowerCase(), outcome: value.outcome };
 }
 
 // 読み込んだ JSON を既知の形へ正規化する純粋関数。型が違う値は初期値へ落とす
@@ -1049,7 +1076,12 @@ function normalizeState(raw) {
     const dismissed = Array.isArray(v.dismissed)
       ? v.dismissed.filter((s) => typeof s === 'string' && s.trim()).map((s) => s.trim())
       : [];
-    out.branches[name] = { round, lastReviewedSha: sha, dismissed };
+    out.branches[name] = {
+      round,
+      lastReviewedSha: sha,
+      dismissed,
+      lastTriage: normalizeLastTriage(v.lastTriage),
+    };
   }
   return out;
 }
@@ -1076,6 +1108,7 @@ function nextState(state, { branch, sha, reviewer } = {}) {
     round: prev.round + 1,
     lastReviewedSha: sha ? String(sha) : prev.lastReviewedSha,
     dismissed: prev.dismissed.slice(),
+    lastTriage: prev.lastTriage,
   };
   return { branches };
 }
@@ -1089,6 +1122,18 @@ function withDismissed(state, branch, text) {
   if (prev.dismissed.includes(value)) return base;
   const branches = { ...base.branches };
   branches[branch] = { ...prev, dismissed: prev.dismissed.concat(value) };
+  return { branches };
+}
+
+function withTriage(state, branch, triage) {
+  const base = normalizeState(state);
+  const lastTriage = normalizeLastTriage(triage);
+  if (!branch || !lastTriage) return base;
+  const prev = branchStateOf(base, branch);
+  // 古い往復の結論で新しい往復の結論を戻さない。同じ往復の記録し直しは受ける。
+  if (prev.lastTriage && lastTriage.round < prev.lastTriage.round) return base;
+  const branches = { ...base.branches };
+  branches[branch] = { ...prev, lastTriage };
   return { branches };
 }
 
@@ -2172,7 +2217,7 @@ function runReview(opts, deps = {}) {
   }
   // bridge の解決や状態ファイルの警告は、他の通知と同じ stderr の出口 (writeErr) へ流す。
   const invDeps = deps.warn ? deps : { ...deps, warn: writeErr };
-  // 状態ファイル (往復回数 / 直前レビュー SHA / 非対応と判断した指摘) を読む。
+  // 状態ファイル (往復回数 / 直前レビュー SHA / 非対応指摘 / 最後の結論) を読む。
   // --no-state、ブランチ名を取れない、ファイルが壊れているときは記録を使わず読み書きもしない。
   const readStateFn = deps.readState || readState;
   const writeStateFn = deps.writeState || writeState;
@@ -2614,9 +2659,8 @@ function cleanLegacyArtifacts(deps = {}) {
   return runArtifactsCommand({ cleanLegacy: true }, deps);
 }
 
-// `comment --round <N>` サブコマンド。保存済みのメタ情報、主セッションが書いた判断ファイル、
-// 検証出力を定型に整形し、`gh pr comment --body-file` へ渡すファイルを書き出す。
-// `--post` を付けたときは本文を先に保存してから gh へ投稿し、失敗時に保存本文を削除する。
+// `comment --round <N>` サブコマンド。保存済みのメタ情報、判断ファイル、検証出力から本文を生成する。
+// `--outcome` 指定時は、本文生成後 (投稿する場合は投稿成功後) に結論を状態ファイルへ記録する。
 // deps で出力、ファイル読み書き、gh の呼び出しを差し替えられる (runReview と同じ流儀)。
 function runCommentCommand(opts, deps = {}) {
   const writeErr = deps.err || ((s) => process.stderr.write(s));
@@ -2624,6 +2668,8 @@ function runCommentCommand(opts, deps = {}) {
   const exists = deps.exists || ((p) => fs.existsSync(p));
   const readFile = deps.readFile || ((p) => fs.readFileSync(p, 'utf8'));
   const writeReviewFile = deps.writeReviewFile || defaultReviewFileWriter;
+  const readStateFn = deps.readState || readState;
+  const writeStateFn = deps.writeState || writeState;
   const round = opts.round;
   let branch;
   try {
@@ -2636,6 +2682,14 @@ function runCommentCommand(opts, deps = {}) {
     process.exitCode = 1;
     return null;
   }
+  const safeGitValue = (read) => {
+    try {
+      return read(gitRun);
+    } catch {
+      return null;
+    }
+  };
+  const startHeadSha = opts.outcome == null ? null : safeGitValue(currentHeadSha);
   const dir = resolveBranchReviewDir(branch, deps);
   const outPath = opts.outPath || path.join(dir, roundFileNames(round, '').comment);
   const usesDefaultOut = !opts.outPath;
@@ -2666,6 +2720,66 @@ function runCommentCommand(opts, deps = {}) {
     }
     process.exitCode = 1;
     return null;
+  };
+  const recordTriage = (posted) => {
+    if (opts.outcome == null) return true;
+    const stateDeps = deps.warn ? deps : { ...deps, warn: writeErr };
+    let loaded;
+    try {
+      loaded = readStateFn(stateDeps);
+    } catch (err) {
+      loaded = { path: resolveStatePath(stateDeps), corrupt: true, error: err };
+    }
+    const statePath = loaded && loaded.path ? loaded.path : resolveStatePath(stateDeps);
+    const context = posted ? `PR #${opts.postNumber} へ投稿しましたが` : '本文は生成しましたが';
+    if (!loaded || loaded.corrupt) {
+      writeErr(`[cross-review] ${context}結論は記録していません: 状態ファイルを読めません (${statePath})\n`);
+      process.exitCode = 1;
+      return false;
+    }
+    if (!startHeadSha) {
+      writeErr(`[cross-review] ${context}結論は記録していません: HEAD の SHA を取得できません (${statePath})\n`);
+      process.exitCode = 1;
+      return false;
+    }
+    // 投稿を待つあいだにコミットやブランチ切替があると、確かめていない SHA を結論に残すため。
+    if (safeGitValue(currentBranchName) !== branch || safeGitValue(currentHeadSha) !== startHeadSha) {
+      writeErr(`[cross-review] ${context}結論は記録していません: 実行中にブランチか HEAD が変わりました (${statePath})\n`);
+      process.exitCode = 1;
+      return false;
+    }
+    const headSha = startHeadSha;
+    const recorded = branchStateOf(loaded.state, branch).lastTriage;
+    if (recorded && round < recorded.round) {
+      writeErr(`[cross-review] ${context}結論は記録していません: ${recorded.round} 往復目の結論が既にあります (${statePath})\n`);
+      process.exitCode = 1;
+      return false;
+    }
+    const updated = withTriage(loaded.state, branch, { round, sha: headSha, outcome: opts.outcome });
+    try {
+      if (writeStateFn(updated, stateDeps) === false) {
+        writeErr(`[cross-review] ${context}結論は記録していません: 状態ファイルへ書けません (${statePath})\n`);
+        process.exitCode = 1;
+        return false;
+      }
+    } catch {
+      writeErr(`[cross-review] ${context}結論は記録していません: 状態ファイルへ書けません (${statePath})\n`);
+      process.exitCode = 1;
+      return false;
+    }
+    if (opts.outcome === 'converged') {
+      let status = null;
+      try {
+        status = gitRun(['status', '--porcelain', '--untracked-files=no'], { allowFailure: true });
+      } catch {
+        status = null;
+      }
+      if (status != null && String(status).trim()) {
+        writeErr(`[cross-review] ${branch} に追跡ファイルの未コミット変更があります。結論に記録した SHA ${shortSha(headSha)} には含まれていません。\n`);
+      }
+    }
+    writeErr(`[cross-review] ${branch} の結論を記録しました (${round} 往復目 / ${opts.outcome} / ${shortSha(headSha)}): ${statePath}\n`);
+    return true;
   };
 
   // レビュアーは明示が無ければメタ情報から自動で決める。複数あるときに黙って片方を選ぶと、
@@ -2776,6 +2890,7 @@ function runCommentCommand(opts, deps = {}) {
         : 'gh の実行結果を取得できません';
       return fail(`[cross-review] PR コメントを投稿できません: ${detail}\n`);
     }
+    if (!recordTriage(true)) return null;
     writeErr(`[cross-review] PR #${opts.postNumber} へコメントを投稿しました: ${outPath}\n`);
     return outPath;
   }
@@ -2790,6 +2905,7 @@ function runCommentCommand(opts, deps = {}) {
   // パスは二重引用符で囲む。空白を含むパスでもそのまま貼れるようにする。
   writeErr(`[cross-review] PR コメントの本文を生成しました: ${outPath}\n`
     + `  gh pr comment ${prNumber} --body-file "${outPath}"\n`);
+  if (!recordTriage(false)) return null;
   return outPath;
 }
 
@@ -2855,6 +2971,7 @@ module.exports = {
   branchStateOf,
   nextState,
   withDismissed,
+  withTriage,
   withoutBranch,
   readState,
   writeState,
