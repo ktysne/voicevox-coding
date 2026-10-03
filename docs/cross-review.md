@@ -356,13 +356,22 @@ claude-codex-bridge を入れている環境では、codex を直接起動する
 
 ### 状態ファイル（`.cross-review-state.json`）
 
-往復回数、直前レビュー時の `HEAD`、非対応と判断した指摘は、**ブランチごとに決まる値**です。  
+往復回数、直前レビュー時の `HEAD`、非対応と判断した指摘、最後に判断した結論は、**ブランチごとに決まる値**です。  
 会話の中だけで持つと、妥当性確認のたびに人が SHA を控え直し、往復回数を数え直すことになるので、リポジトリ直下の `.cross-review-state.json` に記録します。
 
 ```json
 {
   "branches": {
-    "feat/example": { "round": 2, "lastReviewedSha": "abc123...", "dismissed": ["運用上到達しない入力への指摘"] }
+    "feat/example": {
+      "round": 2,
+      "lastReviewedSha": "abc123...",
+      "dismissed": ["運用上到達しない入力への指摘"],
+      "lastTriage": {
+        "round": 2,
+        "sha": "0123456789abcdef0123456789abcdef01234567",
+        "outcome": "converged"
+      }
+    }
   }
 }
 ```
@@ -378,11 +387,24 @@ claude-codex-bridge を入れている環境では、codex を直接起動する
   **GPT 側使用不能のフォールバック（代替プロンプトの書き出し）でも増えません。** CLI はサブエージェントがレビューを終えたかを観測できないので、書き出した時点で数えると、プロンプトを渡さずに再実行したとき未レビューの差分が「差分なし」になって再試行できなくなります。フォールバック後の記録は、レビューを終えた人が `state --mark` で行います。
 - 書き込みは必ず**書く直前に読み直した状態**を基にします（read-modify-write）。レビュアーの実行中に別プロセスが `dismiss` や別ブランチのレビュー完了を書いていることがあり、起動前に読んだスナップショットで上書きするとその更新が消えるためです。読み直しで JSON が壊れていたときは、警告して記録しません。
 - `lastReviewedSha` はその実行時点の `HEAD` です。`--uncommitted` では**更新しません**（作業ツリー差分は「この SHA 以降の増分」の意味を持たないため）。`round` は増えます。
+- `lastTriage` は最後に判断した結論で、未記録なら `null` です。
+  `round` は結論を判断した往復番号、`sha` は記録時の `HEAD`(40 桁か 64 桁の完全な SHA を小文字で持つ)、`outcome` は `fixing` / `converged` / `halted` のいずれかです。
+  旧形式で項目が無い状態も読み込めます。
+  記録済みより古い往復の結論は記録しません(同じ往復の記録し直しはできます)。
+- 結論は `comment --round <N> --outcome <値>` で記録します。
+  本文を書けた後に記録し、`--post` 付きなら投稿成功後に記録します。
+  本文を作れない経路では状態を変更せず、`--outcome` を省略したときも状態ファイルを読み書きしません。
+- `converged` の SHA は、収束した変更をコミットしてから記録します。
+  追跡ファイルに未コミット変更がある状態で記録しても処理は続きますが、SHA に含まれない変更がある旨を警告します。
+- 読み手は `lastTriage` が無い、または `round > lastTriage.round` なら、その往復の結論待ち(レビュー中か、結果の判断待ち)と判断します。
+  `codex` と `claude` の経路はレビュアーが終わってから `round` を進めるので、レビューの実行中は `round == lastTriage.round` のまま前の往復の結論が見えます。
+  `outcome: "fixing"` は修正対応中、`outcome: "halted"` は開発者の判断待ちです。
+  `outcome: "converged"` かつ `sha` が現在の `HEAD` と一致するときだけ、その head で収束した状態です。
 - JSON が壊れているときは、**警告して無視し、書き戻しもしません**（既存の記録を上書きで消さないため）。
 - `--no-state` で読み書きを丸ごと無効化できます（CI など、状態を持たせたくない実行向け）。
 
 ```bash
-node tools/cross-review.js state             # 現在の枝の round / lastReviewedSha / dismissed を JSON で表示
+node tools/cross-review.js state             # 現在の枝の round / lastReviewedSha / dismissed / lastTriage を JSON で表示
 node tools/cross-review.js state --reset     # 現在の枝の記録を消す（他の枝は残る）
 node tools/cross-review.js state --mark      # 往復を 1 回分記録する（round を 1 増やし、lastReviewedSha を現在の HEAD にする）
 node tools/cross-review.js state --mark --uncommitted   # 同上だが lastReviewedSha は据え置く（--uncommitted のレビュー後に使う）
@@ -776,13 +798,13 @@ npm run review:codex
 npm test > verify.log 2>&1
 
 # 4. 定型に整形する (投稿はしない)
-node tools/cross-review.js comment --round 1 --verify verify.log
+node tools/cross-review.js comment --round 1 --verify verify.log --outcome converged
 
 # 5. 生成された本文を投稿する (コマンド例は 4 の stderr に出る)
 gh pr comment <番号> --body-file .cross-review/branch-<slug>-<hash>/round-1-comment.md
 
 # 投稿まで自動化する場合は、生成本文を標準入力で渡す
-node tools/cross-review.js comment --round 1 --verify verify.log --post <番号>
+node tools/cross-review.js comment --round 1 --verify verify.log --post <番号> --outcome converged
 ```
 
 生成される本文の構成は次のとおりです。
@@ -805,8 +827,14 @@ node tools/cross-review.js comment --round 1 --verify verify.log --post <番号>
 | `--verify <path>` | 検証コマンドの出力ファイル |
 | `--out <path>` | 書き出し先（既定はブランチ別ディレクトリの `round-<N>-comment.md`） |
 | `--post <N>` | PR #N へ生成本文を `gh pr comment N --body-file -` の標準入力で投稿（1 以上の整数） |
+| `--outcome <値>` | 本文生成後に結論を記録する。`fixing` / `converged` / `halted` を指定 |
 
-`comment` は入力検査の前に既定出力先の古い本文を削除します。`--out` で明示した出力先は、入力検査に成功して新しい本文の書き出しを開始するまで変更しません。メタ情報が無い、複数ある、検証出力を読めない、判断ファイルが無い、本文を書けない、投稿に失敗するといった場合は終了コード 1 で終わり、今回生成した本文を残しません。`--post` を付けた場合は、本文を出力先へ保存してから同じメモリ本文を投稿し、投稿に失敗すると保存した本文を削除します。投稿ではネットワーク遅延を考慮して gh のタイムアウトを 60 秒に延長し、タイムアウト、シグナル終了、起動エラーの理由を表示します。
+`comment` は入力検査の前に既定出力先の古い本文を削除します。
+`--out` で明示した出力先は、入力検査に成功して新しい本文の書き出しを開始するまで変更しません。
+メタ情報が無い、複数ある、検証出力を読めない、判断ファイルが無い、本文を書けない、投稿に失敗するといった場合は終了コード 1 で終わり、今回生成した本文を残しません。
+`--post` を付けた場合は、本文を出力先へ保存してから同じメモリ本文を投稿し、投稿に失敗すると保存した本文を削除します。
+`--outcome` を付けた場合、状態ファイルの破損、`HEAD` の取得失敗、実行中のブランチか `HEAD` の変化、記録済みより古い往復の指定、書き込み失敗では終了コード 1 になりますが、生成済み本文や成功済みの投稿は残ります。
+投稿ではネットワーク遅延を考慮して gh のタイムアウトを 60 秒に延長し、タイムアウト、シグナル終了、起動エラーの理由を表示します。
 
 投稿しない既定動作では、stderr に手動投稿用のコマンド例を出します。`--post` は PR 番号を明示した実行でだけ使います。
 
