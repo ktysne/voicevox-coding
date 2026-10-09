@@ -69,6 +69,75 @@ test('初回は seed のみ、既知 item は重複通知せず、新規 thread 
   assert.equal(received.length, 2);
 });
 
+/** thread/list の各スレッドに status / updatedAt を持たせられる transport の代役。 */
+class ThreadStatusTransport {
+  constructor(threads) { this.threads = threads; this.turnsCalls = []; }
+  async request(method, params) {
+    if (method === 'thread/list') {
+      return { data: this.threads.map((t) => ({ id: t.id, status: t.status, updatedAt: t.updatedAt })) };
+    }
+    if (method === 'thread/turns/list') {
+      this.turnsCalls.push(params.threadId);
+      return { data: [{ id: `${params.threadId}-turn`, items: [] }] };
+    }
+    return { data: [] };
+  }
+}
+
+test('アイドルスレッドは updatedAt が変わらない限り turns/list を投げない', async () => {
+  const transport = new ThreadStatusTransport([
+    { id: 't1', status: { type: 'idle' }, updatedAt: 1 },
+    { id: 't2', status: { type: 'idle' }, updatedAt: 1 },
+    { id: 't3', status: { type: 'idle' }, updatedAt: 1 },
+  ]);
+  const monitor = new CodexCommentaryMonitor({ transportFactory: () => transport });
+  monitor.transport = transport;
+  // baseline（初回走査）は前回値が無いので 3 件とも確認する。
+  await monitor.scan();
+  assert.equal(transport.turnsCalls.length, 3);
+  // updatedAt が変わらないアイドルスレッドは、以後のポーリングでは確認しない。
+  await monitor.scan();
+  await monitor.scan();
+  assert.equal(transport.turnsCalls.length, 3);
+});
+
+test('updatedAt が変化した idle スレッドだけ確認する', async () => {
+  const threads = [
+    { id: 't1', status: { type: 'idle' }, updatedAt: 1 },
+    { id: 't2', status: { type: 'idle' }, updatedAt: 1 },
+    { id: 't3', status: { type: 'idle' }, updatedAt: 1 },
+  ];
+  const transport = new ThreadStatusTransport(threads);
+  const monitor = new CodexCommentaryMonitor({ transportFactory: () => transport });
+  monitor.transport = transport;
+  await monitor.scan();
+  transport.turnsCalls.length = 0;
+  threads[1].updatedAt = 2; // t2 だけ更新される
+  await monitor.scan();
+  assert.deepEqual(transport.turnsCalls, ['t2']);
+});
+
+test('active スレッドは updatedAt が変わらなくてもポーリングごとに毎回確認する', async () => {
+  const transport = new ThreadStatusTransport([
+    { id: 't1', status: { type: 'active' }, updatedAt: 1 },
+  ]);
+  const monitor = new CodexCommentaryMonitor({ transportFactory: () => transport });
+  monitor.transport = transport;
+  await monitor.scan();
+  await monitor.scan();
+  await monitor.scan();
+  assert.deepEqual(transport.turnsCalls, ['t1', 't1', 't1']);
+});
+
+test('status や updatedAt が取れない未知の形は互換性のため従来どおり毎回確認する', async () => {
+  const transport = new ThreadStatusTransport([{ id: 't1' }]);
+  const monitor = new CodexCommentaryMonitor({ transportFactory: () => transport });
+  monitor.transport = transport;
+  await monitor.scan();
+  await monitor.scan();
+  assert.deepEqual(transport.turnsCalls, ['t1', 't1']);
+});
+
 /** setInterval を監視し、生成数と未解除の本数を数える。 */
 function trackIntervals() {
   const originalSet = globalThis.setInterval;
@@ -293,6 +362,250 @@ test('stop() 後の start() は baseline を取り直し、無効化中に増え
     state.items = ['A', 'B', 'C', 'D'];
     await waitFor(() => received.includes('D'));
     assert.deepEqual(received, ['B', 'D']);
+  } finally {
+    monitor.dispose();
+  }
+});
+
+test('確認の間に新しいターンが始まっても、前のターンの最後の commentary を回収する (#43)', async () => {
+  // idle のまま updatedAt が変わらず、turn1 に最後の commentary (b) が増えたうえで
+  // turn2 が始まるケース。limit: 1 だと最新の turn2 しか取得できず b が失われる
+  let phase = 0; // 0: turn1=[a], 1: turn1=[a,b] + turn2=[c]
+  class TurnSwapTransport extends EventEmitter {
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 't1', status: { type: 'idle' }, updatedAt: 'same' }] };
+      }
+      const turn1 = {
+        id: 'turn1',
+        items: phase === 0
+          ? [{ type: 'agentMessage', phase: 'commentary', id: 'a', text: 'A' }]
+          : [
+              { type: 'agentMessage', phase: 'commentary', id: 'a', text: 'A' },
+              { type: 'agentMessage', phase: 'commentary', id: 'b', text: 'B' },
+            ],
+      };
+      if (phase === 0) return { data: [turn1] };
+      const turn2 = { id: 'turn2', items: [{ type: 'agentMessage', phase: 'commentary', id: 'c', text: 'C' }] };
+      // sortDirection: 'desc' なので新しい turn2 が先頭
+      return { data: [turn2, turn1] };
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    fullRecheckMs: 40,
+    log: { warn() {}, info() {}, debug() {} },
+    transportFactory: () => new TurnSwapTransport(),
+  });
+  const heard = [];
+  monitor.on('commentary', (p) => heard.push(p.itemId));
+
+  try {
+    monitor.start();
+    await waitFor(() => monitor.baselineComplete);
+    phase = 1; // updatedAt を変えずに turn1 へ b が増え、turn2 (c) が始まる
+    await waitFor(() => heard.includes('b') && heard.includes('c'));
+    // 古いターンの b が新しいターンの c より先（時系列順）
+    assert.ok(heard.indexOf('b') < heard.indexOf('c'), `時系列順でない: ${heard}`);
+    assert.ok(!heard.includes('a'), 'baseline の item a は読み上げない');
+  } finally {
+    monitor.dispose();
+  }
+});
+
+test('updatedAt も status も変わらない更新でも、全確認の周期で取りこぼしを回収する (#43)', async () => {
+  // ポーリング間で active 期間を観測できず、updatedAt も変わらないケース。
+  // 間引きの追跡だけでは無期限にスキップされるため、周期的な全確認で拾う
+  let hasNewItem = false;
+  class SilentUpdateTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.turnsCalls = 0;
+    }
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 't1', status: { type: 'idle' }, updatedAt: 'same' }] };
+      }
+      this.turnsCalls += 1;
+      const items = [{ type: 'agentMessage', phase: 'commentary', id: 'a', text: 'A' }];
+      if (hasNewItem) items.push({ type: 'agentMessage', phase: 'commentary', id: 'b', text: 'B' });
+      return { data: [{ id: 'turn1', items }] };
+    }
+    dispose() {}
+  }
+
+  const transport = new SilentUpdateTransport();
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    fullRecheckMs: 40, // テスト用に短くする（既定 60 秒）
+    log: { warn() {}, info() {}, debug() {} },
+    transportFactory: () => transport,
+  });
+  const heard = [];
+  monitor.on('commentary', (p) => heard.push(p.itemId));
+
+  try {
+    monitor.start();
+    await waitFor(() => monitor.baselineComplete);
+    hasNewItem = true; // updatedAt も status も変えずに item b が増える
+    await waitFor(() => heard.includes('b'));
+  } finally {
+    monitor.dispose();
+  }
+});
+
+test('active から idle へ遷移した直後は、updatedAt が同じでも確認する (#43)', async () => {
+  // active 中に追加された最後の commentary が updatedAt を変えないまま idle へ
+  // 遷移するケース。見送ると limit: 1 の走査では次のターン開始後に二度と読めない
+  let phase = 0; // 0: active (item a のみ), 1: idle (item a + b)
+  class TransitionTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.turnsCalls = 0;
+    }
+    start() {}
+    notify() {}
+    async request(method) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 't1', status: { type: phase === 0 ? 'active' : 'idle' }, updatedAt: 'same' }] };
+      }
+      this.turnsCalls += 1;
+      const items = [{ type: 'agentMessage', phase: 'commentary', id: 'a', text: 'A' }];
+      if (phase === 1) items.push({ type: 'agentMessage', phase: 'commentary', id: 'b', text: 'B' });
+      return { data: [{ id: 'turn1', items }] };
+    }
+    dispose() {}
+  }
+
+  const transport = new TransitionTransport();
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    log: { warn() {}, info() {}, debug() {} },
+    transportFactory: () => transport,
+  });
+  const heard = [];
+  monitor.on('commentary', (p) => heard.push(p.itemId));
+
+  try {
+    monitor.start();
+    // baseline + active のままの走査で、追跡に active の状態を記録させる
+    await waitFor(() => transport.turnsCalls >= 2);
+    phase = 1; // idle へ遷移。updatedAt は同じだが item b が増えている
+    await waitFor(() => heard.includes('b'));
+    assert.ok(!heard.includes('a'), 'baseline の item a は読み上げない');
+  } finally {
+    monitor.dispose();
+  }
+});
+
+test('停止中に遅延して返った旧走査の応答は、新しい世代の追跡を汚さない (#43)', async () => {
+  let releaseStale = null;
+  const transports = [];
+
+  class RaceTransport extends EventEmitter {
+    constructor() {
+      super();
+      this.gen = transports.length; // 0 = 旧世代
+      this.turnsCalls = [];
+      transports.push(this);
+    }
+    start() {}
+    notify() {}
+    async request(method, params) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 't1', status: { type: 'idle' }, updatedAt: 'same' }] };
+      }
+      this.turnsCalls.push(params.threadId);
+      if (this.gen === 0) {
+        // 旧世代の turns/list は停止後まで返さない
+        return new Promise((resolve) => {
+          releaseStale = () => resolve({ data: [{ id: 'turn1', items: [] }] });
+        });
+      }
+      return { data: [] };
+    }
+    dispose() {}
+  }
+
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    log: { warn() {}, info() {}, debug() {} },
+    transportFactory: () => new RaceTransport(),
+  });
+
+  try {
+    monitor.start();
+    await waitFor(() => releaseStale !== null); // 旧世代の初回走査が turns/list で待機中
+    monitor.stop();
+    monitor.start(); // 新世代（追跡はクリア済み）
+    await waitFor(() => transports.length === 2);
+    releaseStale(); // 旧走査が今さら解決する。記録は世代確認の後なので何も書かない
+
+    // 新世代の初回走査で、同じ updatedAt の idle スレッドがスキップされずに確認される。
+    // 旧走査の記録が新世代の追跡へ書き戻されていれば、ここで確認されず取りこぼす
+    await waitFor(() => transports[1].turnsCalls.includes('t1'));
+  } finally {
+    monitor.dispose();
+  }
+});
+
+test('stop → start で idle スレッドの updatedAt 追跡がリセットされる', async () => {
+  // status/updatedAt を持つ単一の idle スレッドを返す transport の代役。
+  class IdleThreadTransport extends EventEmitter {
+    constructor(updatedAt) { super(); this.updatedAt = updatedAt; this.turnsCalls = []; }
+    start() {}
+    notify() {}
+    async request(method, params) {
+      if (method === 'initialize') return {};
+      if (method === 'thread/list') {
+        return { data: [{ id: 'th', status: { type: 'idle' }, updatedAt: this.updatedAt }] };
+      }
+      if (method === 'thread/turns/list') {
+        this.turnsCalls.push(params.threadId);
+        return { data: [{ id: 'turn', items: [] }] };
+      }
+      return { data: [] };
+    }
+    dispose() {}
+  }
+
+  let transport = null;
+  const monitor = new CodexCommentaryMonitor({
+    pollMs: 5,
+    restartDelayMs: 5,
+    transportFactory: () => { transport = new IdleThreadTransport(1); return transport; },
+  });
+
+  try {
+    monitor.start();
+    await waitFor(() => monitor.baselineComplete);
+    // 1 回目の start: baseline で idle スレッドも確認する。
+    assert.deepEqual(transport.turnsCalls, ['th']);
+
+    // updatedAt が変わらない間はポーリングを重ねても turns/list は増えない。
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    assert.deepEqual(transport.turnsCalls, ['th']);
+
+    monitor.stop();
+    monitor.start();
+    await waitFor(() => monitor.baselineComplete);
+    // 2 回目の start: updatedAt を変えていなくても、追跡がリセットされているので
+    // 新しい世代の transport（updatedAt 追跡が無い状態）で idle スレッドを確認し直す。
+    assert.deepEqual(transport.turnsCalls, ['th']);
   } finally {
     monitor.dispose();
   }

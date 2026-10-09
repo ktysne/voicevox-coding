@@ -752,11 +752,16 @@ test('時間切れになったパターンは次から短い時間で試す', ()
   assert.ok(first.ms >= IGNORE_MATCH_PATTERN_MS / 2, `${first.ms}ms しかかかっていない`);
 
   // 2 回目は短い時間で打ち切る。絶対値ではなく初回との比で見る（実行環境の速さに左右されないように）。
-  // 単発の計測は CI の低速ランナーで上振れしてフレークするため、最短値で見る
+  // 単発の計測は CI の低速ランナーで上振れしてフレークするため、最短値で見る。
+  // 判定は比（first / 2）ではなく枠の差で行う。負荷によるオーバーヘッドは初回にも
+  // 2 回目にも同程度乗るため、比だと高負荷時に 2 回目側だけ相対的に膨らんで
+  // 落ちることがある（実測: 初回 80.9ms / 2 回目 41.4ms）。「初回より枠の差の
+  // 半分以上速い」なら、2 回目が短い枠で打ち切られたと言い切れる
+  const budgetGap = IGNORE_MATCH_PATTERN_MS / 2;
   const second = measureMin(() => resolveStop(LONG_TEXT, [pattern]));
   assert.equal(second.value.speak, true);
   assert.match(second.value.problems[0], /時間内に終わりません/);
-  assert.ok(second.ms < first.ms / 2, `初回 ${first.ms}ms に対して 2 回目が ${second.ms}ms`);
+  assert.ok(second.ms < first.ms - budgetGap, `初回 ${first.ms}ms に対して 2 回目が ${second.ms}ms`);
 
   // 本文が短ければ短い枠でも間に合うので、同じパターンがちゃんと効く
   const short = resolveStop('aaX', [pattern]);
@@ -767,7 +772,7 @@ test('時間切れになったパターンは次から短い時間で試す', ()
   // 短い本文で間に合っても枠は戻さない。長短が交互に来ても毎回止まらないこと
   const third = measureMin(() => resolveStop(LONG_TEXT, [pattern]));
   assert.equal(third.value.speak, true);
-  assert.ok(third.ms < first.ms / 2, `${third.ms}ms かかった`);
+  assert.ok(third.ms < first.ms - budgetGap, `${third.ms}ms かかった`);
 });
 
 test('記録を捨てると時間切れのパターンをまた測り直す', () => {
