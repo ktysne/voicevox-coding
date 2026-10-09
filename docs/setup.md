@@ -5,7 +5,7 @@
 
 ## 進め方の決まり
 
-- `install.ps1`、`update.ps1`、`uninstall.ps1` と `npm run doctor` は、通常の PowerShell から実行する。
+- `install.ps1`、`update.ps1`、`uninstall.ps1`、`npm run doctor`、共通手順 3 のデーモン起動コマンドは、通常の PowerShell から実行する。
   AI が Codex Desktop 内で動いている場合、AI はこれらのコマンドを実行せず、実行するコマンドと事前確認を開発者へ渡し、その結果を受け取ってから続ける。
   コマンドを実行する PowerShell で、実行前に `$env:CODEX_HOME` の値を確認する。
   値がある場合はそのディレクトリ、空の場合は `%USERPROFILE%\.codex\` が Codex の設定先である。
@@ -33,6 +33,7 @@
   Claude Code のフックコマンドは `"node.exe の実パス" "hook-client.js の実パス" claudeCode`、Codex は `node "hook-client.js の実パス" codex` の形である。
   既存の `settings.json` または `hooks.json` を変更する場合は、変更前に `.bak-<yyyyMMdd-HHmmss>` 形式のバックアップを作成する。
   既存内容と同じ場合はバックアップも設定ファイルへの書き込みも行わない。
+  書き込んだ後は対象ファイルごとに直近 5 世代のバックアップを残し、それより古いものを削除する。
 - `-SkipClaude` または `-SkipCodex` を指定すると、対象連携先の設定から VOICEVOX Coding の既存フックも解除する。
 - 既存の設定はマージし、VOICEVOX Coding 以外のフックは残す。
 - Codex は未承認のフックを実行しない。
@@ -71,7 +72,7 @@ Claude Code と Codex は、どちらか一方だけでも導入できる。
 | VOICEVOX | インストールが必要。VOICEVOX アプリを起動しておく必要はない |
 | PowerShell 7 | セットアップ、更新、アンインストールに必要（[入手先](https://aka.ms/powershell)） |
 | Git | リポジトリの取得と `update.ps1` に使用する |
-| Claude Code / Codex | 利用する連携先だけを用意する。途中経過の読み上げ対象は Codex Desktop（`sourceKinds: vscode`）のセッションであり、読み上げる場合は `codex` CLI を PATH から起動できる必要がある |
+| Claude Code / Codex | 利用する連携先だけを用意する。途中経過の読み上げ対象は Codex Desktop（`sourceKinds: vscode`）のセッションであり、読み上げる場合は `codex` CLI を PATH から起動できる必要がある。`npm run doctor` も Codex のフックの信頼状態を `codex` CLI で問い合わせる |
 
 VOICEVOX アプリは音声を作るための GUI であり、合成 API は同梱のエンジン（`vv-engine\run.exe`）が持つ。
 VOICEVOX Coding はこのエンジンを直接起動するため、アプリを常駐させる必要はない。
@@ -111,6 +112,8 @@ if (Test-Path -LiteralPath $daemonVbs) {
 ```
 
 起動後、`npm run doctor` の `デーモン` が稼働中と表示されるか、`http://127.0.0.1:7591/api/state` が応答することを確認する。
+起動直後はデーモンが VOICEVOX ENGINE を起動している途中で、`VOICEVOX ENGINE` が NG になることがある。数十秒おいて `npm run doctor` を再実行する。
+`start-daemon.vbs` は作成した時点のリポジトリと `node` のパスで起動するため、その後にリポジトリを移動していると起動に失敗する。この場合は `install.ps1` を再実行する。
 管理コンソールは `http://127.0.0.1:7591/` から開く。
 
 起動時に VOICEVOX エンジンが動いていなければ、実行ファイルを自動検出して起動する。
@@ -145,6 +148,8 @@ npm run doctor
 VOICEVOX ENGINE とデーモンが稼働中で、Claude Code と Codex のフックが登録済みと表示されればよい。
 Codex を起動して `/hooks` を開き、VOICEVOX Coding のフックを承認してから `npm run doctor` を再実行する。
 `Codex 信頼状態` が「N 件すべて承認済み」と表示され、`Codex 無効化` の警告が出ないことを確認する。
+`codex` CLI が無い環境では `Codex 信頼状態` が「codex app-server から取得できませんでした」と警告されるが、これは許容する。
+その場合は開発者に Codex の `/hooks` 画面で、VOICEVOX Coding のフックが承認済みで有効になっていることを確かめてもらう。
 Codex の `/hooks` で個別にオフにしたフックは、承認済みでも実行されない。
 `-RegisterStartup` を指定しなかった場合に `スタートアップ` が未登録と警告されるのは正常である。
 
@@ -168,7 +173,7 @@ npm run doctor
 ```
 
 VOICEVOX ENGINE とデーモンが稼働中で、Claude Code のフックが登録済みと表示されればよい。
-Codex は `OK Codex 対象外（導入時に -SkipCodex を指定）` と表示され、Codex への問い合わせは行われない。
+`Codex` の行が OK で、詳細に `対象外（導入時に -SkipCodex を指定）` と表示され、Codex への問い合わせは行われない。
 `-RegisterStartup` を指定しなかった場合に `スタートアップ` が未登録と警告されるのは正常である。
 
 ## パターン 3
@@ -196,7 +201,9 @@ npm run doctor
 VOICEVOX ENGINE とデーモンが稼働中で、Codex のフックが登録済みと表示されればよい。
 Codex で `/hooks` を開いて VOICEVOX Coding のフックを承認し、`npm run doctor` を再実行する。
 `Codex 信頼状態` が「N 件すべて承認済み」と表示され、`Codex 無効化` の警告が出ないことを確認する。
-Claude Code は `OK Claude Code 対象外（導入時に -SkipClaude を指定）` と表示される。
+`codex` CLI が無い環境では `Codex 信頼状態` が「codex app-server から取得できませんでした」と警告されるが、これは許容する。
+その場合は開発者に Codex の `/hooks` 画面で、VOICEVOX Coding のフックが承認済みで有効になっていることを確かめてもらう。
+`Claude Code` の行が OK で、詳細に `対象外（導入時に -SkipClaude を指定）` と表示される。
 `-RegisterStartup` を指定しなかった場合に `スタートアップ` が未登録と警告されるのは正常である。
 
 ## 更新するとき

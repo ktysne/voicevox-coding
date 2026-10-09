@@ -48,9 +48,9 @@ AI には次のように依頼する。
 | パターン | 確かめること |
 |---|---|
 | 共通 | `npm run doctor` が通り、`http://127.0.0.1:7591/` で管理コンソールが開く |
-| パターン 1 | Claude Code と Codex のフックが登録され、doctor の `Codex 信頼状態` が「N 件すべて承認済み」で、`Codex 無効化` の警告がない |
-| パターン 2 | Claude Code のフックが登録され、Codex は `OK Codex 対象外（導入時に -SkipCodex を指定）` と表示される |
-| パターン 3 | Codex のフックが登録され、doctor の `Codex 信頼状態` が「N 件すべて承認済み」で、`Codex 無効化` の警告がなく、Claude Code は `OK Claude Code 対象外（導入時に -SkipClaude を指定）` と表示される |
+| パターン 1 | Claude Code と Codex のフックが登録され、doctor の `Codex 信頼状態` が「N 件すべて承認済み」で、`Codex 無効化` の警告がない（`codex` CLI が無い環境では `/hooks` 画面で承認を確かめる）|
+| パターン 2 | Claude Code のフックが登録され、`Codex` の行が OK で、詳細に `対象外（導入時に -SkipCodex を指定）` と表示される |
+| パターン 3 | Codex のフックが登録され、doctor の `Codex 信頼状態` が「N 件すべて承認済み」で、`Codex 無効化` の警告がなく（`codex` CLI が無い環境では `/hooks` 画面で承認を確かめる）、`Claude Code` の行が OK で、詳細に `対象外（導入時に -SkipClaude を指定）` と表示される |
 
 ## 開発者向けドキュメント
 
