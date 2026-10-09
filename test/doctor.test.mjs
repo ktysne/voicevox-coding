@@ -15,6 +15,7 @@ import {
   registerStartupCommand,
   rerunGuide,
   resolveTargetPlan,
+  startupGuide,
 } from '../scripts/doctor.mjs';
 
 const FULL_MANIFEST = { schemaVersion: 1, includeToolEvents: false, skipClaude: false, skipCodex: false, registerStartup: false };
@@ -22,6 +23,14 @@ const FULL_MANIFEST = { schemaVersion: 1, includeToolEvents: false, skipClaude: 
 test('rerunGuide: install.json があれば壊れていても記録を引き継ぐ update.ps1 へ誘導する', () => {
   assert.match(rerunGuide(true), /update\.ps1/);
   assert.match(rerunGuide(false), /install\.ps1/);
+});
+
+test('startupGuide: 導入時のオプションが記録から分かるときだけ登録コマンドを示す', () => {
+  assert.match(startupGuide({ ...FULL_MANIFEST, skipCodex: true }, true), /install\.ps1 -RegisterStartup -SkipCodex で登録できます/);
+  // 記録が無い旧導入でオプションなしの install.ps1 を案内すると、導入時の構成が既定値に戻る
+  assert.doesNotMatch(startupGuide(null, false), /install\.ps1/);
+  assert.match(startupGuide(null, false), /update\.ps1/);
+  assert.match(startupGuide(null, true), /修復/);
 });
 
 test('registerStartupCommand: 導入時のオプションを添えてスタートアップを登録させる', () => {

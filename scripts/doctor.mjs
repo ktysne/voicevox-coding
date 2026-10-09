@@ -196,6 +196,16 @@ export function registerStartupCommand(manifest) {
 }
 
 /**
+ * スタートアップが未登録のときの案内。登録には install.ps1 を使うので、導入時のオプションが
+ * 記録から分からない(install.json が無い・壊れている)ときは、先に記録を整えさせる。
+ */
+export function startupGuide(manifest, manifestExists) {
+  if (manifest) return `${registerStartupCommand(manifest)} で登録できます`;
+  if (manifestExists) return `${MANIFEST_PATH} を修復してから登録してください`;
+  return '先に scripts\\update.ps1 を実行して導入時の構成を記録し、もう一度 npm run doctor で登録のコマンドを確かめてください';
+}
+
+/**
  * 導入時に -IncludeToolEvents を指定した（＝ manifest.includeToolEvents が true の）のに、
  * PreToolUse / PostToolUse が実際には登録されていない場合、その不足イベント名を返す。
  * 期待していない場合（manifest が無い、または includeToolEvents が false）は常に空配列。
@@ -340,8 +350,7 @@ async function main() {
     'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'VOICEVOX Coding.vbs',
   );
   if (fs.existsSync(startupVbs)) ok('スタートアップ', 'サインイン時に自動起動します');
-  else if (manifestExists && !manifest) warn('スタートアップ', `未登録です。${MANIFEST_PATH} を修復してから登録してください`);
-  else warn('スタートアップ', `未登録です。${registerStartupCommand(manifest)} で登録できます`);
+  else warn('スタートアップ', `未登録です。${startupGuide(manifest, manifestExists)}`);
 
   if (config?.daemon?.tray === false) warn('タスクトレイ', '設定で無効になっています');
   else if (daemonUp) ok('タスクトレイ', '常駐が有効です');
