@@ -69,6 +69,7 @@ function runHarness(scriptFile, functionNames, harnessBody) {
 const BUILD_SAMPLE = `
 $target = Join-Path $WORK 'settings.json'
 $ours = 'node "' + $HookScript + '" claudeCode'
+$slashOurs = $ours.Replace([char]92, '/')
 $root = [ordered]@{
   hooks = [ordered]@{
     Stop = @(
@@ -77,7 +78,7 @@ $root = [ordered]@{
     )
     PreToolUse = @(
       @{ matcher = '*'; hooks = @(
-        @{ type = 'command'; command = $ours },
+        @{ type = 'command'; command = $slashOurs },
         @{ type = 'command'; command = 'node "C:\\other\\their-hook-client.js" x' }
       ) }
     )
@@ -198,6 +199,18 @@ Write-Output ('codexWithTool=' + $codexWithTool.SkipClaude + ',' + $codexWithToo
   assert.match(stdout, /bothEmpty=False,False,False/);
   assert.match(stdout, /claudeOnly=False,True,False/);
   assert.match(stdout, /codexWithTool=True,False,True/);
+});
+
+test('Get-OurHookEvents は / 区切りの配置先も我々のフックとして数える', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness('update.ps1', ['Get-OurHookEvents'], `
+$env:USERPROFILE = $WORK
+$hookScript = Join-Path (Join-Path $env:USERPROFILE '.voicevox-coding') 'hook-client.js'
+$command = 'node "' + $hookScript.Replace([char]92, '/') + '" claudeCode'
+$root = [pscustomobject]@{ hooks = [pscustomobject]@{ Stop = @([pscustomobject]@{ hooks = @([pscustomobject]@{ command = $command }) }) } }
+$events = @(Get-OurHookEvents $root)
+Write-Output ('events=' + ($events -join ','))
+`);
+  assert.match(stdout, /events=Stop/);
 });
 
 test('実効オプションを決めてからデーモンを停止する', () => {

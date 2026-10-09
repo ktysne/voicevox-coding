@@ -76,7 +76,9 @@ function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow 
 #>
 function Test-OurHookCommand([string]$command) {
     if ([string]::IsNullOrEmpty($command)) { return $false }
-    return $command.IndexOf($HookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    $normalizedCommand = $command.Replace('/', '\')
+    $normalizedHookScript = $HookScript.Replace('/', '\')
+    return $normalizedCommand.IndexOf($normalizedHookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
 function Get-NodePath {

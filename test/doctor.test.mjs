@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
@@ -8,8 +11,20 @@ import {
   isOurHookCommand,
   normalizePathForComparison,
   parseCodexInitializeResult,
+  readJson,
   resolveTargetPlan,
 } from '../scripts/doctor.mjs';
+
+test('readJson: BOM 付き JSON を読み込める', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vvc-doctor-'));
+  const file = path.join(dir, 'install.json');
+  try {
+    fs.writeFileSync(file, '\uFEFF{"schemaVersion":1}', 'utf8');
+    assert.deepEqual(readJson(file), { schemaVersion: 1 });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('initialize 応答から Codex の実使用 CODEX_HOME を取り出す', () => {
   assert.equal(

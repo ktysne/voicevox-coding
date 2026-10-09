@@ -50,22 +50,24 @@ function Write-Skip($msg)  { Write-Host "  --   $msg" -ForegroundColor DarkGray 
 function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow }
 
 <#
-  対象ファイルのバックアップ世代を整理する。
-  「<ファイル名>.bak-yyyyMMdd-HHmmss（同一秒の一意化 -N を含む）」に完全一致する
-  ものだけを対象にし、新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
-  削除に失敗しても uninstall 全体は失敗させず、警告だけ出して続行する。
-  install.ps1 の同名関数と同じロジックだが、モジュール共有はせずそれぞれに持たせている。
-#>
-<#
   コマンド文字列が「我々が登録したフック」かどうかの判定。
   'hook-client.js' の部分一致では他製品の similar-hook-client.js まで
   巻き込んで削除しかねないため、配置先の絶対パスで厳密に識別する。
 #>
 function Test-OurHookCommand([string]$command) {
     if ([string]::IsNullOrEmpty($command)) { return $false }
-    return $command.IndexOf($HookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    $normalizedCommand = $command.Replace('/', '\')
+    $normalizedHookScript = $HookScript.Replace('/', '\')
+    return $normalizedCommand.IndexOf($normalizedHookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
 }
 
+<#
+  対象ファイルのバックアップ世代を整理する。
+  「<ファイル名>.bak-yyyyMMdd-HHmmss（同一秒の一意化 -N を含む）」に完全一致する
+  ものだけを対象にし、新しい順（名前の降順）に $Keep 件だけ残して古いものを削除する。
+  削除に失敗しても uninstall 全体は失敗させず、警告だけ出して続行する。
+  install.ps1 の同名関数と同じロジックだが、モジュール共有はせずそれぞれに持たせている。
+#>
 function Remove-OldBackups([string]$path, [int]$Keep = 5) {
     $dir  = Split-Path -Parent $path
     $name = Split-Path -Leaf $path

@@ -192,6 +192,8 @@ function Get-OurHookEvents($root) {
     $events = @()
     if (-not $root -or -not (Get-Member -InputObject $root -Name 'hooks' -ErrorAction SilentlyContinue)) { return $events }
     if (-not $root.hooks) { return $events }
+    $hookScript = Join-Path (Join-Path $env:USERPROFILE '.voicevox-coding') 'hook-client.js'
+    $normalizedHookScript = $hookScript.Replace('/', '\')
     foreach ($prop in $root.hooks.PSObject.Properties) {
         foreach ($g in @($prop.Value)) {
             if (-not $g) { continue }
@@ -199,9 +201,8 @@ function Get-OurHookEvents($root) {
                 if (-not $hk) { continue }
                 # 他製品の similar-hook-client.js を我々のものと誤認しないよう、
                 # 配置先の絶対パスで厳密に識別する
-                $cmdText = [string]$hk.command
-                $hookScript = Join-Path (Join-Path $env:USERPROFILE '.voicevox-coding') 'hook-client.js'
-                if ($cmdText.IndexOf($hookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $events += $prop.Name }
+                $cmdText = ([string]$hk.command).Replace('/', '\')
+                if ($cmdText.IndexOf($normalizedHookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $events += $prop.Name }
             }
         }
     }

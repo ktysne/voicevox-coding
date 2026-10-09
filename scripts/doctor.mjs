@@ -21,9 +21,9 @@ const ok = (name, detail) => results.push({ level: 'ok', name, detail });
 const warn = (name, detail) => results.push({ level: 'warn', name, detail });
 const fail = (name, detail) => results.push({ level: 'fail', name, detail });
 
-function readJson(p) {
+export function readJson(p) {
   try {
-    return JSON.parse(fs.readFileSync(p, 'utf8'));
+    return JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''));
   } catch {
     return null;
   }
@@ -123,6 +123,25 @@ export function parseCodexInitializeResult(message) {
 }
 
 /**
+ * install.json の中身を検証して返す。形式が不正なら null（manifest なしとして扱う）。
+ * "false" のような文字列の bool は truthy に化けて検査や登録を誤って省略するため、
+ * schemaVersion が整数であることと、各オプションが本物の boolean であることを確かめる。
+ */
+export function normalizeInstallManifest(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  // schemaVersion 1 だけを受理する。未知のバージョンを現行形式として
+  // 処理すると、将来の項目変更で誤判定するため
+  if (obj.schemaVersion !== 1) return null;
+  // schemaVersion 1 では 4 項目すべてが必須の boolean。欠けた項目を既定値へ
+  // 倒すと、意図しない再登録やツールイベントの解除が起きるため、不完全な
+  // manifest は無効扱いにして現状推定へ戻す
+  for (const key of ['includeToolEvents', 'skipClaude', 'skipCodex', 'registerStartup']) {
+    if (typeof obj[key] !== 'boolean') return null;
+  }
+  return obj;
+}
+
+/**
  * install.json（導入時の期待構成）と現状の手がかりから、Claude Code / Codex それぞれの
  * 点検方針を決める純関数。
  *
@@ -143,25 +162,6 @@ export function parseCodexInitializeResult(message) {
  * @param {boolean} [opts.migrateWhenMissing] manifest が無いときに未導入への移行判定を行うか
  * @returns {{ mode: 'skip' | 'check' | 'warn-uninstalled' }}
  */
-/**
- * install.json の中身を検証して返す。形式が不正なら null（manifest なしとして扱う）。
- * "false" のような文字列の bool は truthy に化けて検査や登録を誤って省略するため、
- * schemaVersion が整数であることと、各オプションが本物の boolean であることを確かめる。
- */
-export function normalizeInstallManifest(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-  // schemaVersion 1 だけを受理する。未知のバージョンを現行形式として
-  // 処理すると、将来の項目変更で誤判定するため
-  if (obj.schemaVersion !== 1) return null;
-  // schemaVersion 1 では 4 項目すべてが必須の boolean。欠けた項目を既定値へ
-  // 倒すと、意図しない再登録やツールイベントの解除が起きるため、不完全な
-  // manifest は無効扱いにして現状推定へ戻す
-  for (const key of ['includeToolEvents', 'skipClaude', 'skipCodex', 'registerStartup']) {
-    if (typeof obj[key] !== 'boolean') return null;
-  }
-  return obj;
-}
-
 export function resolveTargetPlan(manifest, opts = {}) {
   const { skipKey, hooksExist, cliAvailable, migrateWhenMissing = false } = opts;
 
@@ -191,8 +191,8 @@ export function missingToolEvents(manifest, ourEvents) {
 /**
  * 導入時に -IncludeToolEvents を指定していない（manifest.includeToolEvents が false の）のに、
  * 高頻度の PreToolUse / PostToolUse が残っている場合、そのイベント名を返す。
- * install.ps1 は対象外のツールイベントを解除するようになったため、残っているのは
- * manifest 対応前の導入の名残り。次の update で解除される旨を警告するのに使う。
+ * install.ps1 は対象外のツールイベントを解除するので、残っているのは manifest 対応前の
+ * 導入の名残り。次の update で解除される旨を警告するのに使う。
  * manifest が無い、または includeToolEvents が true の場合は常に空配列。
  */
 export function extraToolEvents(manifest, ourEvents) {
