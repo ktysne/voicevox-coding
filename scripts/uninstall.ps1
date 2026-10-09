@@ -27,21 +27,39 @@ if ($PSVersionTable.PSVersion.Major -lt 6) {
     }
     $forward = @()
     foreach ($kv in $PSBoundParameters.GetEnumerator()) {
-        if ($kv.Value -is [switch] -and -not $kv.Value.IsPresent) { continue }
-        $forward += "-$($kv.Key)"
-        if ($kv.Value -isnot [switch]) { $forward += [string]$kv.Value }
+        if ($kv.Value -is [switch]) {
+            # 明示的な -Name:$false も失わずに転送する（未指定と明示 false の区別を
+            # pwsh 側でも保つ。-File への -Name:$false 渡しは PowerShell が公式に対応）
+            $forward += "-$($kv.Key):`$$($kv.Value.IsPresent)"
+        } else {
+            $forward += "-$($kv.Key)"
+            $forward += [string]$kv.Value
+        }
     }
     & $pwsh.Source -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath @forward
     exit $LASTEXITCODE
 }
 
 $InstallDir = Join-Path $env:USERPROFILE '.voicevox-coding'
+$HookScript = Join-Path $InstallDir 'hook-client.js'
 $ClaudeDir  = Join-Path $env:USERPROFILE '.claude'
 $CodexDir   = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
 
 function Write-Ok($msg)    { Write-Host "  OK   $msg" -ForegroundColor Green }
 function Write-Skip($msg)  { Write-Host "  --   $msg" -ForegroundColor DarkGray }
 function Write-Warn2($msg) { Write-Host "  警告 $msg" -ForegroundColor Yellow }
+
+<#
+  コマンド文字列が「我々が登録したフック」かどうかの判定。
+  'hook-client.js' の部分一致では他製品の similar-hook-client.js まで
+  巻き込んで削除しかねないため、配置先の絶対パスで厳密に識別する。
+#>
+function Test-OurHookCommand([string]$command) {
+    if ([string]::IsNullOrEmpty($command)) { return $false }
+    $normalizedCommand = $command.Replace('/', '\')
+    $normalizedHookScript = $HookScript.Replace('/', '\')
+    return $normalizedCommand.IndexOf($normalizedHookScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
 
 <#
   対象ファイルのバックアップ世代を整理する。
@@ -113,7 +131,7 @@ function Remove-OurHooks([string]$path) {
             $inner = @()
             foreach ($hk in @($g.hooks)) {
                 if ($null -eq $hk) { continue }
-                if ([string]$hk.command -like '*hook-client.js*') { $removed++; continue }
+                if (Test-OurHookCommand ([string]$hk.command)) { $removed++; continue }
                 $inner += $hk
             }
             if ($inner.Count -gt 0) {

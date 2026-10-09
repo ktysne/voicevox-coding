@@ -1,0 +1,272 @@
+// install.ps1 のフック解除（Remove-OurHook / Remove-AllOurHooks）と
+// update.ps1 の manifest 検証（Read-InstallManifest）のテスト。
+// いずれも破壊的または構成を左右する処理なので、実際に pwsh で実行して確かめる。
+// スクリプト本体は読み込むと main が走るため dot-source できず、
+// backup-retention.test.mjs と同じ方式で関数定義をテキストとして抽出する。
+
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { test, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+const tmpDirs = [];
+after(() => {
+  for (const dir of tmpDirs) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
+/** スクリプトから関数定義を抽出する（関数はカラム 0 の `}` で終わる流儀に依存）。 */
+function extractFunction(source, name) {
+  const lines = source.split(/\r?\n/);
+  const start = lines.findIndex((l) => l.startsWith(`function ${name}`));
+  assert.notEqual(start, -1, `function ${name} が見つからない`);
+  const end = lines.findIndex((l, i) => i > start && l === '}');
+  assert.notEqual(end, -1, `function ${name} の終端が見つからない`);
+  return lines.slice(start, end + 1).join('\n');
+}
+
+const pwshOk = (() => {
+  try {
+    return spawnSync('pwsh', ['-NoProfile', '-Command', '1'], { encoding: 'utf8' }).status === 0;
+  } catch {
+    return false;
+  }
+})();
+
+function runHarness(scriptFile, functionNames, harnessBody) {
+  const source = fs.readFileSync(path.join(ROOT, 'scripts', scriptFile), 'utf8');
+  const functions = functionNames.map((n) => extractFunction(source, n)).join('\n\n');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vvc-hooks-'));
+  tmpDirs.push(dir);
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    // 既定の出力はコンソールのコードページ(日本語環境では CP932)になり、utf8 で読むと日本語が化けるため
+    '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
+    'function Write-Ok($msg)    { Write-Host "ok: $msg" }',
+    'function Write-Warn2($msg) { Write-Host "warn: $msg" }',
+    'function Write-Skip($msg)  { Write-Host "skip: $msg" }',
+    `$WORK = '${dir.replace(/'/g, "''")}'`,
+    // Remove-AllOurHooks / Test-OurHookCommand が参照する配置先パス
+    "$HookScript = Join-Path $WORK 'hook-client.js'",
+    functions,
+    harnessBody,
+  ].join('\n');
+  const scriptPath = path.join(dir, 'harness.ps1');
+  fs.writeFileSync(scriptPath, `﻿${script}`, 'utf8');
+  const r = spawnSync('pwsh', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', scriptPath], { encoding: 'utf8' });
+  assert.equal(r.status, 0, `pwsh が失敗した: ${r.stderr}`);
+  return { dir, stdout: r.stdout };
+}
+
+// 我々のフックと他製品のフック（similar な名前を含む）が混在する設定を
+// PowerShell 側で組み立てるスニペット。$WORK / $HookScript を前提にする。
+const BUILD_SAMPLE = `
+$target = Join-Path $WORK 'settings.json'
+$ours = 'node "' + $HookScript + '" claudeCode'
+$slashOurs = $ours.Replace([char]92, '/')
+$root = [ordered]@{
+  hooks = [ordered]@{
+    Stop = @(
+      @{ hooks = @(@{ type = 'command'; command = $ours }) },
+      @{ hooks = @(@{ type = 'command'; command = 'node "C:\\tools\\codegraph.js"' }) }
+    )
+    PreToolUse = @(
+      @{ matcher = '*'; hooks = @(
+        @{ type = 'command'; command = $slashOurs },
+        @{ type = 'command'; command = 'node "C:\\other\\their-hook-client.js" x' }
+      ) }
+    )
+  }
+}
+Set-Content -LiteralPath $target -Value ($root | ConvertTo-Json -Depth 10) -Encoding UTF8
+`;
+
+function collectCommands(result) {
+  const commands = [];
+  for (const groups of Object.values(result.hooks ?? {})) {
+    for (const g of Array.isArray(groups) ? groups : [groups]) {
+      const hooks = Array.isArray(g.hooks) ? g.hooks : [g.hooks];
+      for (const hk of hooks) if (hk) commands.push(String(hk.command));
+    }
+  }
+  return commands;
+}
+
+test('Remove-AllOurHooks は自分のフックだけ解除し、似た名前の他製品フックは残す', { skip: !pwshOk }, () => {
+  const { dir } = runHarness(
+    'install.ps1',
+    ['Test-OurHookCommand', 'Backup-File', 'Remove-OldBackups', 'Remove-AllOurHooks'],
+    `${BUILD_SAMPLE}
+Remove-AllOurHooks $target 'テスト対象'
+`,
+  );
+  const result = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+  const commands = collectCommands(result);
+  assert.ok(!commands.some((c) => c.includes(path.join(dir, 'hook-client.js'))), '自分のフックが残っている');
+  assert.ok(commands.some((c) => c.includes('their-hook-client.js')), '他製品の similar-hook-client.js を巻き込んで削除した');
+  assert.ok(commands.some((c) => c.includes('codegraph.js')), '無関係のフックを巻き込んで削除した');
+  // バックアップが作られている（破壊的変更の復旧手段）
+  assert.ok(fs.readdirSync(dir).some((f) => /settings\.json\.bak-\d{8}-\d{6}/.test(f)), 'バックアップが無い');
+});
+
+test('Remove-AllOurHooks は壊れた JSON とオブジェクト以外のルートを変更せず警告する', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness(
+    'install.ps1',
+    ['Test-OurHookCommand', 'Backup-File', 'Remove-OldBackups', 'Remove-AllOurHooks'],
+    `
+$brokenPath = Join-Path $WORK 'broken.json'
+$scalarPath = Join-Path $WORK 'scalar.json'
+[System.IO.File]::WriteAllText($brokenPath, '{"broken":')
+[System.IO.File]::WriteAllText($scalarPath, '[]')
+$brokenBefore = [System.IO.File]::ReadAllText($brokenPath)
+$scalarBefore = [System.IO.File]::ReadAllText($scalarPath)
+Remove-AllOurHooks $brokenPath '壊れた JSON'
+Remove-AllOurHooks $scalarPath '配列ルート'
+Write-Output ('broken=' + ($brokenBefore -ceq [System.IO.File]::ReadAllText($brokenPath)))
+Write-Output ('scalar=' + ($scalarBefore -ceq [System.IO.File]::ReadAllText($scalarPath)))
+`,
+  );
+  assert.match(stdout, /broken=True/);
+  assert.match(stdout, /scalar=True/);
+  assert.equal(stdout.match(/warn: .*フック解除をスキップします/g)?.length, 2, stdout);
+});
+
+test('Remove-OurHook は対象イベントの自分のフックだけを解除する', { skip: !pwshOk }, () => {
+  const { dir } = runHarness(
+    'install.ps1',
+    ['Test-OurHookCommand', 'Remove-OurHook'],
+    `${BUILD_SAMPLE}
+$root2 = (Get-Content -LiteralPath $target -Raw -Encoding UTF8) | ConvertFrom-Json -AsHashtable
+$root2 = Remove-OurHook -Root $root2 -EventName 'PreToolUse'
+Set-Content -LiteralPath $target -Value ($root2 | ConvertTo-Json -Depth 10) -Encoding UTF8
+`,
+  );
+  const result = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+  const commands = collectCommands(result);
+  const oursPath = path.join(dir, 'hook-client.js');
+  // PreToolUse の自分のフックは消え、共有グループの他製品フックは残る
+  const preToolCommands = collectCommands({ hooks: { PreToolUse: result.hooks.PreToolUse ?? [] } });
+  assert.ok(!preToolCommands.some((c) => c.includes(oursPath)), 'PreToolUse の自分のフックが残っている');
+  assert.ok(preToolCommands.some((c) => c.includes('their-hook-client.js')), '共有グループの他製品フックが消えた');
+  // 対象外の Stop の自分のフックは残る
+  assert.ok(commands.some((c) => c.includes(oursPath)), '対象外イベントの自分のフックまで消えた');
+});
+
+test('Read-InstallManifest は「無い」と「無効」を区別し、無効なら中断する', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness('update.ps1', ['Read-InstallManifest'], `
+$full = '{"schemaVersion":1,"savedAt":"x","includeToolEvents":false,"skipClaude":false,"skipCodex":true,"registerStartup":true}'
+$incomplete = '{"schemaVersion":1,"skipCodex":true}'
+$unknown = '{"schemaVersion":2,"includeToolEvents":false,"skipClaude":false,"skipCodex":true,"registerStartup":true}'
+$stringBool = '{"schemaVersion":1,"includeToolEvents":false,"skipClaude":false,"skipCodex":"false","registerStartup":true}'
+foreach ($case in @(@('full', $full), @('incomplete', $incomplete), @('unknown', $unknown), @('stringBool', $stringBool))) {
+  $p = Join-Path $WORK ($case[0] + '.json')
+  Set-Content -LiteralPath $p -Value $case[1] -Encoding UTF8
+  $result = 'valid'
+  try {
+    $m = Read-InstallManifest $p
+    if ($null -eq $m) { $result = 'null' }
+  } catch { $result = 'abort' }
+  Write-Output ($case[0] + '=' + $result)
+}
+# ファイルが無い場合だけ null（現状からの推定に切り替えてよい）
+$m2 = Read-InstallManifest (Join-Path $WORK 'missing.json')
+Write-Output ('missing=' + $(if ($null -eq $m2) { 'null' } else { 'valid' }))
+`);
+  assert.match(stdout, /full=valid/);
+  // 存在するのに無効な manifest は、一時的なフック欠落を Skip として固定したり
+  // 未知バージョンを v1 で上書きしたりしないよう、推定へ流さず中断する
+  assert.match(stdout, /incomplete=abort/);
+  assert.match(stdout, /unknown=abort/);
+  assert.match(stdout, /stringBool=abort/);
+  assert.match(stdout, /missing=null/);
+});
+
+test('旧導入の推定は両方空なら再登録し、片方だけ空なら空側をスキップする', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness('update.ps1', ['Get-BackfillEstimateFromEvents'], `
+$bothEmpty = Get-BackfillEstimateFromEvents -ClaudeEvents @() -CodexEvents @()
+$claudeOnly = Get-BackfillEstimateFromEvents -ClaudeEvents @('Stop') -CodexEvents @()
+$codexWithTool = Get-BackfillEstimateFromEvents -ClaudeEvents @() -CodexEvents @('Stop', 'PreToolUse')
+Write-Output ('bothEmpty=' + $bothEmpty.SkipClaude + ',' + $bothEmpty.SkipCodex + ',' + $bothEmpty.IncludeToolEvents)
+Write-Output ('claudeOnly=' + $claudeOnly.SkipClaude + ',' + $claudeOnly.SkipCodex + ',' + $claudeOnly.IncludeToolEvents)
+Write-Output ('codexWithTool=' + $codexWithTool.SkipClaude + ',' + $codexWithTool.SkipCodex + ',' + $codexWithTool.IncludeToolEvents)
+`);
+  assert.match(stdout, /bothEmpty=False,False,False/);
+  assert.match(stdout, /claudeOnly=False,True,False/);
+  assert.match(stdout, /codexWithTool=True,False,True/);
+});
+
+test('Get-OurHookEvents は / 区切りの配置先も我々のフックとして数える', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness('update.ps1', ['Get-OurHookEvents'], `
+$env:USERPROFILE = $WORK
+$hookScript = Join-Path (Join-Path $env:USERPROFILE '.voicevox-coding') 'hook-client.js'
+$command = 'node "' + $hookScript.Replace([char]92, '/') + '" claudeCode'
+$root = [pscustomobject]@{ hooks = [pscustomobject]@{ Stop = @([pscustomobject]@{ hooks = @([pscustomobject]@{ command = $command }) }) } }
+$events = @(Get-OurHookEvents $root)
+Write-Output ('events=' + ($events -join ','))
+`);
+  assert.match(stdout, /events=Stop/);
+});
+
+test('Assert-HookConfigReadable は install.ps1 が読めない設定ファイルだけを中断にする', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness('update.ps1', ['Assert-HookConfigReadable'], `
+foreach ($case in @(@('object', '{"hooks":{}}'), @('caseKeys', '{"a":1,"A":2}'), @('empty', '  '), @('broken', '{"hooks":'), @('array', '[]'))) {
+  $p = Join-Path $WORK ($case[0] + '.json')
+  [System.IO.File]::WriteAllText($p, $case[1])
+  $result = 'ok'
+  try { Assert-HookConfigReadable $p } catch { $result = 'abort' }
+  Write-Output ($case[0] + '=' + $result)
+}
+$missing = 'ok'
+try { Assert-HookConfigReadable (Join-Path $WORK 'missing.json') } catch { $missing = 'abort' }
+Write-Output ('missing=' + $missing)
+`);
+  // 無い・空は install.ps1 が未設定として扱うので通す
+  assert.match(stdout, /object=ok/);
+  // install.ps1 は -AsHashtable で読むので、大文字小文字だけが違うキーも読める
+  assert.match(stdout, /caseKeys=ok/);
+  assert.match(stdout, /empty=ok/);
+  assert.match(stdout, /missing=ok/);
+  assert.match(stdout, /broken=abort/);
+  assert.match(stdout, /array=abort/);
+});
+
+test('実効オプションを決めてからデーモンを停止する', () => {
+  const source = fs.readFileSync(path.join(ROOT, 'scripts', 'update.ps1'), 'utf8');
+  const pull = source.indexOf('# --- 1. リポジトリの最新化 ---');
+  const stop = source.indexOf('# --- 2. デーモンの停止 ---');
+  assert.notEqual(pull, -1);
+  assert.notEqual(stop, -1);
+  for (const marker of [
+    '$explicitIncludeToolEvents =',
+    '$manifest = Read-InstallManifest $ManifestPath',
+    '$estimate = Get-BackfillEstimate',
+    'Assert-HookConfigReadable $hookConfig.ClaudeSettings',
+    'Assert-HookConfigReadable $hookConfig.CodexHooks',
+  ]) {
+    const position = source.indexOf(marker);
+    assert.ok(position > pull && position < stop, `${marker} が手順 1 の後、手順 2 の前にない`);
+  }
+});
+
+test('uninstall の解除も似た名前の他製品フックを巻き込まない', { skip: !pwshOk }, () => {
+  const { dir } = runHarness(
+    'uninstall.ps1',
+    ['Test-OurHookCommand', 'Remove-OldBackups', 'Remove-OurHooks'],
+    `${BUILD_SAMPLE}
+Remove-OurHooks $target
+`,
+  );
+  const result = JSON.parse(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8'));
+  const commands = collectCommands(result);
+  assert.ok(!commands.some((c) => c.includes(path.join(dir, 'hook-client.js'))), '自分のフックが残っている');
+  assert.ok(commands.some((c) => c.includes('their-hook-client.js')), '他製品の similar-hook-client.js を巻き込んで削除した');
+  assert.ok(commands.some((c) => c.includes('codegraph.js')), '無関係のフックを巻き込んで削除した');
+});
