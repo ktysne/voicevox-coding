@@ -4,7 +4,9 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkMutationRequest, isRejectedDuringShutdown } from '../src/daemon/server.js';
+import http from 'node:http';
+import { EventEmitter } from 'node:events';
+import { checkMutationRequest, isRejectedDuringShutdown, isLocalHostHeader, createServer } from '../src/daemon/server.js';
 
 const PORT = 7591;
 const TOKEN = 'a'.repeat(64);
@@ -87,6 +89,12 @@ test('トークン未設定のサーバーは Origin なし /api/* を全部拒�
   assert.equal(r.ok, false);
 });
 
+test('ホスト名がローカルでもポートが違う Host は拒否する', () => {
+  const r = check('/api/skip', { host: '127.0.0.1:8000', 'x-voicevox-coding-token': TOKEN });
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 403);
+});
+
 test('Host ヘッダーが無い要求を拒否する', () => {
   const r = checkMutationRequest({ pathname: '/api/skip', headers: {}, port: PORT, token: TOKEN });
   assert.equal(r.ok, false);
@@ -123,6 +131,69 @@ test('/api/* は application/x-www-form-urlencoded をトークンがあって�
   });
   assert.equal(r.ok, false);
   assert.equal(r.status, 415);
+});
+
+// ---------------------------------------------------------------- 全要求に掛ける Host の検証
+
+test('Host は 127.0.0.1 と localhost の自ポートだけを許す', () => {
+  assert.equal(isLocalHostHeader(`127.0.0.1:${PORT}`, PORT), true);
+  assert.equal(isLocalHostHeader(`LOCALHOST:${PORT}`, PORT), true);
+  assert.equal(isLocalHostHeader(`evil.example:${PORT}`, PORT), false);
+  assert.equal(isLocalHostHeader('127.0.0.1', PORT), false);
+  assert.equal(isLocalHostHeader('127.0.0.1:8000', PORT), false);
+  assert.equal(isLocalHostHeader(`[::1]:${PORT}`, PORT), false);
+  assert.equal(isLocalHostHeader(undefined, PORT), false);
+});
+
+async function startServer() {
+  const store = Object.assign(new EventEmitter(), { config: { targets: {} }, revision: 1, bootId: 'boot', profile: () => null });
+  const queue = Object.assign(new EventEmitter(), { state: {} });
+  const log = { subscribe() {}, warn() {}, info() {}, debug() {}, error() {}, recent: () => [] };
+  const engine = { status: async () => ({}) };
+  const probe = http.createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const { port } = probe.address();
+  await new Promise((resolve) => probe.close(resolve));
+  const server = createServer({ store, engine, queue, log, runtime: {}, port, token: TOKEN });
+  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
+  return { server, port };
+}
+
+function get(port, pathname, host) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path: pathname, method: 'GET', headers: { host } }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('DNS リバインディングの GET は読み取り API も UI も 403 にする', async () => {
+  const { server, port } = await startServer();
+  try {
+    for (const pathname of ['/api/state', '/api/config', '/api/logs', '/api/stream', '/']) {
+      const r = await get(port, pathname, `evil.example:${port}`);
+      assert.equal(r.status, 403, pathname);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test('自ホストの GET は通り、UI は iframe への埋め込みを禁じる', async () => {
+  const { server, port } = await startServer();
+  try {
+    assert.equal((await get(port, '/api/config', `127.0.0.1:${port}`)).status, 200);
+    assert.equal((await get(port, '/api/config', `localhost:${port}`)).status, 200);
+    const ui = await get(port, '/', `127.0.0.1:${port}`);
+    assert.equal(ui.status, 200);
+    assert.equal(ui.headers['x-frame-options'], 'DENY');
+    assert.equal(ui.headers['content-security-policy'], "frame-ancestors 'none'");
+  } finally {
+    server.close();
+  }
 });
 
 // ---------------------------------------------------------------- 終了処理中のガード
