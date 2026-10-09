@@ -14,6 +14,8 @@ Node.js の標準モジュールだけで動き、npm パッケージへの依�
 フックはイベントを常駐デーモンへ転送し、設定と読み上げ処理はデーモンに集約する。
 構成と機能の詳しい説明は [docs/usage.md](docs/usage.md) にある。
 
+動作要件は Windows、Node.js 20 以上、PowerShell 7、VOICEVOX である。
+
 ## 連携できるツール
 
 Claude Code と Codex はどちらか一方だけでも利用できる。
@@ -22,7 +24,7 @@ VOICEVOX のインストールは必須である。
 | ツール | 概要 | 連携するとできること |
 |---|---|---|
 | Claude Code | イベントをフックでデーモンへ送る | 応答完了、通知、途中経過、ツール実行などを読み上げる |
-| Codex | イベントをフックでデーモンへ送る | 応答完了、許可待ち、ツール実行などを読み上げる。途中経過（`commentary`）の読み上げには `codex` CLI が必要である |
+| Codex | イベントをフックでデーモンへ送る | 応答完了、許可待ち、ツール実行などを読み上げる。途中経過（`commentary`）は Codex Desktop（`sourceKinds: vscode`）のセッションが対象で、読み上げには `codex` CLI が必要である |
 
 ## 導入
 
@@ -34,7 +36,9 @@ AI には次のように依頼する。
 
 手順書は共通手順と 3 つの導入パターン、更新、アンインストール、トラブル対応で構成する。
 手順書を読んで人が手で進めることもできる。
-`~/.claude/settings.json`、`~/.codex/hooks.json`、Windows のスタートアップ登録などリポジトリ外を変更するときは、AI が変更内容を示して確認を求める。
+`~/.claude/settings.json`、`~/.codex/hooks.json`、Windows のスタートアップ登録に加え、`%USERPROFILE%\.voicevox-coding\` 内の `hook-client.js`、`install.json`、`start-daemon.vbs` も導入で確認する対象である。
+`start-daemon.vbs` は `-RegisterStartup` を指定した場合に作成される。
+これらリポジトリ外のファイルや設定を変更するときは、AI が `CODEX_HOME` を解決した実パスと変更内容を示して確認を求める。
 
 ## 導入できたかの確認
 
@@ -44,9 +48,9 @@ AI には次のように依頼する。
 | パターン | 確かめること |
 |---|---|
 | 共通 | `npm run doctor` が通り、`http://127.0.0.1:7591/` で管理コンソールが開く |
-| パターン 1 | Claude Code と Codex のフックが登録され、Codex のフックが承認済みである |
-| パターン 2 | Claude Code のフックが登録され、Codex は対象外として中立表示になる |
-| パターン 3 | Codex のフックが登録され、Codex のフックが承認済みである |
+| パターン 1 | Claude Code と Codex のフックが登録され、doctor の `Codex 信頼状態` が「N 件すべて承認済み」で、`Codex 無効化` の警告がない |
+| パターン 2 | Claude Code のフックが登録され、Codex は `OK Codex 対象外（導入時に -SkipCodex を指定）` と表示される |
+| パターン 3 | Codex のフックが登録され、doctor の `Codex 信頼状態` が「N 件すべて承認済み」で、`Codex 無効化` の警告がなく、Claude Code は `OK Claude Code 対象外（導入時に -SkipClaude を指定）` と表示される |
 
 ## 開発者向けドキュメント
 

@@ -5,10 +5,36 @@
 
 ## 進め方の決まり
 
-- `~/.claude/settings.json`、`~/.codex/hooks.json`、Windows のスタートアップ登録は、リポジトリの外にある設定である。
-  `install.ps1` が書き込む前に、AI は変更内容を開発者に示して確認を得る。
-- 既存の設定はバックアップしたうえでマージし、VOICEVOX Coding 以外のフックは残す。
-  書き込む内容が既存の設定と同じ場合は、バックアップも書き込みも行わない。
+- `install.ps1`、`update.ps1`、`uninstall.ps1` と `npm run doctor` は、通常の PowerShell から実行する。
+  AI が Codex Desktop 内で動いている場合、AI はこれらのコマンドを実行せず、実行するコマンドと事前確認を開発者へ渡し、その結果を受け取ってから続ける。
+  コマンドを実行する PowerShell で、実行前に `$env:CODEX_HOME` の値を確認する。
+  値がある場合はそのディレクトリ、空の場合は `%USERPROFILE%\.codex\` が Codex の設定先である。
+  設定先の絶対パスは、通常の PowerShell で次のコマンドを実行して確認する。
+
+  ```powershell
+  $codexHome = if ($env:CODEX_HOME) {
+      [System.IO.Path]::GetFullPath($env:CODEX_HOME)
+  } else {
+      Join-Path $env:USERPROFILE '.codex'
+  }
+  "CODEX_HOME=$env:CODEX_HOME"
+  Join-Path $codexHome 'hooks.json'
+  ```
+
+- `install.ps1` にドライランはないため、実行前に AI は書き込み先、登録イベント、フックコマンド、バックアップ、対象外にする連携先の既存フックを解除する動作を開発者に示し、確認を得る。
+  書き込み先は `%USERPROFILE%` と `$env:CODEX_HOME` を解決した実パスで示す。
+  `CODEX_HOME` が空なら `%USERPROFILE%\.codex\hooks.json`、値があればコマンドで解決した Codex 設定先に `hooks.json` を結合した絶対パスを示す。
+  常に `%USERPROFILE%\.voicevox-coding\hook-client.js` と `%USERPROFILE%\.voicevox-coding\install.json` を配置する。
+  Claude Code を対象にする場合は `%USERPROFILE%\.claude\settings.json`、Codex を対象にする場合は上記の `hooks.json` も変更対象として示す。
+  `-RegisterStartup` を指定する場合は `%USERPROFILE%\.voicevox-coding\start-daemon.vbs` と Windows のスタートアップフォルダーにある `VOICEVOX Coding.vbs` も示す。
+  `install.ps1` は `-RegisterStartup` を指定した場合だけ `start-daemon.vbs` を作成する。
+  登録イベントは、Claude Code が `Stop`、`MessageDisplay`、`Notification`、`SessionStart`、`SessionEnd`、`SubagentStop`、`UserPromptSubmit`、`PreCompact`、Codex が `Stop`、`PermissionRequest`、`SessionStart`、`SessionEnd`、`SubagentStop`、`UserPromptSubmit`、`PreCompact` である。
+  `-IncludeToolEvents` を指定すると、両方に `PreToolUse` と `PostToolUse` も登録する。
+  Claude Code のフックコマンドは `"node.exe の実パス" "hook-client.js の実パス" claudeCode`、Codex は `node "hook-client.js の実パス" codex` の形である。
+  既存の `settings.json` または `hooks.json` を変更する場合は、変更前に `.bak-<yyyyMMdd-HHmmss>` 形式のバックアップを作成する。
+  既存内容と同じ場合はバックアップも設定ファイルへの書き込みも行わない。
+- `-SkipClaude` または `-SkipCodex` を指定すると、対象連携先の設定から VOICEVOX Coding の既存フックも解除する。
+- 既存の設定はマージし、VOICEVOX Coding 以外のフックは残す。
 - Codex は未承認のフックを実行しない。
   `/hooks` での承認は開発者が行い、AI は操作場所と手順を案内する。
 - スタートアップ登録は、このリポジトリの現在の場所を参照する。
@@ -41,11 +67,11 @@ Claude Code と Codex は、どちらか一方だけでも導入できる。
 | 項目 | 内容 |
 |---|---|
 | OS | Windows |
-| Node.js | 20 以上（`node --version`） |
+| Node.js | 20 以上（`node --version`）。Codex のフックは PATH 上の素の `node` で起動するため、システムの `PATH` から `node` を解決できる必要がある |
 | VOICEVOX | インストールが必要。VOICEVOX アプリを起動しておく必要はない |
 | PowerShell 7 | セットアップ、更新、アンインストールに必要（[入手先](https://aka.ms/powershell)） |
 | Git | リポジトリの取得と `update.ps1` に使用する |
-| Claude Code / Codex | 利用する連携先だけを用意する。Codex の途中経過を読む場合は `codex` CLI も必要 |
+| Claude Code / Codex | 利用する連携先だけを用意する。途中経過の読み上げ対象は Codex Desktop（`sourceKinds: vscode`）のセッションであり、読み上げる場合は `codex` CLI を PATH から起動できる必要がある |
 
 VOICEVOX アプリは音声を作るための GUI であり、合成 API は同梱のエンジン（`vv-engine\run.exe`）が持つ。
 VOICEVOX Coding はこのエンジンを直接起動するため、アプリを常駐させる必要はない。
@@ -64,26 +90,35 @@ git clone https://github.com/ktysne/voicevox-coding.git
 ### 2. フックを登録する
 
 利用するパターンの「登録の仕方」にあるコマンドで `scripts\install.ps1` を実行する。
-インストールスクリプトはフッククライアントを `%USERPROFILE%\.voicevox-coding\` に配置し、Claude Code の `settings.json` と Codex の `hooks.json` にデーモンへ転送するフックを登録する。
-
-Codex の `hooks.json` は、`CODEX_HOME` が設定されていればそのディレクトリに書き込む。
+インストールスクリプトはフッククライアントを `%USERPROFILE%\.voicevox-coding\` に配置し、選んだ連携先の設定ファイルにデーモンへ転送するフックを登録する。
+実行前に「進め方の決まり」に従って変更内容を示し、開発者の確認を得る。
+Codex の `hooks.json` は、確認した `$env:CODEX_HOME` が設定されていればそのディレクトリに書き込む。
 未設定の場合は `%USERPROFILE%\.codex\hooks.json` を使う。
 
 ### 3. デーモンを起動する
 
-```bash
-npm run console
+AI はデーモンを前面で起動しない。
+`install.ps1` は `-RegisterStartup` を指定した場合だけ `%USERPROFILE%\.voicevox-coding\start-daemon.vbs` を作成するため、そのファイルがあれば `wscript.exe` 経由で起動し、なければリポジトリ内の `src\daemon\main.js` を `node` で非表示起動する。
+
+```powershell
+$daemonVbs = Join-Path $env:USERPROFILE '.voicevox-coding\start-daemon.vbs'
+if (Test-Path -LiteralPath $daemonVbs) {
+    Start-Process wscript.exe -ArgumentList "`"$daemonVbs`""
+} else {
+    $mainJs = (Resolve-Path 'src\daemon\main.js').Path
+    Start-Process node -ArgumentList "`"$mainJs`"" -WindowStyle Hidden
+}
 ```
 
-デーモンが起動し、管理コンソールがブラウザーで開く。
-以後はタスクトレイのアイコン、または `http://127.0.0.1:7591/` からアクセスする。
+起動後、`npm run doctor` の `デーモン` が稼働中と表示されるか、`http://127.0.0.1:7591/api/state` が応答することを確認する。
+管理コンソールは `http://127.0.0.1:7591/` から開く。
 
 起動時に VOICEVOX エンジンが動いていなければ、実行ファイルを自動検出して起動する。
-多重起動した場合、2 つ目のデーモンはポートの重複を検出して終了する。
-
 `-RegisterStartup` を指定した場合は、次のサインイン以降に自動で起動する。
-スタートアップからの起動と手動起動が重なった場合も、2 つ目のデーモンはポートの重複を検出して終了する。
+多重起動した場合、2 つ目のデーモンはポートの重複を検出して終了する。
 導入後は、選んだ連携先を普段どおり使うと読み上げが始まる。
+
+開発者が自分のターミナルで前面起動する場合は `npm run console` も使えるが、ターミナルを閉じるとデーモンも終了する。
 
 ## パターン 1
 
@@ -100,19 +135,18 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 
 ### 確認
 
-通常の PowerShell から次を実行する。
-Codex Desktop 内のターミナルでは、サンドボックス用の別の `CODEX_HOME` が使われるため、導入状態を正しく確認できない。
+「進め方の決まり」に従い、通常の PowerShell から `$env:CODEX_HOME` を確認してから次を実行する。
+Codex Desktop 内のターミナルでは、別の `CODEX_HOME` が使われる場合があるため、導入状態を正しく確認できない。
 
 ```powershell
 npm run doctor
 ```
 
 VOICEVOX ENGINE とデーモンが稼働中で、Claude Code と Codex のフックが登録済みと表示されればよい。
-Codex のフックが未承認の場合は、Codex を起動して `/hooks` を開き、VOICEVOX Coding のフックを承認する。
+Codex を起動して `/hooks` を開き、VOICEVOX Coding のフックを承認してから `npm run doctor` を再実行する。
+`Codex 信頼状態` が「N 件すべて承認済み」と表示され、`Codex 無効化` の警告が出ないことを確認する。
 Codex の `/hooks` で個別にオフにしたフックは、承認済みでも実行されない。
-
-`npm run doctor` は Codex のフックの読み込み状態と信頼状態も点検する。
-`install.json` がない旧導入では、`hooks.json` と `codex` CLI のどちらも見つからない場合に限り「未導入」として警告し、それ以外は従来どおり検査する。
+`-RegisterStartup` を指定しなかった場合に `スタートアップ` が未登録と警告されるのは正常である。
 
 ## パターン 2
 
@@ -134,7 +168,8 @@ npm run doctor
 ```
 
 VOICEVOX ENGINE とデーモンが稼働中で、Claude Code のフックが登録済みと表示されればよい。
-Codex は対象外として中立表示になり、Codex への問い合わせは行われない。
+Codex は `OK Codex 対象外（導入時に -SkipCodex を指定）` と表示され、Codex への問い合わせは行われない。
+`-RegisterStartup` を指定しなかった場合に `スタートアップ` が未登録と警告されるのは正常である。
 
 ## パターン 3
 
@@ -151,18 +186,23 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1 -SkipClaude
 
 ### 確認
 
-通常の PowerShell から次を実行する。
-Codex Desktop 内のターミナルでは、サンドボックス用の別の `CODEX_HOME` が使われるため、導入状態を正しく確認できない。
+「進め方の決まり」に従い、通常の PowerShell から `$env:CODEX_HOME` を確認してから次を実行する。
+Codex Desktop 内のターミナルでは、別の `CODEX_HOME` が使われる場合があるため、導入状態を正しく確認できない。
 
 ```powershell
 npm run doctor
 ```
 
 VOICEVOX ENGINE とデーモンが稼働中で、Codex のフックが登録済みと表示されればよい。
-Codex を起動して `/hooks` を開き、VOICEVOX Coding のフックを承認する。
-`npm run doctor` に Codex のフック読み込み状態と信頼状態が表示されれば確認できている。
+Codex で `/hooks` を開いて VOICEVOX Coding のフックを承認し、`npm run doctor` を再実行する。
+`Codex 信頼状態` が「N 件すべて承認済み」と表示され、`Codex 無効化` の警告が出ないことを確認する。
+Claude Code は `OK Claude Code 対象外（導入時に -SkipClaude を指定）` と表示される。
+`-RegisterStartup` を指定しなかった場合に `スタートアップ` が未登録と警告されるのは正常である。
 
 ## 更新するとき
+
+「進め方の決まり」の確認ルールは更新時にも適用する。
+通常の PowerShell で `$env:CODEX_HOME` を確認し、Codex の `hooks.json` を含む変更見込みを開発者に示して確認を得る。
 
 更新は次のコマンド 1 つで完了する。
 事前に `git pull` を実行しておく必要はない。
@@ -173,6 +213,19 @@ powershell -ExecutionPolicy Bypass -File scripts\update.ps1
 
 PowerShell のプロンプトから実行する。
 エクスプローラからダブルクリックで実行すると、エラーが起きてもコンソール窓が閉じてしまい内容を確認できない。
+
+`update.ps1` のオプションは次のとおりである。
+
+| オプション | 効果 |
+|---|---|
+| `-SkipPull` | `git pull --ff-only` を省略し、取得済みのリポジトリから更新を適用する |
+| `-Force` | デーモンの通常終了が失敗し、スクリプトが VOICEVOX Coding のプロセスだと確認できた場合に限り、強制終了して続行する |
+| `-IncludeToolEvents` | ツール実行前後のフックも登録する |
+| `-SkipClaude` | Claude Code を対象外にし、既存の VOICEVOX Coding フックを解除する |
+| `-SkipCodex` | Codex を対象外にし、既存の VOICEVOX Coding フックを解除する |
+
+`-RegisterStartup` は `update.ps1` のオプションではない。
+更新スクリプトは Windows のスタートアップフォルダーに既存の登録がある場合だけ、その登録を引き継ぐ。
 
 リポジトリを最新化しただけでは、更新は反映されない。
 デーモンが常駐プロセスとして旧コードのまま動き続け、フック定義とスタートアップ登録も `install.ps1` が生成した時点の内容のまま残るからである。
@@ -188,14 +241,17 @@ PowerShell のプロンプトから実行する。
 `-IncludeToolEvents` / `-SkipClaude` / `-SkipCodex` などのオプションは、導入時に `%USERPROFILE%\.voicevox-coding\install.json` へ記録され、更新時は自動で引き継がれる。
 変えたいときだけ、更新時にそのオプションを明示的に指定すればよい。
 `install.json` が無い（manifest 保存に対応する前に導入した）場合、初回更新時は現在の `settings.json` / `hooks.json` の登録状況から推定する。
+`install.json` が無い旧導入の環境では、`npm run doctor` は `hooks.json` と `codex` CLI のどちらも見つからない場合に限り Codex を「未導入」として警告にとどめ、それ以外は通常どおり検査する。
 npm パッケージへの依存はないので、`npm install` は不要である。
 
-停止トークンを取得できない場合（`runtime.json` を書き出さない版のデーモンからの初回更新など）は、本デーモンのプロセスだと確認したうえで自動的に停止して続行する。
+停止トークンを取得できない場合（`runtime.json` を書き出さない版のデーモンからの初回更新など）は、VOICEVOX Coding のデーモンのプロセスだと確認したうえで自動的に停止して続行する。
 この場合、エンジンなどの後始末は次回のデーモン起動時に行われる。
-トークンを取得できているにもかかわらず停止 API でデーモンを止められない場合は、従来どおりスクリプトは中断してトレイの「終了」による停止を案内する。
-本デーモンのプロセスだと確認できた場合に限り、`-Force` を付ければ強制終了して続行できる。
+トークンを取得できているにもかかわらず停止 API でデーモンを止められない場合は、スクリプトが中断し、トレイの「終了」による停止を案内する。
+VOICEVOX Coding のデーモンのプロセスだと確認できた場合に限り、`-Force` を付ければ強制終了して続行できる。
 
-`update.ps1` を使わず手動で更新する場合は、`git pull` の後にトレイの「終了」でデーモンを止め、`install.ps1` を同じオプションで実行し直してから `npm run start` で起動する。
+`update.ps1` を使わず手動で更新する場合は、まず `git pull --ff-only` を実行する。
+次に開発者へタスクトレイの「終了」を依頼し、`npm run doctor` の `デーモン` が応答しない状態になったことを確かめてから次へ進む。
+デーモンが応答しなくなった後、同じオプションで `install.ps1` を実行し、共通手順 3 の方法でデーモンを起動する。
 
 フック定義そのものが変わる更新では、Codex の再承認が必要になることがある。
 更新後に `npm run doctor` を実行すると、承認状態も含めて点検できる。
@@ -205,7 +261,8 @@ npm パッケージへの依存はないので、`npm install` は不要であ�
 
 ## アンインストール
 
-デーモンが動いている場合は、先にタスクトレイの「終了」で停止する。
+アンインストールの前に、開発者へタスクトレイの「終了」を依頼する。
+`npm run doctor` の `デーモン` が応答しない状態になったことを確認してから、次へ進む。
 アンインストールのスクリプトはフックの登録とスタートアップ登録を取り除くだけで、動作中のデーモンは止めない。
 
 ```powershell
