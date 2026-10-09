@@ -201,8 +201,9 @@ export function registerStartupCommand(manifest) {
  */
 export function startupGuide(manifest, manifestExists) {
   if (manifest) return `${registerStartupCommand(manifest)} で登録できます`;
-  if (manifestExists) return `${MANIFEST_PATH} を修復してから登録してください`;
-  return '先に scripts\\update.ps1 を実行して導入時の構成を記録し、もう一度 npm run doctor で登録のコマンドを確かめてください';
+  const recheck = 'もう一度 npm run doctor で登録のコマンドを確かめてください';
+  if (manifestExists) return `${MANIFEST_PATH} を修復するか、削除して scripts\\update.ps1 -SkipPull で記録し直してから、${recheck}`;
+  return `先に scripts\\update.ps1 -SkipPull を実行して導入時の構成を記録し、${recheck}`;
 }
 
 /**
