@@ -175,6 +175,26 @@ export function resolveTargetPlan(manifest, opts = {}) {
 }
 
 /**
+ * フックを作り直す手順の案内。install.ps1 は install.json を読まず、オプションなしで実行すると
+ * 導入時の構成を既定値で上書きするので、記録があれば記録を引き継ぐ update.ps1 へ誘導する。
+ */
+export function rerunGuide(manifest) {
+  return manifest ? 'scripts\\update.ps1 を実行してください' : 'scripts\\install.ps1 を実行してください';
+}
+
+/**
+ * スタートアップを登録するコマンド。update.ps1 は既存の登録を引き継ぐだけで新たに登録しないので
+ * install.ps1 を使い、導入時の構成を変えないよう記録済みのオプションを添える。
+ */
+export function registerStartupCommand(manifest) {
+  const options = ['-RegisterStartup'];
+  if (manifest?.includeToolEvents) options.push('-IncludeToolEvents');
+  if (manifest?.skipClaude) options.push('-SkipClaude');
+  if (manifest?.skipCodex) options.push('-SkipCodex');
+  return `scripts\\install.ps1 ${options.join(' ')}`;
+}
+
+/**
  * 導入時に -IncludeToolEvents を指定した（＝ manifest.includeToolEvents が true の）のに、
  * PreToolUse / PostToolUse が実際には登録されていない場合、その不足イベント名を返す。
  * 期待していない場合（manifest が無い、または includeToolEvents が false）は常に空配列。
@@ -286,14 +306,19 @@ async function main() {
   const manifestExists = fs.existsSync(MANIFEST_PATH);
   const manifest = manifestExists ? normalizeInstallManifest(readJson(MANIFEST_PATH)) : null;
   if (manifest) ok('導入構成', `${MANIFEST_PATH} を期待構成として使用します`);
-  else if (manifestExists) warn('導入構成', `${MANIFEST_PATH} が壊れているか形式が不正なため無視します（scripts\\update.ps1 の再実行で作り直せます）`);
+  else if (manifestExists) {
+    warn(
+      '導入構成',
+      `${MANIFEST_PATH} が壊れているか形式が不正なため無視します。修復するか削除してから scripts\\update.ps1 を実行してください（削除すると現在の登録状況から推定して作り直します）`,
+    );
+  }
 
   const port = config?.daemon?.port ?? 7591;
   const baseUrl = config?.engine?.baseUrl ?? 'http://127.0.0.1:50021';
 
   // --- フッククライアント ---
   if (fs.existsSync(HOOK_CLIENT)) ok('フッククライアント', HOOK_CLIENT);
-  else fail('フッククライアント', `${HOOK_CLIENT} がありません。scripts\\install.ps1 を実行してください`);
+  else fail('フッククライアント', `${HOOK_CLIENT} がありません。${rerunGuide(manifest)}`);
 
   // --- エンジン・デーモン ---
   const engineUp = await checkEngine(baseUrl);
@@ -314,7 +339,7 @@ async function main() {
     'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'VOICEVOX Coding.vbs',
   );
   if (fs.existsSync(startupVbs)) ok('スタートアップ', 'サインイン時に自動起動します');
-  else warn('スタートアップ', '未登録です。scripts\\install.ps1 -RegisterStartup で登録できます');
+  else warn('スタートアップ', `未登録です。${registerStartupCommand(manifest)} で登録できます`);
 
   if (config?.daemon?.tray === false) warn('タスクトレイ', '設定で無効になっています');
   else if (daemonUp) ok('タスクトレイ', '常駐が有効です');
@@ -335,8 +360,7 @@ async function main() {
   } else {
     const others = Object.entries(claude.hooks ?? {}).length;
     if (claudeOurs.length === 0) {
-      const guide = manifest ? 'scripts\\update.ps1 を実行してください' : 'scripts\\install.ps1 を実行してください';
-      fail('Claude Code', `フックが登録されていません。${guide}`);
+      fail('Claude Code', `フックが登録されていません。${rerunGuide(manifest)}`);
     } else {
       ok('Claude Code', `${claudeOurs.length} イベント登録済み: ${claudeOurs.map((o) => o.ev).join(', ')}（他 ${others} 種のイベントキーと共存）`);
     }
@@ -379,12 +403,12 @@ async function main() {
   } else if (codexPlan.mode === 'warn-uninstalled') {
     warn('Codex', '未導入のようです（使う場合は scripts\\install.ps1 を実行してください）');
   } else if (!codexRoot) {
-    fail('Codex', `${CODEX_HOOKS} がありません。scripts\\install.ps1 を実行してください`);
+    const problem = codexHooksFileExists ? 'を読めません（壊れている可能性があります。修復してください）' : 'がありません';
+    fail('Codex', `${CODEX_HOOKS} ${problem}。${rerunGuide(manifest)}`);
   } else {
     const asyncOnes = codexOurs.filter((o) => o.async);
     if (codexOurs.length === 0) {
-      const guide = manifest ? '。scripts\\update.ps1 を実行してください' : '';
-      fail('Codex', `フックが登録されていません${guide}`);
+      fail('Codex', `フックが登録されていません。${rerunGuide(manifest)}`);
     } else {
       ok('Codex', `${codexOurs.length} イベント登録済み: ${codexOurs.map((o) => o.ev).join(', ')}`);
     }
@@ -398,7 +422,7 @@ async function main() {
       fail(
         'Codex (引用符)',
         `command の先頭が引用符で始まっています（${quoted.map((o) => o.ev).join(', ')}）。` +
-          'Codex では実行ファイルを引用できません。scripts\\install.ps1 を実行し直してください',
+          `Codex では実行ファイルを引用できません。${rerunGuide(manifest)}`,
       );
     }
 

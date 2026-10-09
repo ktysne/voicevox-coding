@@ -136,7 +136,7 @@ Write-Output ('scalar=' + ($scalarBefore -ceq [System.IO.File]::ReadAllText($sca
   );
   assert.match(stdout, /broken=True/);
   assert.match(stdout, /scalar=True/);
-  assert.match(stdout, /warn: .*フック解除をスキップします/);
+  assert.equal(stdout.match(/warn: .*フック解除をスキップします/g)?.length, 2, stdout);
 });
 
 test('Remove-OurHook は対象イベントの自分のフックだけを解除する', { skip: !pwshOk }, () => {
@@ -215,6 +215,27 @@ Write-Output ('events=' + ($events -join ','))
   assert.match(stdout, /events=Stop/);
 });
 
+test('Assert-HookConfigReadable は install.ps1 が読めない設定ファイルだけを中断にする', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness('update.ps1', ['Assert-HookConfigReadable'], `
+foreach ($case in @(@('object', '{"hooks":{}}'), @('empty', '  '), @('broken', '{"hooks":'), @('array', '[]'))) {
+  $p = Join-Path $WORK ($case[0] + '.json')
+  [System.IO.File]::WriteAllText($p, $case[1])
+  $result = 'ok'
+  try { Assert-HookConfigReadable $p } catch { $result = 'abort' }
+  Write-Output ($case[0] + '=' + $result)
+}
+$missing = 'ok'
+try { Assert-HookConfigReadable (Join-Path $WORK 'missing.json') } catch { $missing = 'abort' }
+Write-Output ('missing=' + $missing)
+`);
+  // 無い・空は install.ps1 が未設定として扱うので通す
+  assert.match(stdout, /object=ok/);
+  assert.match(stdout, /empty=ok/);
+  assert.match(stdout, /missing=ok/);
+  assert.match(stdout, /broken=abort/);
+  assert.match(stdout, /array=abort/);
+});
+
 test('実効オプションを決めてからデーモンを停止する', () => {
   const source = fs.readFileSync(path.join(ROOT, 'scripts', 'update.ps1'), 'utf8');
   const pull = source.indexOf('# --- 1. リポジトリの最新化 ---');
@@ -225,6 +246,8 @@ test('実効オプションを決めてからデーモンを停止する', () =>
     '$explicitIncludeToolEvents =',
     '$manifest = Read-InstallManifest $ManifestPath',
     '$estimate = Get-BackfillEstimate',
+    'Assert-HookConfigReadable $hookConfig.ClaudeSettings',
+    'Assert-HookConfigReadable $hookConfig.CodexHooks',
   ]) {
     const position = source.indexOf(marker);
     assert.ok(position > pull && position < stop, `${marker} が手順 1 の後、手順 2 の前にない`);

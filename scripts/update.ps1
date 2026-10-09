@@ -133,7 +133,7 @@ function Read-InstallManifest([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
     # 「存在するが無効」を現状推定へ流すと、一時的に欠けたフックを意図的な Skip として
     # 固定したり、未知バージョンの manifest を v1 で上書きしたりする。中断して案内する
-    $stop = { throw "install.json が壊れているか未知の形式のため更新を中断しました。修復するか、ファイルを削除して現状からの推定に任せるか、オプションを明示指定して再実行してください: $path" }
+    $stop = { throw "install.json が壊れているか未知の形式のため更新を中断しました。修復するか、ファイルを削除して現状からの推定に任せてから再実行してください: $path" }
     try {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
         if ([string]::IsNullOrWhiteSpace($raw)) { & $stop }
@@ -229,15 +229,35 @@ function Get-BackfillEstimateFromEvents([string[]]$claudeEvents, [string[]]$code
   現在の settings.json / hooks.json から実効オプションを推定する。
 #>
 function Get-BackfillEstimate {
-    $claudeDir      = Join-Path $env:USERPROFILE '.claude'
-    $settingsPath   = Join-Path $claudeDir 'settings.json'
-    $codexDir       = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
-    $codexHooksPath = Join-Path $codexDir 'hooks.json'
-
-    $claudeEvents = Get-OurHookEvents (Read-JsonFileStrict $settingsPath)
-    $codexEvents  = Get-OurHookEvents (Read-JsonFileStrict $codexHooksPath)
+    $paths = Get-HookConfigPaths
+    $claudeEvents = Get-OurHookEvents (Read-JsonFileStrict $paths.ClaudeSettings)
+    $codexEvents  = Get-OurHookEvents (Read-JsonFileStrict $paths.CodexHooks)
 
     return Get-BackfillEstimateFromEvents -ClaudeEvents $claudeEvents -CodexEvents $codexEvents
+}
+
+# install.ps1 が書き換える設定ファイルの場所。install.ps1 と同じ規則で決める。
+function Get-HookConfigPaths {
+    $codexDir = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
+    return [pscustomobject]@{
+        ClaudeSettings = Join-Path (Join-Path $env:USERPROFILE '.claude') 'settings.json'
+        CodexHooks     = Join-Path $codexDir 'hooks.json'
+    }
+}
+
+<#
+  install.ps1 が読む設定ファイルを、同じ規則(無い・空なら未設定、それ以外は JSON オブジェクト)で確かめる。
+  install.ps1 はデーモンを止めた後に実行するので、そこで壊れたファイルに当たると再起動まで届かないため。
+#>
+function Assert-HookConfigReadable([string]$path) {
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+    if ([string]::IsNullOrWhiteSpace($raw)) { return }
+    $parsed = $null
+    try { $parsed = $raw | ConvertFrom-Json } catch { $parsed = $null }
+    if ($parsed -isnot [System.Management.Automation.PSCustomObject]) {
+        throw "設定ファイルを JSON オブジェクトとして読み取れないため更新を中断しました（修復するか退避してから再実行してください）: $path"
+    }
 }
 
 # --- 1. リポジトリの最新化 ---
@@ -250,6 +270,8 @@ if (-not $SkipPull) {
     }
     Write-Ok (git -C $RepoRoot log -1 --format='%h %s')
 }
+
+Write-Step '導入時のオプションを確かめます'
 
 # オプションは install.ps1 の実行時に install.json へ記録される。
 # このスクリプトで明示的に指定されなかったスイッチだけ、その記録値（または、記録が
@@ -284,6 +306,10 @@ if ($manifest) {
     if (-not $explicitSkipClaude)        { $effSkipClaude        = $estimate.SkipClaude }
     if (-not $explicitSkipCodex)         { $effSkipCodex         = $estimate.SkipCodex }
 }
+
+$hookConfig = Get-HookConfigPaths
+if (-not $effSkipClaude) { Assert-HookConfigReadable $hookConfig.ClaudeSettings }
+if (-not $effSkipCodex)  { Assert-HookConfigReadable $hookConfig.CodexHooks }
 
 # --- 2. デーモンの停止 ---
 $port = Get-DaemonPort
