@@ -82,13 +82,14 @@ export function isRejectedDuringShutdown(runtime, method, pathname) {
 
 const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
-function parseHostname(value) {
-  if (!value) return null;
-  try {
-    return new URL(`http://${value}`).hostname;
-  } catch {
-    return null;
-  }
+/**
+ * Host ヘッダーがこのデーモン自身を指しているか。DNS リバインディングでは攻撃者のドメインが
+ * Host に載るので、読み取りを含む全要求をこれで弾く。待ち受けは 127.0.0.1 だけなので IPv6 表記は許さない。
+ */
+export function isLocalHostHeader(host, port) {
+  if (typeof host !== 'string') return false;
+  const value = host.toLowerCase();
+  return value === `127.0.0.1:${port}` || value === `localhost:${port}`;
 }
 
 /**
@@ -109,8 +110,7 @@ function parseHostname(value) {
  * ここで防いでも境界にならない）。
  */
 export function checkMutationRequest({ pathname, headers = {}, port, token }) {
-  const hostname = parseHostname(headers.host);
-  if (!hostname || !LOCAL_HOSTNAMES.has(hostname)) {
+  if (!isLocalHostHeader(headers.host, port)) {
     return { ok: false, status: 403, error: 'ローカル以外の Host からの要求は受け付けません' };
   }
 
@@ -240,7 +240,8 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   const serveStatic = (req, res, pathname) => {
     const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
     const file = path.resolve(UI_DIR, rel);
-    if (!file.startsWith(UI_DIR)) {
+    const relative = path.relative(UI_DIR, file);
+    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
       res.writeHead(403).end('forbidden');
       return;
     }
@@ -252,6 +253,9 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       res.writeHead(200, {
         'Content-Type': MIME[path.extname(file)] ?? 'application/octet-stream',
         'Cache-Control': 'no-store',
+        // 管理 UI を外部ページの iframe に埋め込ませない（クリックジャッキング対策）
+        'X-Frame-Options': 'DENY',
+        'Content-Security-Policy': "frame-ancestors 'none'",
       });
       res.end(buf);
     });
@@ -260,6 +264,12 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const { pathname } = url;
+
+    if (!isLocalHostHeader(req.headers.host, port)) {
+      log.warn(`要求を拒否しました: ${req.method} ${pathname} — ローカル以外の Host からの要求は受け付けません`);
+      json(res, 403, { error: 'ローカル以外の Host からの要求は受け付けません' });
+      return;
+    }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       if (isRejectedDuringShutdown(runtime, req.method, pathname)) {
