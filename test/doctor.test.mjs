@@ -19,9 +19,9 @@ import {
 
 const FULL_MANIFEST = { schemaVersion: 1, includeToolEvents: false, skipClaude: false, skipCodex: false, registerStartup: false };
 
-test('rerunGuide: install.json があれば記録を引き継ぐ update.ps1 へ誘導する', () => {
-  assert.match(rerunGuide(FULL_MANIFEST), /update\.ps1/);
-  assert.match(rerunGuide(null), /install\.ps1/);
+test('rerunGuide: install.json があれば壊れていても記録を引き継ぐ update.ps1 へ誘導する', () => {
+  assert.match(rerunGuide(true), /update\.ps1/);
+  assert.match(rerunGuide(false), /install\.ps1/);
 });
 
 test('registerStartupCommand: 導入時のオプションを添えてスタートアップを登録させる', () => {

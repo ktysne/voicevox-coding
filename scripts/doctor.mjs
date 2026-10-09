@@ -177,9 +177,10 @@ export function resolveTargetPlan(manifest, opts = {}) {
 /**
  * フックを作り直す手順の案内。install.ps1 は install.json を読まず、オプションなしで実行すると
  * 導入時の構成を既定値で上書きするので、記録があれば記録を引き継ぐ update.ps1 へ誘導する。
+ * 記録が壊れていても update.ps1 へ誘導する(update.ps1 は中断して修復を促すので構成を失わない)。
  */
-export function rerunGuide(manifest) {
-  return manifest ? 'scripts\\update.ps1 を実行してください' : 'scripts\\install.ps1 を実行してください';
+export function rerunGuide(installRecordExists) {
+  return installRecordExists ? 'scripts\\update.ps1 を実行してください' : 'scripts\\install.ps1 を実行してください';
 }
 
 /**
@@ -318,7 +319,7 @@ async function main() {
 
   // --- フッククライアント ---
   if (fs.existsSync(HOOK_CLIENT)) ok('フッククライアント', HOOK_CLIENT);
-  else fail('フッククライアント', `${HOOK_CLIENT} がありません。${rerunGuide(manifest)}`);
+  else fail('フッククライアント', `${HOOK_CLIENT} がありません。${rerunGuide(manifestExists)}`);
 
   // --- エンジン・デーモン ---
   const engineUp = await checkEngine(baseUrl);
@@ -339,6 +340,7 @@ async function main() {
     'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup', 'VOICEVOX Coding.vbs',
   );
   if (fs.existsSync(startupVbs)) ok('スタートアップ', 'サインイン時に自動起動します');
+  else if (manifestExists && !manifest) warn('スタートアップ', `未登録です。${MANIFEST_PATH} を修復してから登録してください`);
   else warn('スタートアップ', `未登録です。${registerStartupCommand(manifest)} で登録できます`);
 
   if (config?.daemon?.tray === false) warn('タスクトレイ', '設定で無効になっています');
@@ -360,7 +362,7 @@ async function main() {
   } else {
     const others = Object.entries(claude.hooks ?? {}).length;
     if (claudeOurs.length === 0) {
-      fail('Claude Code', `フックが登録されていません。${rerunGuide(manifest)}`);
+      fail('Claude Code', `フックが登録されていません。${rerunGuide(manifestExists)}`);
     } else {
       ok('Claude Code', `${claudeOurs.length} イベント登録済み: ${claudeOurs.map((o) => o.ev).join(', ')}（他 ${others} 種のイベントキーと共存）`);
     }
@@ -404,11 +406,11 @@ async function main() {
     warn('Codex', '未導入のようです（使う場合は scripts\\install.ps1 を実行してください）');
   } else if (!codexRoot) {
     const problem = codexHooksFileExists ? 'を読めません（壊れている可能性があります。修復してください）' : 'がありません';
-    fail('Codex', `${CODEX_HOOKS} ${problem}。${rerunGuide(manifest)}`);
+    fail('Codex', `${CODEX_HOOKS} ${problem}。${rerunGuide(manifestExists)}`);
   } else {
     const asyncOnes = codexOurs.filter((o) => o.async);
     if (codexOurs.length === 0) {
-      fail('Codex', `フックが登録されていません。${rerunGuide(manifest)}`);
+      fail('Codex', `フックが登録されていません。${rerunGuide(manifestExists)}`);
     } else {
       ok('Codex', `${codexOurs.length} イベント登録済み: ${codexOurs.map((o) => o.ev).join(', ')}`);
     }
@@ -422,7 +424,7 @@ async function main() {
       fail(
         'Codex (引用符)',
         `command の先頭が引用符で始まっています（${quoted.map((o) => o.ev).join(', ')}）。` +
-          `Codex では実行ファイルを引用できません。${rerunGuide(manifest)}`,
+          `Codex では実行ファイルを引用できません。${rerunGuide(manifestExists)}`,
       );
     }
 

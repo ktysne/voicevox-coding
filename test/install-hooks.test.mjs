@@ -217,7 +217,7 @@ Write-Output ('events=' + ($events -join ','))
 
 test('Assert-HookConfigReadable は install.ps1 が読めない設定ファイルだけを中断にする', { skip: !pwshOk }, () => {
   const { stdout } = runHarness('update.ps1', ['Assert-HookConfigReadable'], `
-foreach ($case in @(@('object', '{"hooks":{}}'), @('empty', '  '), @('broken', '{"hooks":'), @('array', '[]'))) {
+foreach ($case in @(@('object', '{"hooks":{}}'), @('caseKeys', '{"a":1,"A":2}'), @('empty', '  '), @('broken', '{"hooks":'), @('array', '[]'))) {
   $p = Join-Path $WORK ($case[0] + '.json')
   [System.IO.File]::WriteAllText($p, $case[1])
   $result = 'ok'
@@ -230,6 +230,8 @@ Write-Output ('missing=' + $missing)
 `);
   // 無い・空は install.ps1 が未設定として扱うので通す
   assert.match(stdout, /object=ok/);
+  // install.ps1 は -AsHashtable で読むので、大文字小文字だけが違うキーも読める
+  assert.match(stdout, /caseKeys=ok/);
   assert.match(stdout, /empty=ok/);
   assert.match(stdout, /missing=ok/);
   assert.match(stdout, /broken=abort/);

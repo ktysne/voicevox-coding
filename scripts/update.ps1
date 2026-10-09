@@ -254,8 +254,8 @@ function Assert-HookConfigReadable([string]$path) {
     $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
     if ([string]::IsNullOrWhiteSpace($raw)) { return }
     $parsed = $null
-    try { $parsed = $raw | ConvertFrom-Json } catch { $parsed = $null }
-    if ($parsed -isnot [System.Management.Automation.PSCustomObject]) {
+    try { $parsed = $raw | ConvertFrom-Json -AsHashtable } catch { $parsed = $null }
+    if ($parsed -isnot [hashtable]) {
         throw "設定ファイルを JSON オブジェクトとして読み取れないため更新を中断しました（修復するか退避してから再実行してください）: $path"
     }
 }
