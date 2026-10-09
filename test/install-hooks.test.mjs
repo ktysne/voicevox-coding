@@ -48,6 +48,8 @@ function runHarness(scriptFile, functionNames, harnessBody) {
   tmpDirs.push(dir);
   const script = [
     "$ErrorActionPreference = 'Stop'",
+    // 既定の出力はコンソールのコードページ(日本語環境では CP932)になり、utf8 で読むと日本語が化けるため
+    '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)',
     'function Write-Ok($msg)    { Write-Host "ok: $msg" }',
     'function Write-Warn2($msg) { Write-Host "warn: $msg" }',
     'function Write-Skip($msg)  { Write-Host "skip: $msg" }',
