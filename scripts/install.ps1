@@ -305,9 +305,18 @@ function Save-InstallManifest {
 #>
 function Remove-AllOurHooks([string]$path, [string]$label) {
     if (-not (Test-Path -LiteralPath $path)) { return }
-    $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
-    if ([string]::IsNullOrWhiteSpace($raw)) { return }
-    $root = $raw | ConvertFrom-Json -AsHashtable
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { throw 'JSON が空です' }
+        $root = $raw | ConvertFrom-Json -AsHashtable
+    } catch {
+        Write-Warn2 "$label の設定を JSON として読み取れないため、フック解除をスキップします: $path"
+        return
+    }
+    if ($root -isnot [hashtable]) {
+        Write-Warn2 "$label の設定ルートがオブジェクトではないため、フック解除をスキップします: $path"
+        return
+    }
     if (-not $root.ContainsKey('hooks') -or $root.hooks -isnot [hashtable]) { return }
 
     $removed = 0

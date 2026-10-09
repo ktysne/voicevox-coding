@@ -114,6 +114,28 @@ Remove-AllOurHooks $target 'テスト対象'
   assert.ok(fs.readdirSync(dir).some((f) => /settings\.json\.bak-\d{8}-\d{6}/.test(f)), 'バックアップが無い');
 });
 
+test('Remove-AllOurHooks は壊れた JSON とオブジェクト以外のルートを変更せず警告する', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness(
+    'install.ps1',
+    ['Test-OurHookCommand', 'Backup-File', 'Remove-OldBackups', 'Remove-AllOurHooks'],
+    `
+$brokenPath = Join-Path $WORK 'broken.json'
+$scalarPath = Join-Path $WORK 'scalar.json'
+[System.IO.File]::WriteAllText($brokenPath, '{"broken":')
+[System.IO.File]::WriteAllText($scalarPath, '[]')
+$brokenBefore = [System.IO.File]::ReadAllText($brokenPath)
+$scalarBefore = [System.IO.File]::ReadAllText($scalarPath)
+Remove-AllOurHooks $brokenPath '壊れた JSON'
+Remove-AllOurHooks $scalarPath '配列ルート'
+Write-Output ('broken=' + ($brokenBefore -ceq [System.IO.File]::ReadAllText($brokenPath)))
+Write-Output ('scalar=' + ($scalarBefore -ceq [System.IO.File]::ReadAllText($scalarPath)))
+`,
+  );
+  assert.match(stdout, /broken=True/);
+  assert.match(stdout, /scalar=True/);
+  assert.match(stdout, /warn: .*フック解除をスキップします/);
+});
+
 test('Remove-OurHook は対象イベントの自分のフックだけを解除する', { skip: !pwshOk }, () => {
   const { dir } = runHarness(
     'install.ps1',
@@ -162,6 +184,36 @@ Write-Output ('missing=' + $(if ($null -eq $m2) { 'null' } else { 'valid' }))
   assert.match(stdout, /unknown=abort/);
   assert.match(stdout, /stringBool=abort/);
   assert.match(stdout, /missing=null/);
+});
+
+test('旧導入の推定は両方空なら再登録し、片方だけ空なら空側をスキップする', { skip: !pwshOk }, () => {
+  const { stdout } = runHarness('update.ps1', ['Get-BackfillEstimateFromEvents'], `
+$bothEmpty = Get-BackfillEstimateFromEvents -ClaudeEvents @() -CodexEvents @()
+$claudeOnly = Get-BackfillEstimateFromEvents -ClaudeEvents @('Stop') -CodexEvents @()
+$codexWithTool = Get-BackfillEstimateFromEvents -ClaudeEvents @() -CodexEvents @('Stop', 'PreToolUse')
+Write-Output ('bothEmpty=' + $bothEmpty.SkipClaude + ',' + $bothEmpty.SkipCodex + ',' + $bothEmpty.IncludeToolEvents)
+Write-Output ('claudeOnly=' + $claudeOnly.SkipClaude + ',' + $claudeOnly.SkipCodex + ',' + $claudeOnly.IncludeToolEvents)
+Write-Output ('codexWithTool=' + $codexWithTool.SkipClaude + ',' + $codexWithTool.SkipCodex + ',' + $codexWithTool.IncludeToolEvents)
+`);
+  assert.match(stdout, /bothEmpty=False,False,False/);
+  assert.match(stdout, /claudeOnly=False,True,False/);
+  assert.match(stdout, /codexWithTool=True,False,True/);
+});
+
+test('実効オプションを決めてからデーモンを停止する', () => {
+  const source = fs.readFileSync(path.join(ROOT, 'scripts', 'update.ps1'), 'utf8');
+  const pull = source.indexOf('# --- 1. リポジトリの最新化 ---');
+  const stop = source.indexOf('# --- 2. デーモンの停止 ---');
+  assert.notEqual(pull, -1);
+  assert.notEqual(stop, -1);
+  for (const marker of [
+    '$explicitIncludeToolEvents =',
+    '$manifest = Read-InstallManifest $ManifestPath',
+    '$estimate = Get-BackfillEstimate',
+  ]) {
+    const position = source.indexOf(marker);
+    assert.ok(position > pull && position < stop, `${marker} が手順 1 の後、手順 2 の前にない`);
+  }
 });
 
 test('uninstall の解除も似た名前の他製品フックを巻き込まない', { skip: !pwshOk }, () => {

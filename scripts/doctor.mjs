@@ -286,7 +286,7 @@ async function main() {
   const manifestExists = fs.existsSync(MANIFEST_PATH);
   const manifest = manifestExists ? normalizeInstallManifest(readJson(MANIFEST_PATH)) : null;
   if (manifest) ok('導入構成', `${MANIFEST_PATH} を期待構成として使用します`);
-  else if (manifestExists) warn('導入構成', `${MANIFEST_PATH} が壊れているか形式が不正なため無視します（scripts\\install.ps1 の再実行で作り直せます）`);
+  else if (manifestExists) warn('導入構成', `${MANIFEST_PATH} が壊れているか形式が不正なため無視します（scripts\\update.ps1 の再実行で作り直せます）`);
 
   const port = config?.daemon?.port ?? 7591;
   const baseUrl = config?.engine?.baseUrl ?? 'http://127.0.0.1:50021';
@@ -334,14 +334,18 @@ async function main() {
     warn('Claude Code', `${CLAUDE_SETTINGS} を読めません`);
   } else {
     const others = Object.entries(claude.hooks ?? {}).length;
-    if (claudeOurs.length === 0) fail('Claude Code', 'フックが登録されていません。scripts\\install.ps1 を実行してください');
-    else ok('Claude Code', `${claudeOurs.length} イベント登録済み: ${claudeOurs.map((o) => o.ev).join(', ')}（他 ${others} 種のイベントキーと共存）`);
+    if (claudeOurs.length === 0) {
+      const guide = manifest ? 'scripts\\update.ps1 を実行してください' : 'scripts\\install.ps1 を実行してください';
+      fail('Claude Code', `フックが登録されていません。${guide}`);
+    } else {
+      ok('Claude Code', `${claudeOurs.length} イベント登録済み: ${claudeOurs.map((o) => o.ev).join(', ')}（他 ${others} 種のイベントキーと共存）`);
+    }
 
     const missing = missingToolEvents(manifest, claudeOurs);
     if (missing.length > 0) {
       fail(
         'Claude Code (ツールイベント)',
-        `導入時に -IncludeToolEvents を指定していますが登録されていません: ${missing.join(', ')}。scripts\\install.ps1 を実行し直してください`,
+        `導入時に -IncludeToolEvents を指定していますが登録されていません: ${missing.join(', ')}。scripts\\update.ps1 を実行し直してください`,
       );
     }
     const claudeExtra = extraToolEvents(manifest, claudeOurs);
@@ -378,8 +382,12 @@ async function main() {
     fail('Codex', `${CODEX_HOOKS} がありません。scripts\\install.ps1 を実行してください`);
   } else {
     const asyncOnes = codexOurs.filter((o) => o.async);
-    if (codexOurs.length === 0) fail('Codex', 'フックが登録されていません');
-    else ok('Codex', `${codexOurs.length} イベント登録済み: ${codexOurs.map((o) => o.ev).join(', ')}`);
+    if (codexOurs.length === 0) {
+      const guide = manifest ? '。scripts\\update.ps1 を実行してください' : '';
+      fail('Codex', `フックが登録されていません${guide}`);
+    } else {
+      ok('Codex', `${codexOurs.length} イベント登録済み: ${codexOurs.map((o) => o.ev).join(', ')}`);
+    }
     if (asyncOnes.length > 0) {
       fail('Codex (async)', `async: true のフックは Codex に無視されます: ${asyncOnes.map((o) => o.ev).join(', ')}`);
     }
@@ -398,7 +406,7 @@ async function main() {
     if (missing.length > 0) {
       fail(
         'Codex (ツールイベント)',
-        `導入時に -IncludeToolEvents を指定していますが登録されていません: ${missing.join(', ')}。scripts\\install.ps1 を実行し直してください`,
+        `導入時に -IncludeToolEvents を指定していますが登録されていません: ${missing.join(', ')}。scripts\\update.ps1 を実行し直してください`,
       );
     }
     const codexExtra = extraToolEvents(manifest, codexOurs);

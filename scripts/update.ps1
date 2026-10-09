@@ -127,7 +127,7 @@ function Confirm-DaemonProcess([int]$ownerPid, $runtime) {
 
 <#
   install.ps1 が保存した「期待する導入構成」(install.json) を読む。
-  無い、または壊れている場合は $null を返す（呼び出し側で現状からの推定に切り替える）。
+  無い場合は $null を返し、存在するのに無効な場合は更新を中断する。
 #>
 function Read-InstallManifest([string]$path) {
     if (-not (Test-Path -LiteralPath $path)) { return $null }
@@ -208,6 +208,21 @@ function Get-OurHookEvents($root) {
     return $events
 }
 
+function Get-BackfillEstimateFromEvents([string[]]$claudeEvents, [string[]]$codexEvents) {
+    $claudeHasHooks = ($null -ne $claudeEvents -and @($claudeEvents).Count -gt 0)
+    $codexHasHooks  = ($null -ne $codexEvents -and @($codexEvents).Count -gt 0)
+    $toolEvents = @('PreToolUse', 'PostToolUse')
+    $includeToolEvents = @($toolEvents | Where-Object {
+        ($claudeEvents -contains $_) -or ($codexEvents -contains $_)
+    }).Count -gt 0
+
+    return [pscustomobject]@{
+        IncludeToolEvents = $includeToolEvents
+        SkipClaude        = (-not $claudeHasHooks -and $codexHasHooks)
+        SkipCodex         = (-not $codexHasHooks -and $claudeHasHooks)
+    }
+}
+
 <#
   install.json が無い（manifest 保存に対応する前の）既存導入からの初回更新用に、
   現在の settings.json / hooks.json から実効オプションを推定する。
@@ -221,15 +236,7 @@ function Get-BackfillEstimate {
     $claudeEvents = Get-OurHookEvents (Read-JsonFileStrict $settingsPath)
     $codexEvents  = Get-OurHookEvents (Read-JsonFileStrict $codexHooksPath)
 
-    $toolEvents = @('PreToolUse', 'PostToolUse')
-    $claudeHasToolEvents = @($claudeEvents | Where-Object { $toolEvents -contains $_ }).Count -gt 0
-    $codexHasToolEvents  = @($codexEvents  | Where-Object { $toolEvents -contains $_ }).Count -gt 0
-
-    return [pscustomobject]@{
-        IncludeToolEvents = ($claudeHasToolEvents -or $codexHasToolEvents)
-        SkipClaude        = ($claudeEvents.Count -eq 0)
-        SkipCodex         = ($codexEvents.Count -eq 0)
-    }
+    return Get-BackfillEstimateFromEvents -ClaudeEvents $claudeEvents -CodexEvents $codexEvents
 }
 
 # --- 1. リポジトリの最新化 ---
@@ -241,6 +248,40 @@ if (-not $SkipPull) {
         exit 1
     }
     Write-Ok (git -C $RepoRoot log -1 --format='%h %s')
+}
+
+# オプションは install.ps1 の実行時に install.json へ記録される。
+# このスクリプトで明示的に指定されなかったスイッチだけ、その記録値（または、記録が
+# 無い旧導入の場合は現状からの推定値）で補う。$PSBoundParameters に無いキーは
+# 「このスイッチは指定されていない」ことを意味する（未指定と $false の明示指定を区別する）。
+$explicitIncludeToolEvents = $PSBoundParameters.ContainsKey('IncludeToolEvents')
+$explicitSkipClaude        = $PSBoundParameters.ContainsKey('SkipClaude')
+$explicitSkipCodex         = $PSBoundParameters.ContainsKey('SkipCodex')
+
+$effIncludeToolEvents = $IncludeToolEvents.IsPresent
+$effSkipClaude        = $SkipClaude.IsPresent
+$effSkipCodex         = $SkipCodex.IsPresent
+
+$manifest = Read-InstallManifest $ManifestPath
+if ($manifest) {
+    Write-Ok "導入時のオプションを引き継ぎます: $ManifestPath"
+    if (-not $explicitIncludeToolEvents -and (Get-Member -InputObject $manifest -Name 'includeToolEvents' -ErrorAction SilentlyContinue)) {
+        $effIncludeToolEvents = [bool]$manifest.includeToolEvents
+    }
+    if (-not $explicitSkipClaude -and (Get-Member -InputObject $manifest -Name 'skipClaude' -ErrorAction SilentlyContinue)) {
+        $effSkipClaude = [bool]$manifest.skipClaude
+    }
+    if (-not $explicitSkipCodex -and (Get-Member -InputObject $manifest -Name 'skipCodex' -ErrorAction SilentlyContinue)) {
+        $effSkipCodex = [bool]$manifest.skipCodex
+    }
+} elseif ((-not $explicitIncludeToolEvents) -or (-not $explicitSkipClaude) -or (-not $explicitSkipCodex)) {
+    Write-Warn2 'install.json が無いため現状から推定しました'
+    $estimate = Get-BackfillEstimate
+    Write-Host "  推定値: IncludeToolEvents=$($estimate.IncludeToolEvents), SkipClaude=$($estimate.SkipClaude), SkipCodex=$($estimate.SkipCodex)"
+    Write-Host '  推定と異なる場合は -SkipClaude:$false のように明示指定して上書きできます。'
+    if (-not $explicitIncludeToolEvents) { $effIncludeToolEvents = $estimate.IncludeToolEvents }
+    if (-not $explicitSkipClaude)        { $effSkipClaude        = $estimate.SkipClaude }
+    if (-not $explicitSkipCodex)         { $effSkipCodex         = $estimate.SkipCodex }
 }
 
 # --- 2. デーモンの停止 ---
@@ -338,38 +379,6 @@ if ($wasRunning) {
 
 # --- 3. フックとスタートアップの再生成 ---
 Write-Step 'フック定義とスタートアップ登録を作り直します'
-
-# オプションは install.ps1 の実行時に install.json へ記録される。
-# このスクリプトで明示的に指定されなかったスイッチだけ、その記録値（または、記録が
-# 無い旧導入の場合は現状からの推定値）で補う。$PSBoundParameters に無いキーは
-# 「このスイッチは指定されていない」ことを意味する（未指定と $false の明示指定を区別する）。
-$explicitIncludeToolEvents = $PSBoundParameters.ContainsKey('IncludeToolEvents')
-$explicitSkipClaude        = $PSBoundParameters.ContainsKey('SkipClaude')
-$explicitSkipCodex         = $PSBoundParameters.ContainsKey('SkipCodex')
-
-$effIncludeToolEvents = $IncludeToolEvents.IsPresent
-$effSkipClaude        = $SkipClaude.IsPresent
-$effSkipCodex         = $SkipCodex.IsPresent
-
-$manifest = Read-InstallManifest $ManifestPath
-if ($manifest) {
-    Write-Ok "導入時のオプションを引き継ぎます: $ManifestPath"
-    if (-not $explicitIncludeToolEvents -and (Get-Member -InputObject $manifest -Name 'includeToolEvents' -ErrorAction SilentlyContinue)) {
-        $effIncludeToolEvents = [bool]$manifest.includeToolEvents
-    }
-    if (-not $explicitSkipClaude -and (Get-Member -InputObject $manifest -Name 'skipClaude' -ErrorAction SilentlyContinue)) {
-        $effSkipClaude = [bool]$manifest.skipClaude
-    }
-    if (-not $explicitSkipCodex -and (Get-Member -InputObject $manifest -Name 'skipCodex' -ErrorAction SilentlyContinue)) {
-        $effSkipCodex = [bool]$manifest.skipCodex
-    }
-} elseif ((-not $explicitIncludeToolEvents) -or (-not $explicitSkipClaude) -or (-not $explicitSkipCodex)) {
-    Write-Warn2 'install.json が無いため現状から推定しました'
-    $estimate = Get-BackfillEstimate
-    if (-not $explicitIncludeToolEvents) { $effIncludeToolEvents = $estimate.IncludeToolEvents }
-    if (-not $explicitSkipClaude)        { $effSkipClaude        = $estimate.SkipClaude }
-    if (-not $explicitSkipCodex)         { $effSkipCodex         = $estimate.SkipCodex }
-}
 
 # スタートアップ登録は記録に頼らず、VBS の実在という物理的な事実で判定する
 # （手動でショートカットを消す／作るなど、記録と食い違いうるため）。
