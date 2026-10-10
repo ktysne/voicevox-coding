@@ -66,6 +66,10 @@ Claude 側の経路にはこのフォールバックが無いので、使えな�
 | Claude | `npm run review:codex` (codex は read-only) | `node tools/cross-review.js subagent` の出力を Claude の客観サブエージェント (Agent ツール、読み取り専用) へ渡す |
 | Codex | `node tools/cross-review.js subagent` の出力を Claude の客観サブエージェントへ渡す（Codex が主セッションなら `npm run review:claude`） | `npm run review:codex` |
 
+Claude の客観サブエージェントには、依頼を別ベンダーへ転送しないエージェント定義を使う。
+claude-codex-bridge を導入している環境では、レビューだけを頼むときは読み取り専用のレビュー用定義 `review-claude` を使い、実装用の `impl-*` には渡さない。`subagent --fix` で修正まで任せるときは、Codex へ転送しない、書き込み権限のある Claude のサブエージェントを使う。`impl-*` は依頼を Codex へ転送するため、実装者が Codex のときに同じベンダーのレビューになる。
+`review-claude` のように道具がファイルの読み取りだけの定義は git や `gh` を実行できないので、`subagent` の出力はファイルに書き出してそのパスを渡し、前の往復の指摘と対応も判断ファイル（`round-<N>-triage.md`）のパスで渡す。
+
 どの選択肢でも、レビュー結果を読んで修正を適用するのは主セッション（ユーザ判断が要る内容は、推奨の対応方法を添えて確認してから着手。自走中は推奨を適用して進め、最後の報告に判断待ちの事項として載せる）。
 修正が終わったら、同じ経路でもう一度レビューを回して妥当性確認する。
 レビューを回す前に feature ブランチと PR を用意する。詳細は `docs/cross-review.md`。
