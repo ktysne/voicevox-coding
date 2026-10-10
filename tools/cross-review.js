@@ -153,9 +153,14 @@ const CODEX_AGENT_SCRIPT_SUBPATH = ['.claude', 'tools', 'codex-agent.sh'];
 const CODEX_AGENT_REVIEW_NAME = 'codex-review';
 const CODEX_AGENT_FIX_NAME = 'codex-subagent';
 
-// bridge の定義ファイル置き場。codex-agent.sh と同じく <cwd> → <ホーム> の順で探す
-// (プロジェクト定義がユーザ定義を上書きする)。
+// bridge の定義ファイル置き場。ホーム側の定義が基準で、<cwd> 側の定義は
+// CODEX_AGENT_PROJECT_OVERRIDABLE_KEYS だけを変えられる (codex-agent.sh と同じ規則)。
 const CODEX_AGENT_DEF_SUBDIR = ['.claude', 'gpt-agents'];
+
+// <cwd> 側の定義が値を変えてよいキー。codex_home は認証とサンドボックス外で動く設定
+// (config.toml の mcp_servers など) を、codex_sandbox は書き込みの可否を決めるため、
+// 信頼していないリポジトリからは変えさせない。
+const CODEX_AGENT_PROJECT_OVERRIDABLE_KEYS = ['codex_model', 'codex_reasoning_effort'];
 
 // 定義ファイルの codex_sandbox が取り得る値。既定は安全側の read-only (bridge 側の既定と揃える)。
 const CODEX_SANDBOX_READ_ONLY = 'read-only';
@@ -1886,32 +1891,91 @@ function codexAgentSandboxOf(text) {
   return value ? value : CODEX_SANDBOX_READ_ONLY;
 }
 
-// 定義ファイル (.claude/gpt-agents/<name>.md) を bridge と同じ順で探して本文を返す。
-// どこにも無い / 読めない場合は null (呼び出し側は検査せず bridge に委ねる)。
-// deps で cwd / homedir / 存在確認 / 読み込みを差し替え可能にする (テスト用)。
+// フロントマターに現れるキー名の一覧。フロントマターが無い、閉じていない、空行とコメント以外に
+// キーの形でない行がある場合は null (codex-agent.sh もこれらを読めない定義として止める)。
+function frontMatterKeys(text) {
+  const lines = String(text == null ? '' : text).split(/\r?\n/);
+  if (lines[0] !== '---') return null;
+  const keys = [];
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i] === '---') return keys;
+    if (/^[ \t]*(#.*)?$/.test(lines[i])) continue;
+    const m = /^([^\s:]+):/.exec(lines[i]);
+    if (!m) return null;
+    if (!keys.includes(m[1])) keys.push(m[1]);
+  }
+  return null;
+}
+
+// <cwd> 側とホーム側の値を比べるための実効値。キーが無いときの既定と codex_home の表記揺れを
+// codex-agent.sh の解釈に揃える。
+function codexAgentEffectiveValue(text, key, home) {
+  const raw = frontMatterValue(text, key);
+  if (key === 'codex_sandbox') return raw ? raw : CODEX_SANDBOX_READ_ONLY;
+  if (key === 'codex_enabled') return raw === null ? 'true' : raw;
+  if (raw === null) return '';
+  if (key !== 'codex_home') return raw;
+  const homeSlash = String(home).replace(/\\/g, '/');
+  let value = raw;
+  if (value === '~') value = homeSlash;
+  else if (value.startsWith('~/')) value = `${homeSlash}/${value.slice(2)}`;
+  value = value.split('$USERPROFILE').join(homeSlash).split('%USERPROFILE%').join(homeSlash);
+  return value.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
+}
+
+// <cwd> 側の定義が変えてはいけないキーを変えていれば、その説明を返す。問題が無ければ null。
+function codexAgentProjectOverrideError(userText, projectText, projectPath, home) {
+  const keys = frontMatterKeys(projectText);
+  if (keys === null) return `リポジトリ側の定義のフロントマターが読めません: ${projectPath}`;
+  for (const key of keys) {
+    if (CODEX_AGENT_PROJECT_OVERRIDABLE_KEYS.includes(key)) continue;
+    const projectValue = codexAgentEffectiveValue(projectText, key, home);
+    if (projectValue === codexAgentEffectiveValue(userText, key, home)) continue;
+    return `リポジトリ側の定義が ${key} を ${frontMatterValue(projectText, key)} に変えています: ${projectPath}`
+      + ` (リポジトリ側の定義で変えられるのは ${CODEX_AGENT_PROJECT_OVERRIDABLE_KEYS.join(' と ')} だけです)`;
+  }
+  return null;
+}
+
+// 定義ファイル (.claude/gpt-agents/<name>.md) を bridge と同じ規則で解決し、ホーム側の本文を返す。
+// どちらも無ければ null (呼び出し側は検査せず bridge に委ねる)。ホーム側が無く <cwd> 側だけがあれば
+// { projectOnly }、読めない定義は { error }、<cwd> 側が変えてはいけないキーを変えていれば { rejected } を返す。
 function readCodexAgentDefinition(name, deps = {}) {
   const cwd = deps.cwd || process.cwd();
   const home = deps.homedir || os.homedir();
   const exists = deps.exists || ((p) => fs.existsSync(p));
   const readFile = deps.readFile || ((p) => fs.readFileSync(p, 'utf8'));
-  for (const dir of [cwd, home]) {
-    const defPath = path.join(dir, ...CODEX_AGENT_DEF_SUBDIR, `${name}.md`);
+  const readOne = (defPath) => {
     let present = false;
     try {
       present = !!exists(defPath);
     } catch {
       present = false; // 存在確認そのものの失敗は「無い」と同じ扱い (bridge 側の検査に委ねる)。
     }
-    if (!present) continue;
+    if (!present) return null;
     // 存在するのに読めない定義は「無い」と同じにしない。bridge はその定義で起動するため、
-    // 検証できないまま起動したり、別候補 (ホーム側) を検証して安全と見なしたりできない。
+    // 検証できないまま起動できない。
     try {
       return { path: defPath, text: readFile(defPath) };
     } catch (err) {
       return { path: defPath, error: (err && err.message) || 'read error' };
     }
-  }
-  return null;
+  };
+  const userPath = path.join(home, ...CODEX_AGENT_DEF_SUBDIR, `${name}.md`);
+  const projectPath = path.join(cwd, ...CODEX_AGENT_DEF_SUBDIR, `${name}.md`);
+  const samePath = (a, b) => {
+    const norm = (p) => (process.platform === 'win32' ? path.resolve(p).toLowerCase() : path.resolve(p));
+    return norm(a) === norm(b);
+  };
+  const userDef = readOne(userPath);
+  if (userDef && userDef.error) return userDef;
+  if (samePath(userPath, projectPath)) return userDef;
+  const projectDef = readOne(projectPath);
+  if (projectDef && projectDef.error) return projectDef;
+  if (!userDef) return projectDef ? { path: projectPath, projectOnly: true } : null;
+  if (!projectDef) return userDef;
+  const rejected = codexAgentProjectOverrideError(userDef.text, projectDef.text, projectPath, home);
+  return rejected ? { path: projectPath, rejected } : userDef;
 }
 
 // 定義ファイルの codex_sandbox が --fix の有無と一致するかを判定する純粋関数。
@@ -1982,6 +2046,14 @@ function codexAgentInvocation(script, opts, deps = {}) {
   const def = readCodexAgentDefinition(agentName, deps);
   if (def && def.error) {
     return { error: `定義 ${agentName} を読めないため起動しません (${def.error}): ${def.path}` };
+  }
+  // <cwd> 側を優先して読む旧版の bridge は、この定義の codex_home と codex_sandbox で起動するため渡さない。
+  if (def && def.projectOnly) {
+    warn(`[cross-review] ホーム側に定義 ${agentName} が無く、作業ディレクトリ側の定義だけがあるため直接起動へ切り替えます: ${def.path}\n`);
+    return null;
+  }
+  if (def && def.rejected) {
+    return { error: `定義 ${agentName} を使えないため起動しません。${def.rejected}` };
   }
   if (def) {
     const check = checkCodexAgentSandbox({ fix: opts.fix, sandbox: codexAgentSandboxOf(def.text) });
