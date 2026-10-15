@@ -154,6 +154,8 @@ node tools/cross-review.js artifacts --clean-legacy  # 旧形式の平置き出�
 
 誤字、コメントのみ、ドキュメント文言調整 / フォーマット、lint 整形のみ / 既にレビュー済みパターンを 1 箇所そのまま踏襲した 1〜数行 / 直前のレビュー済み状態への単純 revert。**規模、影響で迷ったら省略せず確認する**。
 
+PR があるときに省略した場合、`cockpit_skip_review` ツール (agent-cockpit) が使えるなら、owner、repo、PR 番号、現在の head SHA、省略した理由を渡して記録する。記録が無いと、ダッシュボードでは意図した省略とレビュー未実施を区別できない。ツールが無い環境では記録は要らない。
+
 ## 基盤の更新
 
 vendored ファイル (`tools/cross-review.js` / `tools/cross-review.sync.js` / `docs/cross-review.md` / `.cross-review.example.md` / この SKILL) は直接編集せず、**upstream ([ai-cross-review](https://github.com/ktysne/ai-cross-review)) を直して `tools/cross-review.sync.js` で再同期**する（スクリプト名はプロジェクトの `package.json` 次第。例：`npm run sync` / `npm run sync:check`）。
