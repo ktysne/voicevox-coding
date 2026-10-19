@@ -275,7 +275,8 @@ function defaultPrepareUpstream(repo, ref, deps = {}) {
     gitRun(['init', '--quiet', dir]);
     gitRun(['-C', dir, 'remote', 'add', 'origin', repo]);
     gitRun(['-C', dir, 'fetch', '--quiet', '--depth', '1', 'origin', ref]);
-    gitRun(['-C', dir, 'checkout', '--quiet', 'FETCH_HEAD']);
+    // 利用者の core.autocrlf が効くと上流が CRLF で取り出され、LF の取り込み先と食い違うため無効にする。
+    gitRun(['-C', dir, '-c', 'core.autocrlf=false', '-c', 'core.eol=lf', 'checkout', '--quiet', 'FETCH_HEAD']);
     const commit = gitRun(['-C', dir, 'rev-parse', 'HEAD']).trim();
     return { dir, commit, cleanup: () => rm(dir) };
   } catch (err) {
@@ -285,10 +286,21 @@ function defaultPrepareUpstream(repo, ref, deps = {}) {
   }
 }
 
+function normalizeEol(text) {
+  return text.replace(/\r\n/g, '\n');
+}
+
+// 取り込み先の作業ツリーの行末は .gitattributes や autocrlf で取り込み先ごとに違うため、
+// 既存ファイルが CRLF を含むならそれに合わせ、それ以外 (既存ファイルが無いときを含む) は LF にする。
+function matchEol(text, current) {
+  const lf = normalizeEol(text);
+  return current != null && current.includes('\r\n') ? lf.replace(/\n/g, '\r\n') : lf;
+}
+
 // 各ファイルの取り込みプランを算出する (書き込みはしない)。
-//   expected: 上流の内容に replace を適用した「取り込み先のあるべき内容」
+//   expected: 上流の内容に replace を適用し、行末を取り込み先に合わせた「取り込み先のあるべき内容」
 //   current : 取り込み先の現在の内容 (無ければ null)
-//   status  : create (新規) / update (差分あり) / unchanged (一致)
+//   status  : create (新規) / update (差分あり) / unchanged (行末をそろえて一致)
 function computeSyncPlan(manifest, upstreamDir, destRoot, deps = {}) {
   const readFile = deps.readFile || ((p) => fs.readFileSync(p, 'utf8'));
   const exists = deps.exists || ((p) => fs.existsSync(p));
@@ -300,11 +312,11 @@ function computeSyncPlan(manifest, upstreamDir, destRoot, deps = {}) {
     if (!exists(upstreamAbs)) {
       throw new Error(`上流にファイルがありません: ${entry.from}`);
     }
-    const expected = applyReplacements(readFile(upstreamAbs), entry.replace);
     const current = exists(destAbs) ? readFile(destAbs) : null;
+    const expected = matchEol(applyReplacements(readFile(upstreamAbs), entry.replace), current);
     let status;
     if (current == null) status = 'create';
-    else if (current !== expected) status = 'update';
+    else if (normalizeEol(current) !== normalizeEol(expected)) status = 'update';
     else status = 'unchanged';
     return { from: entry.from, to: entry.to, destAbs, expected, status };
   });
