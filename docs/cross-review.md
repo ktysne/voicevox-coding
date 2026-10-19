@@ -568,12 +568,13 @@ node tools/cross-review.js <reviewer> --base <そのSHA> --instructions <指摘�
 - **取り込むファイルの対応付け**：`files[]` の `from`（上流相対）→ `to`（取り込み先相対）で対応付けます。取り込み先の配置が上流と違っても対応できます（例：テストを `tests/tools/` 配下に置く）。**ファイル単位のみ**で、`from` にディレクトリを指定した一括コピーは非対応です。
 - **require パス等の機械置換**：`files[].replace`（`{ from, to }` の配列）で**文字列リテラルの全置換**を行います（正規表現ではない）。コピーしたテストの require パスを取り込み先の配置へ合わせる用途です。上流側は書き換えません。
 - **取り込み元の記録**：取り込んだ実コミットを `lastSyncedCommit`（と `lastSyncedRef`）へ書き戻します（記録値が変わるときだけ。同一コミットの再同期では書き換えません）。どのコミットから取り込んだかが履歴に残り、検査の基準にもなります。
+- **行末の扱い**：上流は利用者の `core.autocrlf` に左右されずに取り出し、行末をそろえてから比べます（行末だけの違いはドリフトにしません）。取り込むファイルと書き戻すマニフェストは、取り込み先の既存のファイルが CRLF を含めば CRLF、それ以外（新規を含む）は LF で書きます。
 - **移行ノートの表示**：上流の `docs/migrations/*.md` のうち、まだ見せていないものを stderr へ全文表示します（後述「移行ノート」）。同期では直せない取り込み先側の作業を人が取りこぼさないようにするためです。
 - **モード**：
   - 既定（同期）：差分のあるファイルだけ上書きし、取り込み元コミットが変わったときだけマニフェストの `lastSyncedCommit` を更新する。
   - `--check`：書き込まず、上流（ref）との差分（ドリフト）だけを報告する。差分があれば **exit 1**（CI のドリフト検知向け）。
   - `--dry-run`：書き込まず、同期で何が変わるかだけ表示する。
-- **マニフェスト検査**：`--check-manifest` は、上流の雛形 `tools/cross-review.sync.example.json`（配布物一式の正本）にあって、取り込み先のマニフェストの `files[]` に無いエントリを列挙します（`from` で突き合わせ）。上流が配り始めたファイルの取りこぼしを知らせるだけで、**マニフェストは書き換えません**（何を取り込むかは取り込み先の判断であるため）。同じ理由で、未登録があってもドリフトではないので **exit 1 にしません**。列挙するだけの検査なので **`--check` を含意**し、単独指定でも書き込みは起きません（`sync --check-manifest` と `sync --check --check-manifest` は同じ挙動。ドリフトがあれば `--check` と同じく exit 1）。上流に雛形が無い、読めない、または**構造が不正**（`files[]` が配列でない、`from` を持つエントリが 1 つも無い）ときは警告して検査だけスキップします（突き合わせる相手が無いまま「未登録なし」と誤報しないため）。
+- **マニフェスト検査**：`--check-manifest` は、上流の雛形 `tools/cross-review.sync.example.json`（配布物一式の正本）と取り込み先の `files[]` / `excludedFiles[]` を `from` で照合し、未登録の配布物を列挙します。`excludedFiles` は任意の配列で、値には `files[].from` と同じ上流相対パスを指定します。上流の雛形に存在する除外は未登録に数えず、未登録 0 件の出力には除外件数を添えます。上流の雛形にない除外は `[cross-review]` で始まる警告を stderr に出します。未登録と古い除外はドリフトではないため **exit 1 にしません**。検査はマニフェストを書き換えず、列挙するだけなので **`--check` を含意**し、単独指定でも書き込みは起きません（`sync --check-manifest` と `sync --check --check-manifest` は同じ挙動。ドリフトがあれば `--check` と同じく exit 1）。上流に雛形が無い、読めない、または**構造が不正**（`files[]` が配列でない、`from` を持つエントリが 1 つも無い）ときは警告して検査だけスキップします（突き合わせる相手が無いまま「未登録なし」と誤報しないため）。
 - **そのほかのオプション**：`--ref <ref>`（マニフェストの ref を上書き）/ `--manifest <path>`（マニフェストの場所。既定はスクリプト隣の `cross-review.sync.json`）/ `--root <path>`（取り込み先ルート。既定は `tools/` の 1 つ上 = プロジェクトルート。cwd に依存せず解決）。
 - **安全策**：`from` / `to` が取り込み元 / 取り込み先ルートの外を指す場合はエラーにします（マニフェスト由来のパスでルート外へ読み書きする事故を防ぐ）。
 
@@ -584,6 +585,7 @@ node tools/cross-review.js <reviewer> --base <そのSHA> --instructions <指摘�
   "upstream": { "repo": "https://github.com/ktysne/ai-cross-review.git", "ref": "main" },
   "lastSyncedCommit": null,
   "shownMigrations": [],
+  "excludedFiles": ["tests/cross-review.sync.test.js", "tests/cross-review.sync-all.test.js"],
   "files": [
     { "from": "tools/cross-review.js", "to": "tools/cross-review.js" },
     { "from": "tools/cross-review.sync.js", "to": "tools/cross-review.sync.js" },
@@ -599,6 +601,8 @@ node tools/cross-review.js <reviewer> --base <そのSHA> --instructions <指摘�
   ]
 }
 ```
+
+`excludedFiles` には、取り込み先の判断で意図して取り込まない配布物を指定します（例：テストの基盤が無いので vendored テストを取り込まない）。指定したパスが上流の雛形から無くなると、`--check-manifest` は古い除外として警告します。
 
 上の `files` は代表例です。配布物一式の雛形は `tools/cross-review.sync.example.json` にあり、こちらが正本です（CLI 本体、同期スクリプト、一括同期ツール `cross-review.sync-all.js`、手順書、観点テンプレート、**Claude Code スキル `.claude/skills/cross-review/SKILL.md`**、各テストを含む）。  
 このマニフェスト自体は**取り込み先で編集するファイル**です（上書きコピーの対象に含めない）。  
@@ -637,7 +641,7 @@ since: 035a746efba75fb4f2cbbff7f0d3576fef6575ab
 ノートの作業は同期スクリプトが代行しないので、表示されたら必ず人が対応してください。  
 移行ノートの表示は同期スクリプト自身の機能なので、この機能より前のバージョンから更新する初回だけは、取り込み先に残っている古いバージョンのスクリプトが動いてノートが出ません。  
 そのときは同期をもう一度実行する（1 回目で新しいバージョンに置き換わり、2 回目で未読のノートが出ます）か、上流の checkout から `tools/cross-review.sync-all.js` を使ってください（この checkout の同期ロジックで回るため、初回からノートが出ます）。  
-上流が新しい配布物を増やしていないかは `node tools/cross-review.sync.js --check-manifest` で確認できます（未登録のエントリを列挙するだけで書き込みはしないので、必要なものだけ `files[]` に足してください）。
+上流が新しい配布物を増やしていないかは `node tools/cross-review.sync.js --check-manifest` で確認できます（未登録のエントリを列挙し、古い除外を警告します。書き込みはしないので、必要なものだけ `files[]` に足してください）。
 
 **未読の判定（`shownMigrations`）**：マニフェストの `shownMigrations` に、表示済みノートのファイル名を配列で記録します。  
 記録に無いノートが未読です。記録は既存の値を保ったまま未読分を足すので、上流から消えたノートも再表示されません。  
@@ -716,7 +720,7 @@ node tools/cross-review.sync.js            # 上流から取り込む（差分�
 node tools/cross-review.sync.js --check    # ドリフト検査のみ（書き込まない。差分があれば exit 1）
 node tools/cross-review.sync.js --dry-run  # 何が変わるかだけ表示（書き込まない）
 node tools/cross-review.sync.js --ref v1.2.3   # 取り込むバージョンをマニフェストより優先
-node tools/cross-review.sync.js --check-manifest  # 配布物の取りこぼし確認（--check を含意。書き込まない）
+node tools/cross-review.sync.js --check-manifest  # 未登録配布物と古い除外の確認（--check を含意。書き込まない）
 ```
 
 > 取り込み元の取得は git のネットワークアクセスを使います。  
