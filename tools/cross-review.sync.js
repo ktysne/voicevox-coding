@@ -19,7 +19,7 @@
 // - 依存パッケージを追加しない (Node 標準 API のみ、CommonJS)。cross-review.js と同じ方針。
 // - 上流の取得は git のみで行う。ref (ブランチ / タグ / コミット SHA) を一時ディレクトリへ
 //   shallow fetch し、そこからファイルをコピーする。取得した実コミットをマニフェストの
-//   lastSyncedCommit に記録し、どの版から取り込んだかを履歴に残す。
+//   lastSyncedCommit に記録し、どのコミットから取り込んだかを履歴に残す。
 // - どのファイルをどこへ取り込むかは cross-review.sync.json (マニフェスト) が単一ソース。
 //   取り込み先のディレクトリ構成が上流と違っても from / to で対応付ける。テストの require パス等は
 //   replace で機械置換する (上流側を書き換えない)。
@@ -311,7 +311,7 @@ function computeSyncPlan(manifest, upstreamDir, destRoot, deps = {}) {
 }
 
 // 移行ノート先頭の YAML 風フロントマター (--- で囲んだ since: <上流 SHA> の 1 行) を読む。
-// since は「このノートが対象とする上流の版」を人が追うための情報で、未読判定には使わない
+// since は「このノートが対象とする上流のバージョン」を人が追うための情報で、未読判定には使わない
 // (shallow fetch では SHA の祖先関係を判定できないため)。
 // 想定した形でなければ { ok: false, reason } を返し、呼び出し側がそのノートをスキップする。
 function parseMigrationFrontMatter(raw) {
@@ -607,7 +607,7 @@ function runSync(opts, deps = {}) {
       writeFile(p.destAbs, p.expected);
       wrote.push(p.to);
     }
-    // 取り込み元コミットと表示済み移行ノートを記録し、どの版から取り込んだかを履歴に残す。記録値
+    // 取り込み元コミットと表示済み移行ノートを記録し、どのコミットから取り込んだかを履歴に残す。記録値
     // (commit / ref / shownMigrations) が変わるときだけ書き戻す。同一コミットの再同期では、ユーザが
     // 手で整形したマニフェストを毎回上書きしない (不要な差分、整形崩れを防ぐ)。上流が進めば取り込み
     // ファイルが一致でも記録は更新する。

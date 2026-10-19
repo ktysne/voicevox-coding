@@ -2047,7 +2047,7 @@ function codexAgentInvocation(script, opts, deps = {}) {
   if (def && def.error) {
     return { error: `定義 ${agentName} を読めないため起動しません (${def.error}): ${def.path}` };
   }
-  // <cwd> 側を優先して読む旧版の bridge は、この定義の codex_home と codex_sandbox で起動するため渡さない。
+  // <cwd> 側を優先して読む古いバージョンの bridge は、この定義の codex_home と codex_sandbox で起動するため渡さない。
   if (def && def.projectOnly) {
     warn(`[cross-review] ホーム側に定義 ${agentName} が無く、作業ディレクトリ側の定義だけがあるため直接起動へ切り替えます: ${def.path}\n`);
     return null;
@@ -2214,12 +2214,13 @@ function createStreamCollector() {
 // onExit は終了時に 1 回だけ { code, outputTail, output, truncated, error } で呼ぶ
 // (runReview が outputTail を終了分類に、output を `.cross-review/` への保存に使い、
 //  truncated なら保存本文の先頭へ切り詰めの注記を足す)。
-function spawnReviewer(cmd, args, stdinText, onExit) {
+function spawnReviewer(cmd, args, stdinText, onExit, environment = process.env) {
   const resolved = resolveReviewerCommandForSpawn(cmd);
   const child = spawn(resolved.cmd, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
     // Windows では .cmd/.bat shim のことがあるため、その場合だけ shell 経由にする。
     shell: resolved.shell,
+    env: environment,
   });
   // 転送側は Buffer のまま書いてバイト列を保ち、保持側は収集器 (StringDecoder) に任せる。
   // stdout と stderr は別々にデコードする (混ぜると片方の未完成バイト列がもう片方の先頭に
@@ -2609,6 +2610,9 @@ function runReview(opts, deps = {}) {
   // 起動を関数にするのは、bridge 未導入のときに同じプロンプトで直接起動をやり直すため。
   const start = (invocation) => {
     writeOut(invocation.notice);
+    const reviewerEnvironment = resolvedOpts.reviewer === 'claude'
+      ? { ...process.env, AGENT_COCKPIT_NONINTERACTIVE: '1' }
+      : process.env;
     return spawnFn(invocation.cmd, invocation.args, prompt, (result) => {
       const exit = result || {};
       // bridge が未導入 (codex コマンドや定義が無い)、または bash 自体が無い場合は直接起動へ戻す。
@@ -2651,7 +2655,7 @@ function runReview(opts, deps = {}) {
         pid: deps.pid,
         cause: classification.cause,
       });
-    });
+    }, reviewerEnvironment);
   };
   return start(inv);
 }
