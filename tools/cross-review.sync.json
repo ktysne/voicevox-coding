@@ -3,7 +3,7 @@
     "repo": "https://github.com/ktysne/ai-cross-review.git",
     "ref": "main"
   },
-  "lastSyncedCommit": "f3730f9763de3e1debdef3143a944c3f2280d9c5",
+  "lastSyncedCommit": "5e38af14bd86ad80a36608870e0814129648038e",
   "lastSyncedRef": "main",
   "excludedFiles": [
     "tests/cross-review.test.js",
