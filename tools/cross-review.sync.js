@@ -9,7 +9,7 @@
 //   node tools/cross-review.sync.js                 # マニフェストに従い上流から取り込む (コピー)
 //   node tools/cross-review.sync.js --check         # ドリフト検査のみ (書き込まない。差分があれば exit 1)
 //   node tools/cross-review.sync.js --dry-run       # 書き込まず、何が変わるかだけ表示
-//   node tools/cross-review.sync.js --check-manifest # 上流の雛形にあって files[] に無い配布物を列挙 (--check を含意。書き込まない)
+//   node tools/cross-review.sync.js --check-manifest # files[] と excludedFiles[] を照合 (--check を含意。書き込まない)
 //   node tools/cross-review.sync.js --ref <ref>     # 取り込む上流の ref をマニフェストより優先
 //   node tools/cross-review.sync.js --manifest <p>  # マニフェストの場所を指定 (既定: スクリプト隣の cross-review.sync.json)
 //   node tools/cross-review.sync.js --root <p>      # 取り込み先プロジェクトのルートを指定 (既定: tools/ の 1 つ上)
@@ -25,10 +25,8 @@
 //   replace で機械置換する (上流側を書き換えない)。
 // - --check は書き込まず、上流 (ref) と取り込み先の差分 (ドリフト) だけを報告する。
 //   差分があれば exit 1 にして CI で検知できるようにする (取り込み先の docs:check 相当のドリフト検知)。
-// - --check-manifest は、上流の雛形 (tools/cross-review.sync.example.json = 配布物一式の正本) にあって
-//   取り込み先のマニフェストの files[] に無いエントリを列挙する。上流が配り始めたファイルの取りこぼしを
-//   知らせるだけで、マニフェストは書き換えない (何を取り込むかは取り込み先の判断であるため)。
-//   同じ理由で、未登録があってもドリフトではないので exit 1 にしない。
+// - --check-manifest は、上流の雛形と files[] / excludedFiles[] を照合して未登録を列挙し、古い除外を警告する。
+//   マニフェストは書き換えず、未登録や古い除外もドリフトではないため exit 1 にしない。
 //   単独指定でも書き込みを起こさないよう、parseArgs で --check を含意させる (列挙するだけの検査という
 //   案内どおりに振る舞わせるため)。ドリフトがあれば --check と同じく exit 1 になる。
 //   雛形が無い / 読めない / 構造が不正なときは警告して検査だけスキップし、同期そのものは止めない。
@@ -50,8 +48,7 @@ const path = require('path');
 const DEFAULT_MANIFEST_FILENAME = 'cross-review.sync.json';
 // 上流の移行ノートの置き場 (上流ルートからの相対)。マニフェストの migrationsDir で上書きできる。
 const DEFAULT_MIGRATIONS_DIR = 'docs/migrations';
-// 上流にある配布物一式の雛形 (上流ルートからの相対)。--check-manifest はこの files[] を正本として、
-// 取り込み先のマニフェストに無いエントリを探す。
+// 上流にある配布物一式の雛形 (上流ルートからの相対)。--check-manifest は files[] と excludedFiles[] を照合する。
 const UPSTREAM_EXAMPLE_MANIFEST = 'tools/cross-review.sync.example.json';
 
 const USAGE = [
@@ -61,7 +58,7 @@ const USAGE = [
   '',
   'options:',
   '  --check           ドリフト検査のみ。書き込まず、上流 (ref) との差分があれば exit 1',
-  '  --check-manifest  上流の雛形にあって files[] に無い配布物を列挙する (--check を含意。書き込まない)',
+  '  --check-manifest  files[] と excludedFiles[] を照合し、未登録と古い除外を表示する (--check を含意。書き込まない)',
   '  --dry-run         書き込まず、同期で何が変わるかだけ表示する',
   '  --ref <ref>       取り込む上流の ref をマニフェストより優先 (ブランチ / タグ / コミット)',
   '  --manifest <path> マニフェストの場所を指定 (既定: スクリプト隣の cross-review.sync.json)',
@@ -73,6 +70,7 @@ const USAGE = [
   '    "upstream": { "repo": "https://github.com/ktysne/ai-cross-review.git", "ref": "main" },',
   '    "lastSyncedCommit": null,',
   '    "shownMigrations": [],',
+  '    "excludedFiles": [],',
   '    "files": [',
   '      { "from": "tools/cross-review.js", "to": "tools/cross-review.js" },',
   '      { "from": "tests/cross-review.test.js", "to": "tests/tools/cross-review.test.js",',
@@ -83,8 +81,9 @@ const USAGE = [
   'shownMigrations には、上流の移行ノート (docs/migrations/*.md) のうち表示済みのファイル名が記録される。',
   '記録に無いノートは同期時に stderr へ全文表示される (取り込み先で必要な手作業の案内)。',
   '',
-  '--check-manifest は上流の tools/cross-review.sync.example.json (配布物一式の正本) と files[] を突き合わせ、',
-  '未登録のエントリを列挙する。足すかどうかは取り込み先の判断なので、マニフェストは書き換えない。',
+  'excludedFiles には、意図して取り込まない配布物の上流相対パスを文字列で指定する。',
+  '--check-manifest は上流の tools/cross-review.sync.example.json (配布物一式の正本) と files[] / excludedFiles[] を照合し、',
+  '未登録を列挙する。雛形にない除外は stderr に警告し、何を取り込むかは取り込み先の判断なのでマニフェストは書き換えない。',
   '列挙するだけの検査なので --check を含意し、単独指定でも書き込みは起きない (ドリフトがあれば exit 1。',
   '未登録があっても exit 1 にはしない)。',
   '',
@@ -150,7 +149,7 @@ function parseArgs(argv) {
 
 // マニフェストを読み込み JSON として解釈する。読めない / JSON でないときは例外を投げる。
 // deps.readFile / deps.exists でテストから差し替え可能。
-function loadManifest(manifestPath, deps = {}) {
+function loadManifestData(manifestPath, deps = {}) {
   const readFile = deps.readFile || ((p) => fs.readFileSync(p, 'utf8'));
   const exists = deps.exists || ((p) => fs.existsSync(p));
   if (!exists(manifestPath)) {
@@ -163,10 +162,14 @@ function loadManifest(manifestPath, deps = {}) {
     throw new Error(`マニフェストを読めません: ${manifestPath} (${(err && err.message) || 'read error'})`);
   }
   try {
-    return JSON.parse(raw);
+    return { manifest: JSON.parse(raw), raw };
   } catch (err) {
     throw new Error(`マニフェストが JSON として不正です: ${manifestPath} (${(err && err.message) || 'parse error'})`);
   }
+}
+
+function loadManifest(manifestPath, deps = {}) {
+  return loadManifestData(manifestPath, deps).manifest;
 }
 
 // マニフェストの形を検証する。問題があれば分かりやすい日本語メッセージで例外を投げる。
@@ -198,6 +201,10 @@ function validateManifest(manifest, refOverride) {
   }
   if (!Array.isArray(manifest.files) || manifest.files.length === 0) {
     throw new Error('マニフェストの files に取り込むファイルを 1 つ以上指定してください');
+  }
+  if (manifest.excludedFiles != null
+      && (!Array.isArray(manifest.excludedFiles) || manifest.excludedFiles.some((file) => typeof file !== 'string'))) {
+    throw new Error('excludedFiles は上流相対パス (文字列) の配列である必要があります');
   }
   if (manifest.shownMigrations != null) {
     if (!Array.isArray(manifest.shownMigrations)
@@ -442,9 +449,22 @@ function findMissingManifestEntries(exampleManifest, localManifest) {
   const registered = new Set(
     localFiles.filter((e) => e && typeof e.from === 'string').map((e) => e.from),
   );
+  const excluded = new Set(
+    localManifest && Array.isArray(localManifest.excludedFiles) ? localManifest.excludedFiles : [],
+  );
   return exampleFiles
-    .filter((e) => e && typeof e.from === 'string' && !registered.has(e.from))
+    .filter((e) => e && typeof e.from === 'string' && !registered.has(e.from) && !excluded.has(e.from))
     .map((e) => ({ from: e.from, to: typeof e.to === 'string' ? e.to : e.from }));
+}
+
+// excludedFiles のうち、上流の雛形の files[] に無くなった from を返す純粋関数。
+function findStaleExcludedFiles(exampleManifest, localManifest) {
+  const exampleFiles = exampleManifest && Array.isArray(exampleManifest.files) ? exampleManifest.files : [];
+  const excludedFiles = localManifest && Array.isArray(localManifest.excludedFiles) ? localManifest.excludedFiles : [];
+  const upstreamFiles = new Set(
+    exampleFiles.filter((e) => e && typeof e.from === 'string').map((e) => e.from),
+  );
+  return excludedFiles.filter((from) => typeof from === 'string' && !upstreamFiles.has(from));
 }
 
 // 雛形マニフェストが配布物の正本として使える形かを判定する。
@@ -457,25 +477,34 @@ function isUsableExampleManifest(example) {
 }
 
 // 上流の雛形マニフェストを読み、未登録エントリを求める。
-// 戻り値: { entries, warning }。上流に雛形が無い / 読めない / JSON として不正 / 構造が不正なときは
+// 戻り値: { entries, excludedEntries, staleExcludedFiles, warning }。上流に雛形が無い / 読めない / JSON として不正 / 構造が不正なときは
 // entries を空にし、warning に理由を入れて検査をスキップする (雛形を持たない古い ref でも同期そのものは通す)。
 function collectMissingManifestEntries(upstreamDir, manifest, deps = {}) {
   const readFile = deps.readFile || ((p) => fs.readFileSync(p, 'utf8'));
   const exists = deps.exists || ((p) => fs.existsSync(p));
   const examplePath = path.resolve(upstreamDir, UPSTREAM_EXAMPLE_MANIFEST);
   if (!exists(examplePath)) {
-    return { entries: [], warning: `上流に配布物の雛形 (${UPSTREAM_EXAMPLE_MANIFEST}) が無いため、マニフェスト検査をスキップします` };
+    return { entries: [], excludedEntries: [], staleExcludedFiles: [], warning: `上流に配布物の雛形 (${UPSTREAM_EXAMPLE_MANIFEST}) が無いため、マニフェスト検査をスキップします` };
   }
   let example;
   try {
     example = JSON.parse(readFile(examplePath));
   } catch (err) {
-    return { entries: [], warning: `上流の配布物の雛形を読めません: ${UPSTREAM_EXAMPLE_MANIFEST} (${(err && err.message) || 'read error'})` };
+    return { entries: [], excludedEntries: [], staleExcludedFiles: [], warning: `上流の配布物の雛形を読めません: ${UPSTREAM_EXAMPLE_MANIFEST} (${(err && err.message) || 'read error'})` };
   }
   if (!isUsableExampleManifest(example)) {
-    return { entries: [], warning: `上流の配布物の雛形の構造が不正です (${UPSTREAM_EXAMPLE_MANIFEST} の files[] に from を持つエントリがありません)。マニフェスト検査をスキップします` };
+    return { entries: [], excludedEntries: [], staleExcludedFiles: [], warning: `上流の配布物の雛形の構造が不正です (${UPSTREAM_EXAMPLE_MANIFEST} の files[] に from を持つエントリがありません)。マニフェスト検査をスキップします` };
   }
-  return { entries: findMissingManifestEntries(example, manifest), warning: null };
+  const excludedFiles = new Set(Array.isArray(manifest && manifest.excludedFiles) ? manifest.excludedFiles : []);
+  const excludedEntries = example.files
+    .filter((e) => e && typeof e.from === 'string' && excludedFiles.has(e.from))
+    .map((e) => ({ from: e.from, to: typeof e.to === 'string' ? e.to : e.from }));
+  return {
+    entries: findMissingManifestEntries(example, manifest),
+    excludedEntries,
+    staleExcludedFiles: findStaleExcludedFiles(example, manifest),
+    warning: null,
+  };
 }
 
 // 未登録の配布物を人が読む形に整える (stdout 向け)。
@@ -489,9 +518,9 @@ function formatMissingManifestEntries(entries) {
 const STATUS_LABEL = { create: '新規', update: '更新', unchanged: '一致' };
 
 // 同期 / 検査を実行する本体。副作用は deps で差し替え可能。
-// 戻り値: { ref, commit, results, drift, wrote, migrations, missingManifestEntries } (テストから検証する)。
-// migrations は今回表示した未読移行ノートのファイル名、missingManifestEntries は --check-manifest で
-// 見つかった未登録の配布物 (指定しなければ空配列)。process.exitCode も設定する。
+// 戻り値: { ref, commit, results, drift, wrote, migrations, missingManifestEntries, excludedManifestEntries, staleExcludedFiles }。
+// migrations は今回表示した未読移行ノート、missingManifestEntries と excludedManifestEntries は
+// --check-manifest の結果 (指定しなければ空配列)。process.exitCode も設定する。
 function runSync(opts, deps = {}) {
   const writeOut = deps.out || ((s) => process.stdout.write(s));
   const writeErr = deps.err || ((s) => process.stderr.write(s));
@@ -508,8 +537,11 @@ function runSync(opts, deps = {}) {
   const destRoot = opts.root ? path.resolve(opts.root) : path.resolve(scriptDir, '..');
 
   let manifest;
+  let manifestRaw;
   try {
-    manifest = loadManifest(manifestPath, { readFile, exists });
+    const loaded = loadManifestData(manifestPath, { readFile, exists });
+    manifest = loaded.manifest;
+    manifestRaw = loaded.raw;
     validateManifest(manifest, opts.ref);
   } catch (err) {
     writeErr(`${(err && err.message) || 'マニフェストの読み込みに失敗しました'}\n`);
@@ -556,25 +588,32 @@ function runSync(opts, deps = {}) {
     const unread = selection ? selection.toShow : [];
     const migrations = unread.map((n) => n.name);
 
-    // マニフェスト検査 (--check-manifest)。上流が配り始めた配布物の取りこぼしを知らせるだけで、
-    // マニフェストは書き換えず、終了コードにも影響させない (足すかどうかは取り込み先の判断であるため)。
+    // --check-manifest は未登録と有効な除外を表示し、雛形にない除外を警告する。
+    // マニフェストは書き換えず、未登録や古い除外は終了コードに影響しない。
     // 検査をスキップした理由 (雛形の不在、読めない、構造不正) は manifestCheckWarning として戻り値にも
     // 載せる。stderr の警告は一括同期 (sync-all) では流れて見落とすので、呼び出し側が「未登録 0 件」と
     // 「そもそも検査できていない」を区別できるようにするため。
     let missingManifestEntries = [];
+    let excludedManifestEntries = [];
+    let staleExcludedFiles = [];
     let manifestCheckWarning = null;
     let manifestChecked = false;
     if (opts.checkManifest) {
-      let missing = { entries: [], warning: null };
+      let missing = { entries: [], excludedEntries: [], staleExcludedFiles: [], warning: null };
       try {
         missing = collectMissingManifestEntries(upstream.dir, manifest, { readFile, exists });
       } catch (err) {
-        missing = { entries: [], warning: `マニフェスト検査に失敗しました: ${(err && err.message) || 'read error'}` };
+        missing = { entries: [], excludedEntries: [], staleExcludedFiles: [], warning: `マニフェスト検査に失敗しました: ${(err && err.message) || 'read error'}` };
       }
       if (missing.warning) writeErr(`[cross-review] ${missing.warning}\n`);
+      for (const from of missing.staleExcludedFiles) {
+        writeErr(`[cross-review] 除外対象が上流の雛形にありません: ${from}\n`);
+      }
       manifestCheckWarning = missing.warning || null;
       manifestChecked = !missing.warning;
       missingManifestEntries = missing.entries;
+      excludedManifestEntries = missing.excludedEntries;
+      staleExcludedFiles = missing.staleExcludedFiles;
     }
 
     writeOut(`上流: ${manifest.upstream.repo} @ ${ref} (${upstream.commit})\n`);
@@ -583,8 +622,10 @@ function runSync(opts, deps = {}) {
     }
     if (missingManifestEntries.length) {
       writeOut(formatMissingManifestEntries(missingManifestEntries));
+      if (excludedManifestEntries.length) writeOut(`excludedFiles で除外した配布物: ${excludedManifestEntries.length} 件 (未登録には数えていません)\n`);
     } else if (manifestChecked) {
-      writeOut('マニフェスト未登録の配布物はありません (上流の雛形と一致)。\n');
+      const excludedLabel = excludedManifestEntries.length ? `、除外 ${excludedManifestEntries.length} 件` : '';
+      writeOut(`マニフェスト未登録の配布物はありません (上流の雛形と一致${excludedLabel})。\n`);
     }
 
     // --check は --dry-run より優先する (ここで先に return する)。両方指定すると検査として振る舞い、
@@ -602,7 +643,7 @@ function runSync(opts, deps = {}) {
       } else {
         writeOut('ドリフトはありません (上流と一致)。\n');
       }
-      return { ref, commit: upstream.commit, results, drift, wrote, migrations, missingManifestEntries, manifestCheckWarning };
+      return { ref, commit: upstream.commit, results, drift, wrote, migrations, missingManifestEntries, excludedManifestEntries, staleExcludedFiles, manifestCheckWarning };
     }
 
     // 未読の移行ノートを全文表示する。dry-run でも表示はするが、記録 (shownMigrations) は残さない
@@ -611,7 +652,7 @@ function runSync(opts, deps = {}) {
 
     if (opts.dryRun) {
       writeOut(drift ? `dry-run: ${changed.length} 件を更新します (書き込みはしていません)。\n` : 'dry-run: 変更はありません。\n');
-      return { ref, commit: upstream.commit, results, drift, wrote, migrations, missingManifestEntries, manifestCheckWarning };
+      return { ref, commit: upstream.commit, results, drift, wrote, migrations, missingManifestEntries, excludedManifestEntries, staleExcludedFiles, manifestCheckWarning };
     }
 
     // 同期 (コピー): 差分のあるファイルだけ書き込む。
@@ -629,11 +670,11 @@ function runSync(opts, deps = {}) {
       manifest.lastSyncedCommit = upstream.commit;
       manifest.lastSyncedRef = ref;
       if (selection) manifest.shownMigrations = selection.nextShown;
-      writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+      writeFile(manifestPath, matchEol(`${JSON.stringify(manifest, null, 2)}\n`, manifestRaw));
     }
 
     writeOut(wrote.length ? `同期しました (${wrote.length} 件を更新)。\n` : '同期しました (変更なし)。\n');
-    return { ref, commit: upstream.commit, results, drift, wrote, migrations, missingManifestEntries, manifestCheckWarning };
+    return { ref, commit: upstream.commit, results, drift, wrote, migrations, missingManifestEntries, excludedManifestEntries, staleExcludedFiles, manifestCheckWarning };
   } finally {
     if (upstream && typeof upstream.cleanup === 'function') {
       try { upstream.cleanup(); } catch { /* 一時ディレクトリ削除の失敗は無視する */ }
@@ -668,6 +709,7 @@ module.exports = {
   shownMigrationsChanged,
   formatMigrationNotes,
   findMissingManifestEntries,
+  findStaleExcludedFiles,
   collectMissingManifestEntries,
   formatMissingManifestEntries,
   runSync,
