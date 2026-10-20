@@ -47,13 +47,13 @@ Codex の登録状態を確かめるときは、Codex Desktop 内ではなく通
 
 ## ai-cross-review の取り込み
 
-ai-cross-review から取り込んだファイルは、上流への変更を `tools/cross-review.sync.js` で同期する。
+ai-cross-review から取り込んだファイルは、上流への変更を `node tools/cross-review.js sync` で同期する。
 同期後は、表示された移行ノートを反映してから検証する。
 
 ```bash
 npm run sync
 npm run sync:check
-node tools/cross-review.sync.js --check-manifest
+node tools/cross-review.js sync --check-manifest
 ```
 
 ## 開発時の注意

@@ -3,28 +3,20 @@
     "repo": "https://github.com/ktysne/ai-cross-review.git",
     "ref": "main"
   },
-  "lastSyncedCommit": "d6e618a39c9d57545de2e335862988334d29e00d",
+  "lastSyncedCommit": "3cbb4f2096599e43143e99b0f338c7bf45002c02",
   "lastSyncedRef": "main",
-  "excludedFiles": [
-    "tests/cross-review.test.js",
-    "tests/cross-review.sync.test.js",
-    "tests/cross-review.sync-all.test.js"
-  ],
+  "excludedFiles": [],
   "files": [
     {
-      "from": "tools/cross-review.js",
+      "from": "tools/cross-review.entry.js",
       "to": "tools/cross-review.js"
     },
     {
-      "from": "tools/cross-review.sync.js",
-      "to": "tools/cross-review.sync.js"
+      "from": "tools/cross-review.sync.example.json",
+      "to": "tools/cross-review.sync.example.json"
     },
     {
-      "from": "tools/cross-review.sync-all.js",
-      "to": "tools/cross-review.sync-all.js"
-    },
-    {
-      "from": "docs/cross-review.md",
+      "from": "templates/docs/cross-review.md",
       "to": "docs/cross-review.md"
     },
     {
@@ -32,7 +24,7 @@
       "to": ".cross-review.example.md"
     },
     {
-      "from": ".claude/skills/cross-review/SKILL.md",
+      "from": "templates/cloud-skill/SKILL.md",
       "to": ".claude/skills/cross-review/SKILL.md"
     }
   ],
@@ -43,6 +35,10 @@
     "2026-09-phase4-pr-comment.md",
     "2026-09-phase5-global-skill-and-manifest-check.md",
     "2026-09-global-skill-codex-subagent.md",
-    "2026-09-review-choice-control.md"
+    "2026-09-review-choice-control.md",
+    "2026-10-bridge-describe.md",
+    "2026-10-engine-entry.md",
+    "2026-10-global-skill-check.md",
+    "2026-10-state-contract.md"
   ]
 }
