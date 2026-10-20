@@ -12,6 +12,10 @@
       "to": "tools/cross-review.js"
     },
     {
+      "from": "tools/cross-review.sync.example.json",
+      "to": "tools/cross-review.sync.example.json"
+    },
+    {
       "from": "templates/docs/cross-review.md",
       "to": "docs/cross-review.md"
     },
