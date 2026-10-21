@@ -9,21 +9,21 @@ import { spawn, execFile } from 'node:child_process';
 import { CONFIG_DIR } from './config.js';
 
 const PID_PATH = path.join(CONFIG_DIR, 'engine.pid');
+const ENGINE_REL_PATH = path.join('VOICEVOX', 'vv-engine', 'run.exe');
 
-/** 既知のインストール先候補。上から順に探す。 */
+/** 利用者本人か管理者だけが書ける既知のインストール先。自動起動でも使う。 */
 function candidatePaths() {
-  const rel = path.join('VOICEVOX', 'vv-engine', 'run.exe');
-  const list = [
-    path.join(process.env.LOCALAPPDATA ?? '', 'Programs', rel),
-    path.join(process.env.PROGRAMFILES ?? '', 'VOICEVOX', 'vv-engine', 'run.exe'),
-    path.join(process.env['PROGRAMFILES(X86)'] ?? '', 'VOICEVOX', 'vv-engine', 'run.exe'),
-    path.join(os.homedir(), 'AppData', 'Local', 'Programs', rel),
-  ];
-  // ドライブ直下の VOICEVOX（インストーラで場所を変えた場合によくある）
-  for (const drive of ['C', 'D', 'E', 'F', 'G']) {
-    list.push(path.join(`${drive}:\\`, rel));
-  }
-  return list;
+  return [
+    process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', ENGINE_REL_PATH),
+    path.join(os.homedir(), 'AppData', 'Local', 'Programs', ENGINE_REL_PATH),
+    process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, ENGINE_REL_PATH),
+    process.env['PROGRAMFILES(X86)'] && path.join(process.env['PROGRAMFILES(X86)'], ENGINE_REL_PATH),
+  ].filter(Boolean);
+}
+
+/** 他の OS ユーザーやリムーバブルメディアが書けうるため、自動起動では使わない。 */
+function driveRootCandidatePaths() {
+  return ['C', 'D', 'E', 'F', 'G'].map((drive) => path.join(`${drive}:\\`, ENGINE_REL_PATH));
 }
 
 function runPowerShell(script) {
@@ -37,11 +37,31 @@ function runPowerShell(script) {
   });
 }
 
+async function registryCandidatePaths() {
+  const fromRegistry = await runPowerShell(
+    "(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*', " +
+      "'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | " +
+      "Where-Object { $_.DisplayName -like '*VOICEVOX*' } | " +
+      'Select-Object -ExpandProperty InstallLocation -First 3) -join "`n"',
+  );
+  return fromRegistry
+    .split('\n')
+    .map((dir) => dir.trim())
+    .filter(Boolean)
+    .map((dir) => path.join(dir, 'vv-engine', 'run.exe'));
+}
+
+function firstExistingPath(paths) {
+  for (const candidate of paths) {
+    if (candidate && fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
 /**
- * エンジンの実行ファイルを探す。
- * 1) 起動中の run.exe / VOICEVOX.exe のパスから逆引き（最も確実）
- * 2) レジストリのアンインストール情報
- * 3) 既知のインストール先候補
+ * 管理画面で利用者が確認して保存するエンジン実行ファイルを探す。
+ * 起動中プロセス、レジストリ、既知の候補、ドライブ直下の順に確認する。
+ * 書き込める者を限定できない場所も含むため、自動起動では使わない。
  */
 export async function detectEnginePath() {
   const fromProcess = await runPowerShell(
@@ -55,22 +75,19 @@ export async function detectEnginePath() {
     if (fs.existsSync(guess)) return guess;
   }
 
-  for (const p of candidatePaths()) {
-    if (p && fs.existsSync(p)) return p;
-  }
+  const fromRegistry = firstExistingPath(await registryCandidatePaths());
+  if (fromRegistry) return fromRegistry;
 
-  const fromRegistry = await runPowerShell(
-    "(Get-ItemProperty 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*', " +
-      "'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*' -ErrorAction SilentlyContinue | " +
-      "Where-Object { $_.DisplayName -like '*VOICEVOX*' } | " +
-      'Select-Object -ExpandProperty InstallLocation -First 3) -join "`n"',
-  );
-  for (const dir of fromRegistry.split('\n').map((s) => s.trim()).filter(Boolean)) {
-    const p = path.join(dir, 'vv-engine', 'run.exe');
-    if (fs.existsSync(p)) return p;
-  }
+  const fromKnownLocation = firstExistingPath(candidatePaths());
+  if (fromKnownLocation) return fromKnownLocation;
 
-  return null;
+  return firstExistingPath(driveRootCandidatePaths());
+}
+
+async function detectAutoStartEnginePath() {
+  const fromRegistry = firstExistingPath(await registryCandidatePaths());
+  if (fromRegistry) return fromRegistry;
+  return firstExistingPath(candidatePaths());
 }
 
 function readPid() {
@@ -178,8 +195,13 @@ export class EngineProcess {
 
       const cfg = this.getConfig().engine;
       let exe = cfg.enginePath;
-      if (!exe || !fs.existsSync(exe)) {
-        exe = await detectEnginePath();
+      if (exe && !fs.existsSync(exe)) {
+        const error = `設定したエンジンのパスが見つかりません: ${exe}。管理コンソールでパスを指定し直してください。`;
+        this.log?.error(error);
+        return { started: false, error };
+      }
+      if (!exe) {
+        exe = await detectAutoStartEnginePath();
         if (exe) this.log?.info(`エンジンを検出しました: ${exe}`);
       }
       if (!exe) {
