@@ -3,8 +3,189 @@
 
 const FENCED_CODE = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
 const INDENTED_CODE = /^(?: {4}|\t).+$/gm;
-const THINKING = /<(thinking|antml:thinking)>[\s\S]*?<\/\1>/gi;
-const HTML_TAG = /<\/?[a-zA-Z][^>]*>/g;
+const THINKING = /<(thinking|antml:thinking)>/gi;
+const HTML_TAG = /<\/?[a-zA-Z]/g;
+// 本文は認証の無い入口から届く。読み上げとして意味のある長さを超える部分は、正規表現を当てる前に捨てる。
+const MAX_INPUT_CHARS = 50_000;
+const WHITESPACE = /\s/;
+const LINE_TERMINATOR = /[\r\n\u2028\u2029]/;
+
+// 以下の置換は、閉じ記号の位置を先に求めて使い回す。開き記号ごとに末尾まで探し直すと、
+// 閉じない開き記号が続く入力で入力長の二乗になるため。
+function replaceThinking(text) {
+  const closes = { thinking: [], 'antml:thinking': [] };
+  for (const m of text.matchAll(/<\/(thinking|antml:thinking)>/gi)) {
+    closes[m[1].toLowerCase()].push({ start: m.index, end: m.index + m[0].length });
+  }
+  const cursors = { thinking: 0, 'antml:thinking': 0 };
+  const parts = [];
+  let last = 0;
+  THINKING.lastIndex = 0;
+  let m;
+  while ((m = THINKING.exec(text))) {
+    const tag = m[1].toLowerCase();
+    const ends = closes[tag];
+    while (cursors[tag] < ends.length && ends[cursors[tag]].start < THINKING.lastIndex) cursors[tag]++;
+    const close = ends[cursors[tag]];
+    if (!close) continue;
+    parts.push(text.slice(last, m.index), ' ');
+    last = close.end;
+    THINKING.lastIndex = last;
+  }
+  return parts.join('') + text.slice(last);
+}
+
+// replaceThinking と同じ順で開きタグと閉じタグを対応させ、最初に閉じないブロックの閉じタグを返す。
+function danglingThinkingCloser(text) {
+  const closes = /<\/(thinking|antml:thinking)>/gi;
+  THINKING.lastIndex = 0;
+  let m;
+  while ((m = THINKING.exec(text))) {
+    const tag = m[1].toLowerCase();
+    closes.lastIndex = THINKING.lastIndex;
+    let close;
+    while ((close = closes.exec(text)) && close[1].toLowerCase() !== tag);
+    if (!close) return `</${tag}>`;
+    THINKING.lastIndex = closes.lastIndex;
+  }
+  return '';
+}
+
+// FENCED_CODE と同じ順で囲みを対応させ、最初に閉じない囲みの閉じ記号を返す。
+function danglingFenceCloser(text) {
+  let pos = 0;
+  for (;;) {
+    const backtick = text.indexOf('```', pos);
+    const tilde = text.indexOf('~~~', pos);
+    if (backtick < 0 && tilde < 0) return '';
+    const open = tilde < 0 || (backtick >= 0 && backtick < tilde) ? backtick : tilde;
+    const fence = text.slice(open, open + 3);
+    const close = text.indexOf(fence, open + 3);
+    if (close < 0) return `\n${fence}`;
+    pos = close + 3;
+  }
+}
+
+function replaceMarkdownLinks(text, pattern, image) {
+  const parts = [];
+  let last = 0;
+  let bracket = -1;
+  let close = -1;
+  pattern.lastIndex = 0;
+  let m;
+  while ((m = pattern.exec(text))) {
+    const labelStart = pattern.lastIndex;
+    if (bracket < labelStart) bracket = text.indexOf(']', labelStart);
+    if (bracket < 0) break;
+    if (text[bracket + 1] !== '(') {
+      pattern.lastIndex = bracket + 1;
+      continue;
+    }
+    if (close < bracket + 2) close = text.indexOf(')', bracket + 2);
+    if (close < 0) break;
+    parts.push(text.slice(last, m.index), image ? ' ' : text.slice(labelStart, bracket) + ' ');
+    last = close + 1;
+    pattern.lastIndex = last;
+  }
+  return parts.join('') + text.slice(last);
+}
+
+function replaceEmphasis(text) {
+  const ends = { '**': [], '__': [], '*': [], '_': [], '~~': [] };
+  const cursors = { '**': 0, '__': 0, '*': 0, '_': 0, '~~': 0 };
+  for (let i = 1; i < text.length; i++) {
+    if (WHITESPACE.test(text[i - 1])) continue;
+    const one = text[i];
+    const two = text.slice(i, i + 2);
+    if (ends[one]) ends[one].push(i);
+    if (ends[two]) ends[two].push(i);
+  }
+  const parts = [];
+  let last = 0;
+  MD_EMPHASIS.lastIndex = 0;
+  let m;
+  while ((m = MD_EMPHASIS.exec(text))) {
+    const choices = m[0] === '**' || m[0] === '__' ? [m[0], m[0][0]] : [m[0]];
+    for (const delimiter of choices) {
+      const bodyStart = m.index + delimiter.length;
+      if (bodyStart >= text.length || WHITESPACE.test(text[bodyStart])) continue;
+      const positions = ends[delimiter];
+      while (cursors[delimiter] < positions.length && positions[cursors[delimiter]] <= bodyStart) cursors[delimiter]++;
+      const end = positions[cursors[delimiter]];
+      if (end === undefined) continue;
+      parts.push(text.slice(last, m.index), text.slice(bodyStart, end));
+      last = end + delimiter.length;
+      MD_EMPHASIS.lastIndex = last;
+      break;
+    }
+    // 二重記号が失敗した場合は、次の文字からの単独記号の一致も試す。
+    if (last <= m.index) MD_EMPHASIS.lastIndex = m.index + 1;
+  }
+  return parts.join('') + text.slice(last);
+}
+
+function replaceHtmlTags(text) {
+  let close = -1;
+  let last = 0;
+  const parts = [];
+  HTML_TAG.lastIndex = 0;
+  let m;
+  while ((m = HTML_TAG.exec(text))) {
+    if (close < m.index) close = text.indexOf('>', m.index + m[0].length);
+    if (close < 0) break;
+    parts.push(text.slice(last, m.index), ' ');
+    last = close + 1;
+    HTML_TAG.lastIndex = last;
+  }
+  return parts.join('') + text.slice(last);
+}
+
+// 空行をまたぐ空白の一致を保ち、同じ空白列からの失敗を繰り返さない。
+function replaceWhitespacePrefixedLines(text, pattern, replacement) {
+  const parts = [];
+  let last = 0;
+  let whitespaceEnd = 0;
+  let failedAt = -1;
+  for (let start = 0; start < text.length; start++) {
+    if (start > 0 && !LINE_TERMINATOR.test(text[start - 1])) continue;
+    whitespaceEnd = Math.max(start, whitespaceEnd);
+    while (whitespaceEnd < text.length && WHITESPACE.test(text[whitespaceEnd])) whitespaceEnd++;
+    if (failedAt === whitespaceEnd) continue;
+    pattern.lastIndex = whitespaceEnd;
+    const match = pattern.exec(text);
+    if (!match) {
+      failedAt = whitespaceEnd;
+      continue;
+    }
+    parts.push(text.slice(last, start), replacement);
+    last = pattern.lastIndex;
+    start = last - 1;
+  }
+  return parts.join('') + text.slice(last);
+}
+
+// 記号と空白の連なりを 1 回で切り出し、行の境界へ詰めてから記号の数を数える。
+// `^\s*(?:[-*_]\s*){3,}$` のまま当てると、空白の続く行ごとに後戻りして二乗になるため。
+function replaceRuleLines(text, pattern, countSymbols) {
+  return text.replace(pattern, (run, offset) => {
+    let start = 0;
+    if (offset > 0 && !LINE_TERMINATOR.test(text[offset - 1])) {
+      while (start < run.length && !LINE_TERMINATOR.test(run[start])) start++;
+      start++;
+    }
+    let end = run.length;
+    if (offset + end < text.length && !LINE_TERMINATOR.test(text[offset + end])) {
+      while (end > start && !LINE_TERMINATOR.test(run[end])) end--;
+    }
+    let count = 0;
+    for (let i = start; i < end; i++) {
+      if (!countSymbols || !WHITESPACE.test(run[i])) count++;
+    }
+    if (count < 3) return run;
+    return run.slice(0, start) + ' ' + run.slice(end);
+  });
+}
+
 // URL の開始位置の目印。実際にどこまでが URL 本体かは scanUrlLength() が 1 文字ずつ判定する。
 const URL_START = /https?:\/\/|\bwww\./g;
 
@@ -115,13 +296,13 @@ function replaceUrls(text, replacer) {
   }
   return out + text.slice(last);
 }
-const MD_LINK = /\[([^\]]*)\]\(([^)]*)\)/g;
-const MD_IMAGE = /!\[([^\]]*)\]\(([^)]*)\)/g;
-const TABLE_ROW = /^\s*\|.*\|\s*$/gm;
-const TABLE_SEP = /^\s*\|?[\s:|-]{3,}\|?\s*$/gm;
+const MD_LINK = /\[/g;
+const MD_IMAGE = /!\[/g;
+const TABLE_ROW = /\|.*\|\s*$/my;
+const TABLE_SEP = /[\s:|-]+/g;
 const HEADING_LINE = /^\s{0,3}#{1,6}\s+.*$/gm;
 const HEADING_MARK = /^\s{0,3}#{1,6}\s+/gm;
-const LIST_MARKER = /^\s*(?:[-*+]|\d{1,3}[.)])\s+/gm;
+const LIST_MARKER = /(?:[-*+]|\d{1,3}[.)])\s+/y;
 // 箇条書き項目の 1 行。記号を外す前にどの行が項目だったかを控えるために使う。
 // 区切り線かどうかは LIST_SYMBOL_ONLY で別に判定する。この正規表現へ先読みとして
 // 埋め込むと、空白だけが続く行で後戻りのたびに行末まで走り、入力長の二乗で遅くなる。
@@ -132,10 +313,10 @@ const LIST_ITEM_LINE = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　]+.*$/gm;
 // 記号のあとに長い空白が続く行で後戻りが入力長の二乗に膨らむ。
 // この判定は LIST_ITEM_LINE に一致した行にしか使わないので、区切り 1 文字は保証されている。
 const LIST_SYMBOL_ONLY = /^[ \t　]*(?:[-*+]|\d{1,3}[.)])[ \t　][-*_ \t　]*$/;
-const BLOCKQUOTE = /^\s*>+\s?/gm;
-const HR = /^\s*(?:[-*_]\s*){3,}$/gm;
+const BLOCKQUOTE = />+\s?/y;
+const HR = /[\s*_-]+/g;
 const INLINE_CODE = /`([^`\n]+)`/g;
-const MD_EMPHASIS = /(\*\*|__|\*|_|~~)(?=\S)([\s\S]*?\S)\1/g;
+const MD_EMPHASIS = /\*\*|__|\*|_|~~/g;
 const EMOJI = /[\p{Extended_Pictographic}\u{1F3FB}-\u{1F3FF}\u{FE0F}\u{200D}]/gu;
 const BOX_DRAWING = /[─-╿▀-▟]/g;
 
@@ -187,7 +368,7 @@ const ABS_PATH = new RegExp(
 );
 
 // 相対パス。先頭のセグメントも含めないと src/daemon/queue.js が「src」と「queue.js」に割れる。
-const REL_PATH = new RegExp(String.raw`${REL_CHAR}+(?:[\\/]${REL_CHAR}+)+[\\/]?`, 'gu');
+const REL_PATH = new RegExp(String.raw`${REL_CHAR}+(?:[\\/]${REL_CHAR}+)*[\\/]?`, 'gu');
 
 const NUMERIC_SEG = /^\d+(?:\.\d+)?$/;
 const EXTENSION = /\.[A-Za-z0-9]{1,10}$/;
@@ -221,45 +402,38 @@ const BRACKET_OPEN_TO_CLOSE_PATH = { '(': ')', '[': ']', '{': '}', '（': '）',
 const BRACKET_CLOSE_TO_OPEN_PATH = {};
 for (const [o, c] of Object.entries(BRACKET_OPEN_TO_CLOSE_PATH)) BRACKET_CLOSE_TO_OPEN_PATH[c] = o;
 
-function countChar(s, ch) {
-  let n = 0;
-  for (const c of s) if (c === ch) n++;
-  return n;
-}
-
-/** s 全体が先頭の開き括弧とその対応する閉じ括弧で囲まれているか。 */
-function isBracketWrapped(s) {
-  const open = s[0];
-  const close = BRACKET_OPEN_TO_CLOSE_PATH[open];
-  if (!close || s[s.length - 1] !== close) return false;
-  let depth = 0;
-  for (let i = 0; i < s.length; i++) {
-    if (s[i] === open) depth++;
-    else if (s[i] === close && --depth === 0) return i === s.length - 1;
-  }
-  return false;
-}
-
 /** マッチ文字列を「外側の括弧」「パス本体」「外側の括弧」へ分ける。 */
 function splitOuterBrackets(m) {
+  const counts = {};
+  const stacks = {};
+  const pairs = new Map();
+  for (let i = 0; i < m.length; i++) {
+    const ch = m[i];
+    counts[ch] = (counts[ch] || 0) + 1;
+    if (BRACKET_OPEN_TO_CLOSE_PATH[ch]) (stacks[ch] ??= []).push(i);
+    const open = BRACKET_CLOSE_TO_OPEN_PATH[ch];
+    if (open && stacks[open]?.length) pairs.set(stacks[open].pop(), i);
+  }
   let start = 0;
   let end = m.length;
-  for (;;) {
-    const core = m.slice(start, end);
-    if (core.length < 2) break;
-    const last = core[core.length - 1];
+  while (end - start >= 2) {
+    const last = m[end - 1];
     const openOfLast = BRACKET_CLOSE_TO_OPEN_PATH[last];
-    if (openOfLast && countChar(core, openOfLast) < countChar(core, last)) {
-      end--; // 対応する開き括弧を持たない閉じ括弧
+    if (openOfLast && (counts[openOfLast] || 0) < counts[last]) {
+      counts[last]--;
+      end--;
       continue;
     }
-    const first = core[0];
+    const first = m[start];
     const closeOfFirst = BRACKET_OPEN_TO_CLOSE_PATH[first];
-    if (closeOfFirst && countChar(core, closeOfFirst) < countChar(core, first)) {
-      start++; // 対応する閉じ括弧を持たない開き括弧
+    if (closeOfFirst && (counts[closeOfFirst] || 0) < counts[first]) {
+      counts[first]--;
+      start++;
       continue;
     }
-    if (isBracketWrapped(core)) {
+    if (pairs.get(start) === end - 1) {
+      counts[first]--;
+      counts[last]--;
       start++;
       end--;
       continue;
@@ -351,7 +525,11 @@ function insertBoundaryBeforeTrailingSpace(line) {
  * 印は空白ではないので、残すと前後の trim を遮って印の有無で整形結果が変わってしまう。
  */
 function trimBoundaryEdges(text) {
-  return text.replace(/^(?:\u0001|\s)+/, '').replace(/(?:\u0001|\s)+$/, '');
+  let start = 0;
+  let end = text.length;
+  while (start < end && (text[start] === LIST_BOUNDARY || WHITESPACE.test(text[start]))) start++;
+  while (end > start && (text[end - 1] === LIST_BOUNDARY || WHITESPACE.test(text[end - 1]))) end--;
+  return text.slice(start, end);
 }
 
 /** 項目の切れ目のマーカーを取り除く。 */
@@ -387,7 +565,7 @@ function applyInlineCode(text, mode) {
 
 function applyUrls(text, mode, placeholder) {
   // Markdown リンクはラベルを残し、URL 部分だけを対象にする
-  const out = text.replace(MD_IMAGE, ' ').replace(MD_LINK, '$1 ');
+  const out = replaceMarkdownLinks(replaceMarkdownLinks(text, MD_IMAGE, true), MD_LINK, false);
   if (mode === 'read') return out;
   return replaceUrls(out, () => (mode === 'placeholder' ? placeholder : ' '));
 }
@@ -406,6 +584,7 @@ function applyFilePaths(text, mode) {
   });
 
   const shorten = (m, requireLikely) => {
+    if (requireLikely && pathSegments(m).length < 2) return m;
     const { lead, core, trail } = splitOuterBrackets(m);
     if (!core || (requireLikely && !isLikelyRelativePath(core))) return m;
     const parts = pathSegments(core);
@@ -460,9 +639,9 @@ function applyConstantCase(text, mode) {
 function applyTables(text, mode) {
   if (mode === 'read') {
     // 読む場合でも区切り行だけは意味がないので落とす
-    return text.replace(TABLE_SEP, ' ').replace(/\|/g, ' ');
+    return replaceRuleLines(text, TABLE_SEP, false).replace(/\|/g, ' ');
   }
-  return text.replace(TABLE_ROW, ' ');
+  return replaceWhitespacePrefixedLines(text, TABLE_ROW, ' ');
 }
 
 function limitSentences(text, max) {
@@ -494,14 +673,23 @@ function limitChars(text, max) {
  */
 export function filterText(input, f = {}) {
   if (typeof input !== 'string') return { text: '', marked: '', truncated: false };
-  let t = input;
+  let inputEnd = Math.min(input.length, MAX_INPUT_CHARS);
+  const lastCodeUnit = input.charCodeAt(inputEnd - 1);
+  const nextCodeUnit = input.charCodeAt(inputEnd);
+  if (inputEnd < input.length && lastCodeUnit >= 0xD800 && lastCodeUnit <= 0xDBFF
+    && nextCodeUnit >= 0xDC00 && nextCodeUnit <= 0xDFFF) inputEnd--;
+  const inputTruncated = inputEnd < input.length;
+  let t = input.slice(0, inputEnd);
 
-  if (f.thinkingBlocks !== false) t = t.replace(THINKING, ' ');
+  // 上限で切ると、閉じ記号が上限の先にあるブロックの中身が地の文として残る。閉じ記号を補って除去を成立させる。
+  if (f.thinkingBlocks !== false) t = replaceThinking(inputTruncated ? t + danglingThinkingCloser(t) : t);
+  const codeBlockMode = f.codeBlock ?? 'placeholder';
+  if (inputTruncated && codeBlockMode !== 'read') t += danglingFenceCloser(t);
 
-  t = applyCodeBlocks(t, f.codeBlock ?? 'placeholder', f.codeBlockPlaceholder ?? 'コードは省略');
+  t = applyCodeBlocks(t, codeBlockMode, f.codeBlockPlaceholder ?? 'コードは省略');
   t = applyTables(t, f.table ?? 'omit');
 
-  if (f.htmlTags !== false) t = t.replace(HTML_TAG, ' ');
+  if (f.htmlTags !== false) t = replaceHtmlTags(t);
 
   t = applyUrls(t, f.url ?? 'placeholder', f.urlPlaceholder ?? 'リンク');
   t = applyFilePaths(t, f.filePath ?? 'basename');
@@ -531,9 +719,9 @@ export function filterText(input, f = {}) {
     ));
   }
 
-  if (f.listMarkers !== false) t = t.replace(LIST_MARKER, '');
+  if (f.listMarkers !== false) t = replaceWhitespacePrefixedLines(t, LIST_MARKER, '');
 
-  t = t.replace(HR, ' ').replace(BLOCKQUOTE, '');
+  t = replaceWhitespacePrefixedLines(replaceRuleLines(t, HR, true), BLOCKQUOTE, '');
 
   if (f.markdownSymbols !== false) {
     // url: 'read' では本文に URL がまだ残っている。退避せずに記号を外すと
@@ -542,7 +730,7 @@ export function filterText(input, f = {}) {
     // 他のモードでは URL 自体が既に短縮・置換済みで本文中に残らないため、
     // ここでの退避は基本的に空振りする（replaceUrls は該当が無ければ即 return する）。
     const { guarded, parked } = parkUrls(t);
-    t = guarded.replace(MD_EMPHASIS, '$2');
+    t = replaceEmphasis(guarded);
     t = t.replace(/[*_`~>|#]/g, '');
     t = unparkUrls(t, parked);
   }
@@ -551,12 +739,12 @@ export function filterText(input, f = {}) {
   t = t.replace(BOX_DRAWING, ' ');
 
   if (f.collapseWhitespace !== false) {
-    t = t.replace(/[ \t　]+/g, ' ').replace(/\s*\n\s*/g, '\n').replace(/\n{2,}/g, '\n');
+    t = t.replace(/[ \t　]+/g, ' ').replace(/\s+/g, (space) => space.includes('\n') ? '\n' : space).replace(/\n{2,}/g, '\n');
     if (marksList) {
       // 絵文字や罫線の除去は印を付けたあとに走るので、印の手前へ空白が生まれることがある。
       // 印は空白ではなく、畳み込みも trim も素通りさせてしまうため、ここで落とす。
       // 中身が残らなかった項目（絵文字だけの行など）は、印ごと落として空行を作らない。
-      t = t.replace(/[ \t　]+(?=\u0001)/g, '').replace(/^\u0001\n?/gm, '');
+      t = t.replace(/[ \t　]+/g, (space, offset) => t[offset + space.length] === LIST_BOUNDARY ? '' : space).replace(/^\u0001\n?/gm, '');
     }
   }
   if (marksList) {
@@ -572,7 +760,7 @@ export function filterText(input, f = {}) {
 
   const bySentence = limitSentences(t, f.maxSentences);
   const byChar = limitChars(bySentence.text, f.maxChars);
-  const truncated = bySentence.truncated || byChar.truncated;
+  const truncated = inputTruncated || bySentence.truncated || byChar.truncated;
   // 上限で切ったあとにも端へ印が残りうる（読み上げの始めと終わりで間は置かない）。
   let out = trimBoundaryEdges(byChar.text);
   if (truncated && f.truncationSuffix) out += `。${f.truncationSuffix}。`;

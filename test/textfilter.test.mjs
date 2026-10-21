@@ -863,3 +863,122 @@ test('WAV の再生時間をヘッダから算出できる', () => {
   buf.writeUInt32LE(dataSize, 40);
   assert.equal(wavDurationMs(buf), 1000);
 });
+
+
+test('内部の入力上限までは省略せず、超えた本文には省略語を付ける', () => {
+  const config = { ...F, maxChars: 0, maxSentences: 0, truncationSuffix: '以下省略' };
+  const exact = 'あ'.repeat(50_000);
+  assert.deepEqual(filterText(exact, config), { text: exact, marked: exact, truncated: false });
+  const text = `${exact}。以下省略。`;
+  assert.deepEqual(filterText(exact + '末尾', config), { text, marked: text, truncated: true });
+  assert.deepEqual(filterText(exact + '末尾', { ...config, truncationSuffix: '' }), {
+    text: exact, marked: exact, truncated: true,
+  });
+});
+
+test('内部の入力上限でサロゲートペアを分割しない', () => {
+  const config = { ...F, emoji: false, maxChars: 0, maxSentences: 0, truncationSuffix: '省略' };
+  for (const prefixLength of [49_998, 49_999]) {
+    const prefix = 'あ'.repeat(prefixLength);
+    const text = `${prefix}${prefixLength === 49_998 ? '𝄞' : ''}。省略。`;
+    assert.deepEqual(filterText(prefix + '𝄞末尾', config), { text, marked: text, truncated: true });
+    assert.equal(text.isWellFormed(), true);
+  }
+});
+
+test('内部の入力上限で切った thinking ブロックの中身は読まない', () => {
+  const config = { ...F, maxChars: 0, maxSentences: 0, truncationSuffix: '省略' };
+  const input = '前<thinking>' + 'あ'.repeat(49_990) + '</thinking>後';
+  assert.deepEqual(filterText(input, config), { text: '前。省略。', marked: '前。省略。', truncated: true });
+  // 小文字にすると長さが変わる文字（İ）が前にあっても、後続のブロックの閉じタグを補う。
+  const dotted = '<thinking>İ</thinking>前<THINKING>' + 'あ'.repeat(49_990) + '</THINKING>後';
+  assert.equal(filterText(dotted, config).text, '前。省略。');
+  // thinking を読む設定では、閉じタグを補わずに中身を読む。
+  const read = filterText(input, { ...config, thinkingBlocks: false });
+  assert.match(read.text, /^前 あ+。省略。$/);
+});
+
+test('内部の入力上限で切ったコードブロックは設定どおりに省略する', () => {
+  const config = { ...F, maxChars: 0, maxSentences: 0, truncationSuffix: '省略' };
+  for (const fence of ['```', '~~~']) {
+    const input = `前\n${fence}js\n${'const secret = 123;\n'.repeat(3000)}${fence}\n後`;
+    assert.equal(filterText(input, config).text, '前\n。コードは省略。。省略。');
+    assert.equal(filterText(input, { ...config, codeBlock: 'omit' }).text, '前。省略。');
+    // コードを読む設定では、入力に無い閉じ記号を足さない。
+    const read = filterText(input, { ...config, codeBlock: 'read', markdownSymbols: false, inlineCode: 'read' });
+    assert.equal(read.text.split(fence).length, 2, read.text.slice(-40));
+    assert.match(read.text, /const secret = 123;/);
+  }
+  // 上限の手前で閉じたコードブロックの後ろに、閉じない囲みがあっても後者だけを補う。
+  const pair = '前\n```\nx\n```\n中\n~~~\n' + 'y'.repeat(50_000);
+  assert.equal(filterText(pair, config).text, '前\n。コードは省略。\n中\n。コードは省略。。省略。');
+});
+
+test('タグと行頭記号の除去は改行や Unicode 空白を含む一致範囲を保つ', () => {
+  const config = { collapseWhitespace: false, markdownSymbols: false, emoji: false, filePath: 'read', listPauseSec: 0 };
+  const cases = [
+    ['前<thinking>内<thinking>心</thinking>後<ANTML:THINKING>秘密</ANTML:THINKING>末', {}, '前 後 末'],
+    ['前<thinking>閉じない<antml:thinking>秘密</antml:thinking>後', {}, '前 閉じない 後'],
+    ['前<a href="x">中</a>後<a<a', {}, '前 中 後<a<a'],
+    ['前\n\r\n\u00a0　| a | b |\r\n　\n後', {}, '前\n \n後'],
+    ['前\n\r\n\u00a0　-\u00a0項目\r\n　2.\t次\n後', {}, '前\n項目\r次\n後'],
+    ['前\n\r\n\u00a0　>>> 引用\r\n後', {}, '前\n引用\r\n後'],
+    ['前\n \r\n\u00a0- \n*\r\n_　\n後', { listMarkers: false }, '前\n \n後'],
+    ['前\n\r\n\u00a0|:---|\r\n　\n後', { table: 'read' }, '前\n \n後'],
+    ['前\n \r\n\u00a0#\u00a0見出し\r\n後', {}, '前\n \r見出し\r\n後'],
+    ['前\u00a0 \n\r　後', { collapseWhitespace: true }, '前\n後'],
+    ['前\u2028\ufeff> 引用\u2029後', {}, '前\u2028引用\u2029後'],
+    ['前\u0001\u00a0\u0001後', {}, '前\u00a0後'],
+  ];
+  for (const [input, overrides, text] of cases) {
+    const actual = filterText(input, { ...config, ...overrides });
+    assert.equal(actual.text, text, JSON.stringify(input));
+    assert.equal(actual.truncated, false);
+    assert.equal(actual.marked, input.includes('\u0001') ? input : text);
+  }
+});
+
+test('リンクと強調とパスの走査は未閉鎖や入れ子の記号を保って整形する', () => {
+  const cases = [
+    ['[未完[名前](url)', '未完[名前'],
+    ['![未完[画像](url)後', '後'],
+    ['[未完[名前](閉じない', '[未完[名前](閉じない'],
+    ['**強調** _x_ ~~取消~~', '強調 x 取消'],
+    ['**x* _ x _ x', 'x x x'],
+    ['((src/a.js)) [src/b.js]]', '((a.js)) [b.js]]'],
+    ['単独の識別子', '単独の識別子'],
+  ];
+  for (const [input, text] of cases) {
+    assert.deepEqual(filterText(input, { ...F, constantCase: 'read' }), { text, marked: text, truncated: false });
+  }
+});
+
+test('内部上限の長さのタグや空白や記号が続いても整形が遅くならない', () => {
+  const inputs = [
+    '<a'.repeat(25_000),
+    'x' + '\n'.repeat(49_998) + 'x',
+    ' \n'.repeat(25_000),
+    '\n'.repeat(49_999) + '>',
+    'x' + '\u0001'.repeat(49_998) + 'y',
+    '<thinking>'.repeat(5_000),
+    '<antml:thinking>'.repeat(3_125),
+    '|' + ':'.repeat(49_998) + 'x',
+    '-'.repeat(49_999) + 'x',
+    '#' + '\n'.repeat(49_998) + 'x',
+    'a'.repeat(50_000),
+    '['.repeat(50_000),
+    '!['.repeat(25_000),
+    '_x '.repeat(16_666) + 'xx',
+    'x' + '\u00a0'.repeat(49_998) + 'y',
+    '- x' + ' '.repeat(49_996) + 'y',
+    '('.repeat(24_996) + 'src/a.js' + ')'.repeat(24_996),
+  ];
+  for (const config of [{}, F, { ...F, collapseWhitespace: false }, { ...F, table: 'read', collapseWhitespace: false }]) {
+    for (const input of inputs) {
+      const started = performance.now();
+      filterText(input, config);
+      const elapsed = performance.now() - started;
+      assert.ok(elapsed < 500, `${JSON.stringify(input.slice(0, 12))} (${input.length} 文字): ${elapsed}ms`);
+    }
+  }
+});
