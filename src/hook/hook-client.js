@@ -1,19 +1,16 @@
 #!/usr/bin/env node
-// フックから呼ばれる薄いクライアント。
-// stdin のイベント JSON をデーモンに転送するだけ。判断もフィルタもデーモン側が持つ。
-//
-// この中身を薄く保つのは意図的:
-//   ・Codex はフック定義のハッシュで信頼を管理するため、定義を変えずに済ませたい
-//   ・読み上げの失敗が Claude Code / Codex 本体を止めてはいけない
-//
-// 使い方: node hook-client.js <target>     target = claudeCode | codex
+// フック本文は runtime.json の共有トークンで暗号化し、デーモンだけが復号できる形で送る。
+// インストール先へ単体でコピーするため、暗号処理もこのファイル内に持つ。
+// 失敗しても呼び出し元を止めず、全体を 2 秒以内に終了する。
 
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
 const TARGET = process.argv[2] ?? 'claudeCode';
 const CONFIG_PATH = path.join(os.homedir(), '.voicevox-coding', 'config.json');
+const RUNTIME_PATH = path.join(os.homedir(), '.voicevox-coding', 'runtime.json');
 const DEFAULT_PORT = 7591;
 const TIMEOUT_MS = 2000;
 
@@ -47,6 +44,8 @@ function readStdin() {
 }
 
 async function main() {
+  const token = JSON.parse(fs.readFileSync(RUNTIME_PATH, 'utf8'))?.token;
+  if (typeof token !== 'string' || !token) return;
   const text = await readStdin();
   if (!text.trim()) return;
 
@@ -57,20 +56,27 @@ async function main() {
     return;
   }
 
+  const context = 'voicevox-coding-hook-v1';
+  const key = crypto.hkdfSync('sha256', Buffer.from(token, 'utf8'), Buffer.alloc(0), context, 32);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  cipher.setAAD(Buffer.from(context));
+  const ct = Buffer.concat([cipher.update(JSON.stringify({ target: TARGET, payload, ts: Date.now() }), 'utf8'), cipher.final()]);
+  const body = { v: 1, iv: iv.toString('base64'), ct: ct.toString('base64'), tag: cipher.getAuthTag().toString('base64') };
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
   try {
-    await fetch(`http://127.0.0.1:${resolvePort()}/hook`, {
+    await fetch(`http://127.0.0.1:${resolvePort()}/hook/sealed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target: TARGET, payload }),
+      body: JSON.stringify(body),
       signal: ac.signal,
     });
   } catch {
-    // デーモンが起動していないだけ。黙って終わる
   } finally {
     clearTimeout(timer);
   }
 }
 
-main().finally(() => process.exit(0));
+setTimeout(() => process.exit(0), TIMEOUT_MS);
+main().catch(() => {}).finally(() => process.exit(0));

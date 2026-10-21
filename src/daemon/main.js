@@ -12,6 +12,7 @@ import { EngineProcess } from './engine-process.js';
 import { Player } from './player.js';
 import { SpeechQueue } from './queue.js';
 import { Tray } from './tray.js';
+import { describePortHolder } from './port-holder.js';
 import { createServer } from './server.js';
 import { syncEngineDictionary } from './dictionary.js';
 import { CodexCommentaryMonitor, commentaryEnabled } from './codex-commentary-monitor.js';
@@ -93,20 +94,21 @@ function startHealthCheck() {
 
 const port = store.config.daemon?.port ?? 7591;
 
-// 状態変更 API 用のトークン。起動ごとに変わり、トレイなどローカルクライアントにだけ渡す
+// フックの暗号化とローカル API の認証に使う共有トークンは起動ごとに更新する。
 const apiToken = crypto.randomBytes(32).toString('hex');
 
-// 更新スクリプトなど同一ユーザーのローカルツールが /api/shutdown を呼べるよう、
-// トークンをファイルにも書き出す（AUD-01 の脅威モデルはブラウザ経由の攻撃であり、
-// 同一ユーザーのローカルプロセスは対象外）。
 const RUNTIME_PATH = path.join(CONFIG_DIR, 'runtime.json');
 
 function writeRuntimeFile(port) {
+  const temporaryPath = `${RUNTIME_PATH}.${process.pid}.tmp`;
   try {
     fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(RUNTIME_PATH, JSON.stringify({ pid: process.pid, port, token: apiToken }, null, 2), 'utf8');
+    fs.writeFileSync(temporaryPath, JSON.stringify({ pid: process.pid, port, token: apiToken }, null, 2), 'utf8');
+    fs.renameSync(temporaryPath, RUNTIME_PATH);
   } catch (err) {
     log.warn(`runtime.json を書き込めません: ${err.message}`);
+  } finally {
+    try { fs.unlinkSync(temporaryPath); } catch {}
   }
 }
 
@@ -132,10 +134,16 @@ const server = createServer({
 server.on('error', async (err) => {
   // ログは非同期書き込みなので、exit の前に flush を待たないと診断ログが残らない
   if (err.code === 'EADDRINUSE') {
-    log.error(`ポート ${port} は使用中です。デーモンが既に起動している可能性があります。`);
-    if (shouldOpen) {
-      // 既に起動しているなら、コンソールを開くだけで用は足りる
-      spawn('cmd.exe', ['/c', 'start', '', `http://127.0.0.1:${port}/`], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+    const { owner, pids } = await describePortHolder({ port });
+    if (owner === 'same') {
+      log.error(`ポート ${port} は使用中です。デーモンが既に起動している可能性があります。`);
+      if (shouldOpen) {
+        spawn('cmd.exe', ['/c', 'start', '', `http://127.0.0.1:${port}/`], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      }
+    } else if (owner === 'other') {
+      log.error(`ポート ${port} を別のユーザーのプロセスが使っています (PID ${pids.join(', ')})`);
+    } else {
+      log.error(`ポート ${port} の持ち主を確認できません (PID ${pids.join(', ')})`);
     }
     await log.close().catch(() => {});
     process.exit(1);
