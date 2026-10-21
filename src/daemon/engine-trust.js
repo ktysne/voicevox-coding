@@ -20,12 +20,13 @@ function splitAddress(address) {
 }
 
 // 接続先のホストへの接続を受けうる待受のローカルアドレスか。localhost はどちらのファミリーにも解決しうる。
+// [::] はデュアルスタックなら IPv4 の接続も受け、netstat からは見分けられないので IPv4 の接続先でも含める。
 function acceptsConnectionsTo(localHost, targetHost) {
   const v4 = localHost === '0.0.0.0' || (isLoopbackV4(localHost) && (targetHost === 'localhost' || localHost === targetHost));
   const v6 = localHost === '[::]' || localHost === '[::1]';
   if (targetHost === 'localhost') return v4 || v6;
   if (targetHost === '[::1]' || targetHost === '::1') return v6;
-  return v4;
+  return v4 || localHost === '[::]';
 }
 
 export function parseNetstatListeners(output, port, targetHost = 'localhost') {

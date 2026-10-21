@@ -506,9 +506,21 @@ test('parseNetstatListeners は接続先のアドレスファミリーで受け�
   TCP [::1]:50021 [::]:0 LISTENING 12
   TCP 0.0.0.0:50021 0.0.0.0:0 LISTENING 13
   TCP [::]:50021 [::]:0 LISTENING 14`;
-  assert.deepEqual(parseNetstatListeners(output, 50021, '127.0.0.1'), [10, 13]);
+  // [::] はデュアルスタックなら IPv4 の接続も受けるので、IPv4 の接続先でも含める
+  assert.deepEqual(parseNetstatListeners(output, 50021, '127.0.0.1'), [10, 13, 14]);
   assert.deepEqual(parseNetstatListeners(output, 50021, '[::1]'), [12, 14]);
   assert.deepEqual(parseNetstatListeners(output, 50021, 'localhost'), [10, 11, 12, 13, 14]);
+});
+
+test('IPv4 の接続先でも [::] だけの待受は所有者の確認へ進む', async () => {
+  const output = '  TCP [::]:50021 [::]:0 LISTENING 14';
+  let queried;
+  const trust = new EngineTrust({
+    listListeners: async (port, host) => parseNetstatListeners(output, port, host),
+    queryProcessOwner: async (pid) => { queried = pid; return 'same'; },
+  });
+  assert.deepEqual(await trust.check(LOCAL_ENGINE), { trusted: true, pids: [14] });
+  assert.equal(queried, 14);
 });
 
 test('EngineTrust は照会中に待受から消えた PID の結果を許可に使わない', async () => {
