@@ -15,7 +15,7 @@ const LOCALAPPDATA = 'X:\\fake\\LocalAppData';
 const PROGRAMFILES = 'X:\\fake\\Program Files';
 const DRIVE_ROOT_EXE = path.join('C:\\', REL);
 const LOCALAPPDATA_EXE = path.join(LOCALAPPDATA, 'Programs', REL);
-const REGISTRY_DIR = 'X:\\fake\\Registry\\VOICEVOX';
+const REGISTRY_DIR = 'X:\\fake\\Program Files\\VOICEVOX Registered';
 const REGISTRY_EXE = path.join(REGISTRY_DIR, 'vv-engine', 'run.exe');
 
 // CONFIG_DIR は読み込み時に os.homedir() から決まるので、engine.pid を一時ディレクトリへ書かせる
@@ -100,6 +100,24 @@ test('enginePath が空の自動起動は、レジストリのインストール
   const r = await makeProcess('').start();
   assert.equal(r.started, true);
   assert.equal(spawned[0]?.exe, REGISTRY_EXE);
+});
+
+test('enginePath が空の自動起動は、ドライブ直下を指すレジストリの登録先を使わない', async () => {
+  const registryDriveRoot = 'D:\\VOICEVOX';
+  existing.add(path.join(registryDriveRoot, 'vv-engine', 'run.exe'));
+  existing.add(LOCALAPPDATA_EXE);
+  powershell.registry = registryDriveRoot;
+  const r = await makeProcess('').start();
+  assert.equal(r.started, true);
+  assert.equal(spawned[0]?.exe, LOCALAPPDATA_EXE);
+});
+
+test('管理画面の自動検出は、ドライブ直下を指すレジストリの登録先も見つける', async () => {
+  const registryDriveRoot = 'D:\\VOICEVOX';
+  const exe = path.join(registryDriveRoot, 'vv-engine', 'run.exe');
+  existing.add(exe);
+  powershell.registry = registryDriveRoot;
+  assert.equal(await detectEnginePath(), exe);
 });
 
 test('enginePath が空の自動起動は、起動中のプロセスのパスを使わない', async () => {

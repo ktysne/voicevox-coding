@@ -11,7 +11,24 @@ import { CONFIG_DIR } from './config.js';
 const PID_PATH = path.join(CONFIG_DIR, 'engine.pid');
 const ENGINE_REL_PATH = path.join('VOICEVOX', 'vv-engine', 'run.exe');
 
-/** 利用者本人か管理者だけが書ける既知のインストール先。自動起動でも使う。 */
+/** 利用者本人か管理者だけが書ける場所。自動起動はこの配下の実行ファイルだけを使う。 */
+function trustedInstallRoots() {
+  return [
+    process.env.LOCALAPPDATA,
+    path.join(os.homedir(), 'AppData', 'Local'),
+    process.env.PROGRAMFILES,
+    process.env['PROGRAMFILES(X86)'],
+  ].filter(Boolean);
+}
+
+function isUnderTrustedRoot(p) {
+  return trustedInstallRoots().some((root) => {
+    const rel = path.relative(root, p);
+    return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
+  });
+}
+
+/** 既知のインストール先。どれも trustedInstallRoots() の配下にある。 */
 function candidatePaths() {
   return [
     process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', ENGINE_REL_PATH),
@@ -85,7 +102,8 @@ export async function detectEnginePath() {
 }
 
 async function detectAutoStartEnginePath() {
-  const fromRegistry = firstExistingPath(await registryCandidatePaths());
+  // レジストリの登録先がドライブ直下などでも、その実行ファイルを書ける者は限定できない
+  const fromRegistry = firstExistingPath((await registryCandidatePaths()).filter(isUnderTrustedRoot));
   if (fromRegistry) return fromRegistry;
   return firstExistingPath(candidatePaths());
 }
