@@ -48,12 +48,12 @@ test('READY を待って分割行を組み立て、id ごとに逆順の応答�
   assert.equal((await b).sameUser, false);
 });
 
-test('SID の一致、不一致、ERR はソケット単位でキャッシュする', async (t) => {
+test('SID の一致、不一致、ERR denied はソケット単位でキャッシュする', async (t) => {
   const { verifier, children } = fixture(t);
   verifier.start();
   const child = children[0];
   child.line(`READY ${SID}`);
-  for (const [index, response] of [`OK ${SID}`, 'OK S-1-5-21-999', 'ERR process'].entries()) {
+  for (const [index, response] of [`OK ${SID}`, 'OK S-1-5-21-999', 'ERR denied'].entries()) {
     const connection = socket();
     const pending = verifier.verifySocket(connection, 7591);
     child.line(`${index + 1} ${response}`);
@@ -107,9 +107,9 @@ test('READY 待ちにも上限があり、終了・起動失敗時の結果は�
   const pending = verifier.verifySocket(connection, 7591);
   children[1].emit('exit', 1);
   assert.equal((await pending).sameUser, false);
-  await delay(5);
+  await delay(20);
   children[2].emit('error', new Error('spawn failed'));
-  await delay(5);
+  await delay(20);
   children[3].line(`READY ${SID}`);
   const retry = verifier.verifySocket(connection, 7591);
   const id = children[3].commands[0].split(' ')[0];
@@ -130,19 +130,44 @@ test('応答待ちの上限より遅く、起動待ちの上限より早く READ
   assert.equal(children.length, 1);
 });
 
-test('同期的な起動失敗の再起動回数を制限し、警告は一度だけ出す', async () => {
+test('同期的な起動失敗でも間隔を広げて作り直し続け、警告は一度だけ出す', async () => {
   let starts = 0;
   const warnings = [];
   const verifier = new CallerVerifier({ warn: (message) => warnings.push(message) }, {
-    spawnFn() { starts++; throw new Error('spawn'); }, restartDelayMs: 1, maxRestarts: 2,
+    spawnFn() { starts++; throw new Error('spawn'); }, restartDelayMs: 1, maxRestartDelayMs: 4, startTimeoutMs: 20,
   });
   try {
     verifier.start();
-    await delay(30);
-    assert.equal(starts, 3);
+    await delay(60);
+    assert.ok(starts >= 6, `starts=${starts}`);
     assert.equal(warnings.length, 1);
     assert.equal((await verifier.verifySocket(socket(), 7591)).sameUser, false);
   } finally { verifier.dispose(); }
+});
+
+test('ERR lookup は一時的な失敗としてキャッシュせず、次の要求で引き直す', async (t) => {
+  const { verifier, children } = fixture(t);
+  verifier.start();
+  children[0].line(`READY ${SID}`);
+  const connection = socket();
+  const first = verifier.verifySocket(connection, 7591);
+  children[0].line('1 ERR lookup');
+  assert.deepEqual(await first, { sameUser: false, reason: 'lookup' });
+  const second = verifier.verifySocket(connection, 7591);
+  children[0].line(`2 OK ${SID}`);
+  assert.equal((await second).sameUser, true);
+});
+
+test('作り直しを待つ間に届いた要求は、次のワーカーの応答を待つ', async (t) => {
+  const { verifier, children } = fixture(t, { restartDelayMs: 30 });
+  verifier.start();
+  children[0].emit('exit', 1);
+  const pending = verifier.verifySocket(socket(), 7591);
+  await delay(50);
+  children[1].line(`READY ${SID}`);
+  const id = children[1].commands[0].split(' ')[0];
+  children[1].line(`${id} OK ${SID}`);
+  assert.equal((await pending).sameUser, true);
 });
 
 test('IPv4 の 127.0.0.1 以外には問い合わせない', async (t) => {
@@ -173,7 +198,7 @@ test('dispose は待機を解決して stdin を閉じ、再起動しない', as
 
 test('Windows の本物のワーカーで同じプロセスの接続を確認する', { skip: process.platform !== 'win32' }, async (t) => {
   const warnings = [];
-  const verifier = new CallerVerifier({ warn: (message) => warnings.push(message) }, { timeoutMs: 10000, maxRestarts: 0 });
+  const verifier = new CallerVerifier({ warn: (message) => warnings.push(message) }, { timeoutMs: 10000 });
   const server = net.createServer();
   t.after(() => { verifier.dispose(); server.close(); });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

@@ -91,11 +91,20 @@ function Get-DaemonPort {
 function Test-DaemonRunning([int]$port) {
     # /api/state は ENGINE の状態取得を待つため、ENGINE が無応答だとデーモンが生きていても
     # タイムアウトしうる。外部プロセスに依存しない /api/config で確認する。
+    # 読み取り API も接続元の確認を受けるので、昇格した PowerShell からでも通るようトークンを付ける。
+    # トークンはデーモンの起動ごとに変わるので、呼ぶたびに読み直す。
+    $headers = @{}
     try {
-        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/config" -TimeoutSec 3
+        $runtime = Get-Content $RuntimeJson -Raw | ConvertFrom-Json
+        if ($runtime.token) { $headers['X-VoiceVox-Coding-Token'] = [string]$runtime.token }
+    } catch {}
+    try {
+        $null = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/config" -Headers $headers -TimeoutSec 3
         return $true
     } catch {
-        return $false
+        # 403 はデーモンが応答したうえで接続元を確かめられなかったことを表すので、停止中とはみなさない
+        $response = $_.Exception.Response
+        return ($null -ne $response -and [int]$response.StatusCode -eq 403)
     }
 }
 

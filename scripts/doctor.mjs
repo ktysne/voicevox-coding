@@ -12,6 +12,7 @@ const HOME = os.homedir();
 const CONFIG_PATH = path.join(HOME, '.voicevox-coding', 'config.json');
 const HOOK_CLIENT = path.join(HOME, '.voicevox-coding', 'hook-client.js');
 const MANIFEST_PATH = path.join(HOME, '.voicevox-coding', 'install.json');
+const RUNTIME_PATH = path.join(HOME, '.voicevox-coding', 'runtime.json');
 const CLAUDE_SETTINGS = path.join(HOME, '.claude', 'settings.json');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, '.codex');
 const CODEX_HOOKS = path.join(CODEX_HOME, 'hooks.json');
@@ -44,11 +45,20 @@ async function checkEngine(baseUrl) {
   }
 }
 
+/**
+ * デーモンへの要求に付けるヘッダー。読み取り API も接続元の確認を受けるので、昇格して実行したときも
+ * 通るよう runtime.json のトークンを付ける。トークンはデーモンの起動ごとに変わるので、毎回読む。
+ */
+export function daemonHeaders(runtimePath = RUNTIME_PATH) {
+  const token = readJson(runtimePath)?.token;
+  return typeof token === 'string' && token ? { 'X-VoiceVox-Coding-Token': token } : {};
+}
+
 async function checkDaemon(port) {
   try {
     const ac = new AbortController();
     const t = setTimeout(() => ac.abort(), 3000);
-    const res = await fetch(`http://127.0.0.1:${port}/api/state`, { signal: ac.signal });
+    const res = await fetch(`http://127.0.0.1:${port}/api/state`, { signal: ac.signal, headers: daemonHeaders() });
     clearTimeout(t);
     const s = await res.json();
     ok('デーモン', `127.0.0.1:${port} で稼働中${s.queue?.current ? '（読み上げ中）' : ''}`);
@@ -338,7 +348,7 @@ async function main() {
 
   if (daemonUp) {
     try {
-      const s = await (await fetch(`http://127.0.0.1:${port}/api/state`)).json();
+      const s = await (await fetch(`http://127.0.0.1:${port}/api/state`, { headers: daemonHeaders() })).json();
       if (s.engineProcess?.managed) ok('エンジンのプロセス', `このデーモンが起動 (PID ${s.engineProcess.pid})`);
       else if (engineUp) warn('エンジンのプロセス', '別プロセス（VOICEVOX アプリなど）が起動しています。デーモンからは停止できません');
       if (s.muted) warn('読み上げ', '一時停止中です。トレイまたはコンソールから再開してください');

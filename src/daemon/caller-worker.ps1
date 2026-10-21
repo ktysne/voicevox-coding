@@ -1,5 +1,6 @@
 ﻿# 接続元確認ワーカー。stdin の "<id> <クライアントポート> <サーバーポート>" に、その接続を張ったプロセスの SID を返す。
-# 他のユーザーのプロセスは開けないので ERR になり、デーモン側で拒否される。stdin が閉じたら終了する。
+# プロセスを開けないとき(他のユーザーのプロセス)は ERR denied、表の取得などの失敗は ERR lookup を返す。
+# どちらもデーモン側で拒否される。stdin が閉じたら終了する。
 
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @"
@@ -69,6 +70,10 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     $sid = [TcpOwner]::Sid($ownerPid)
     [Console]::Out.WriteLine("$requestId OK $sid")
   } catch {
-    [Console]::Out.WriteLine("$requestId ERR lookup")
+    # .NET の例外は MethodInvocationException に包まれて届くので、内側の理由で見分ける
+    $inner = $_.Exception
+    while ($inner.InnerException) { $inner = $inner.InnerException }
+    $reason = if ($inner.Message -in @('process', 'token')) { 'denied' } else { 'lookup' }
+    [Console]::Out.WriteLine("$requestId ERR $reason")
   }
 }

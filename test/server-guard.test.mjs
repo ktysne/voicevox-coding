@@ -1,4 +1,4 @@
-// 状態変更 API の受け入れ判定 (AUD-01) のテスト。
+// API 要求の受け入れ判定 (AUD-01) のテスト。
 // 外部 Web ページからのドライブバイ操作を拒否しつつ、
 // 管理 UI・トレイ・フッククライアントの正規経路を通すこと。
 
@@ -29,31 +29,66 @@ test('別ユーザーでも正しいトークンなら通り、CSRF 検査は残
   assert.equal(check('/api/config', {}, { sameUser: true }).status, 403);
 });
 
-test('Host、接続元、Content-Type の順で検査し GET/HEAD と /hook は接続元確認を免除する', () => {
+test('Host、接続元、Content-Type の順で検査し GET/HEAD も接続元を確認する', () => {
   assert.match(check('/api/config', { host: 'evil', 'content-type': 'text/plain' }, { sameUser: false }).error, /Host/);
   assert.match(check('/api/config', { 'content-type': 'text/plain' }, { sameUser: false }).error, /OS/);
   assert.equal(check('/api/config', { 'content-type': 'text/plain' }, { sameUser: true }).status, 415);
-  for (const method of ['GET', 'HEAD']) assert.equal(check('/api/config', {}, { sameUser: false }, method).ok, true);
+  for (const method of ['GET', 'HEAD']) {
+    assert.equal(check('/api/config', {}, { sameUser: false }, method).status, 403);
+    assert.equal(check('/api/config', {}, { sameUser: true }, method).ok, true);
+  }
+  assert.equal(check('/api/state', { 'x-voicevox-coding-token': TOKEN }, { sameUser: false }, 'GET').ok, true);
   assert.equal(check('/hook', { 'content-type': 'application/json' }, { sameUser: false }).ok, true);
 });
 
-test('実サーバーは必要な経路だけ接続元を確認し、起動と終了で verifier を管理する', async () => {
+test('キュー本文は 30 文字を超える場合だけ省略記号付きで切る', () => {
+  for (const length of [0, 29, 30]) {
+    const text = 'a'.repeat(length);
+    const state = { running: true, current: { id: 1, target: 'codex', event: 'Commentary', text, chunkIndex: 0, chunkCount: 1 }, queued: [] };
+    assert.deepEqual(guards.summarizeQueueState(state), state);
+  }
+
+  const text = 'b'.repeat(31);
+  const state = {
+    running: true,
+    current: { id: 2, target: 'codex', event: 'Commentary', text, chunkIndex: 1, chunkCount: 2 },
+    queued: [{ id: 3, target: 'obs', event: 'MessageDisplay', text }],
+  };
+  assert.deepEqual(guards.summarizeQueueState(state), {
+    running: true,
+    current: { ...state.current, text: `${text.slice(0, 30)}…` },
+    queued: [{ ...state.queued[0], text: `${text.slice(0, 30)}…` }],
+  });
+});
+
+test('キュー本文の要約は current が null で queued が空でも状態を保つ', () => {
+  const state = { running: false, current: null, queued: [] };
+  assert.deepEqual(guards.summarizeQueueState(state), state);
+});
+
+test('キュー本文の要約は文字列でない本文を空文字にする', () => {
+  const state = { running: true, current: { id: 1, text: null }, queued: [{ id: 2, text: 42 }] };
+  assert.deepEqual(guards.summarizeQueueState(state), { running: true, current: { id: 1, text: '' }, queued: [{ id: 2, text: '' }] });
+});
+
+test('実サーバーは /hook 以外の要求で接続元を確認し、起動と終了で verifier を管理する', async () => {
   const calls = [];
   const verifier = { start() { calls.push('start'); }, dispose() { calls.push('dispose'); },
-    async verifySocket(socket, port) { assert.equal(socket.remoteAddress, '127.0.0.1'); assert.ok(port > 0); calls.push('verify'); return { sameUser: false }; } };
+    async verifySocket(socket, port) { assert.equal(socket.remoteAddress, '127.0.0.1'); assert.ok(port > 0); calls.push('verify'); return { sameUser: true }; } };
   const { server, port } = await startServer(verifier);
   try {
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`)).status, 200);
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'HEAD' })).status, 404);
     assert.equal((await fetch(`http://127.0.0.1:${port}/hook`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"event":"MessageDisplay"}' })).status, 200);
-    assert.deepEqual(calls, ['start']);
-    assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}` }, body: '{}' })).status, 403);
-    assert.deepEqual(calls, ['start', 'verify']);
+    assert.deepEqual(calls, ['start', 'verify', 'verify']);
+    // トークンを持つ要求は接続元を引かない
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json', 'x-voicevox-coding-token': TOKEN }, body: '{}' })).status, 200);
+    assert.deepEqual(calls, ['start', 'verify', 'verify']);
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
-  assert.deepEqual(calls, ['start', 'verify', 'dispose']);
+  assert.deepEqual(calls, ['start', 'verify', 'verify', 'dispose']);
 });
 
 test('設定 API は変更した不正な enginePath を保存せず、同じ値と空文字は通す', async (t) => {
@@ -230,7 +265,7 @@ async function startServer(callerVerifier = { start() {}, dispose() {}, verifySo
     save(next) { this.config = normalizeConfig(next); this.revision++; return this.config; },
     patch(next) { return this.save(normalizeConfig(next, this.config)); },
   });
-  const queue = Object.assign(new EventEmitter(), { state: {} });
+  const queue = Object.assign(new EventEmitter(), { state: { running: false, current: null, queued: [] } });
   const log = { subscribe() {}, warn() {}, info() {}, debug() {}, error() {}, recent: () => [] };
   const engine = { status: async () => ({}) };
   const probe = http.createServer();
@@ -239,7 +274,7 @@ async function startServer(callerVerifier = { start() {}, dispose() {}, verifySo
   await new Promise((resolve) => probe.close(resolve));
   const server = createServer({ store, engine, queue, log, runtime: {}, port, token: TOKEN, callerVerifier, ...extra });
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
-  return { server, port, store };
+  return { server, port, store, queue };
 }
 
 test('別ユーザーの自 Origin 偽装を判定関数で拒否する', () => {
@@ -296,6 +331,35 @@ test('接続元の確認を待つ間に終了処理が始まったら、エン�
   }
 });
 
+test('接続元の確認を待つ間に切れた SSE の要求は購読に登録しない', async (t) => {
+  const intervals = [];
+  const original = globalThis.setInterval;
+  const spy = mock.method(globalThis, 'setInterval', (fn, ms, ...rest) => {
+    intervals.push(ms);
+    return original(fn, ms, ...rest);
+  });
+  t.after(() => spy.mock.restore());
+  let settled;
+  const verified = new Promise((resolve) => { settled = resolve; });
+  const verifier = { start() {}, dispose() {}, verifySocket: (socket) => new Promise((resolve) => {
+    socket.once('close', () => setImmediate(() => { resolve({ sameUser: true }); setImmediate(settled); }));
+  }) };
+  const { server, port } = await startServer(verifier);
+  try {
+    const req = http.request({ host: '127.0.0.1', port, path: '/api/stream', headers: { host: `127.0.0.1:${port}` } });
+    req.on('error', () => {});
+    req.end();
+    await new Promise((resolve) => server.once('connection', resolve));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    req.destroy();
+    await verified;
+    assert.equal(intervals.filter((ms) => ms === 20000).length, 0);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 function get(port, pathname, host) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path: pathname, method: 'GET', headers: { host } }, (res) => {
@@ -306,6 +370,86 @@ function get(port, pathname, host) {
     req.end();
   });
 }
+
+function getStatus(port, pathname, host, headers = {}) {
+  return new Promise((resolve, reject) => {
+    let receivedResponse = false;
+    const req = http.request({ host: '127.0.0.1', port, path: pathname, method: 'GET', headers: { host, ...headers } }, (res) => {
+      receivedResponse = true;
+      const { statusCode } = res;
+      res.on('error', () => {});
+      res.destroy();
+      resolve(statusCode);
+    });
+    req.on('error', (error) => {
+      if (!receivedResponse) reject(error);
+    });
+    req.end();
+  });
+}
+
+function getQueueEvent(port, onConnected) {
+  return new Promise((resolve, reject) => {
+    let connected = false;
+    let receivedEvent = false;
+    let buffer = '';
+    const req = http.request({ host: '127.0.0.1', port, path: '/api/stream', method: 'GET', headers: { host: `127.0.0.1:${port}` } }, (res) => {
+      res.on('data', (chunk) => {
+        buffer += chunk.toString();
+        if (!connected && buffer.includes(': connected\n\n')) {
+          connected = true;
+          onConnected();
+        }
+        const match = buffer.match(/event: queue\ndata: ([^\n]+)/);
+        if (match) {
+          receivedEvent = true;
+          resolve(JSON.parse(match[1]));
+          req.destroy();
+        }
+      });
+    });
+    req.on('error', (error) => {
+      if (!receivedEvent) reject(error);
+    });
+    req.end();
+  });
+}
+
+test('状態 API と SSE はキュー本文を要約する', async () => {
+  const { server, port, queue } = await startServer();
+  const text = '読み上げる本文を秘匿するために三十文字を超えるテスト文です。';
+  const state = {
+    running: true,
+    current: { id: 1, target: 'codex', event: 'Commentary', text, chunkIndex: 2, chunkCount: 3 },
+    queued: [{ id: 2, target: 'obs', event: 'MessageDisplay', text }],
+  };
+  queue.state = state;
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/api/state`);
+    const body = await response.json();
+    assert.deepEqual(body.queue, guards.summarizeQueueState(state));
+
+    const queueEvent = await getQueueEvent(port, () => queue.emit('update', state));
+    assert.deepEqual(queueEvent, guards.summarizeQueueState(state));
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('別ユーザーの GET は読み取り API と SSE を 403 にする', async () => {
+  const verifier = { start() {}, dispose() {}, verifySocket: async () => ({ sameUser: false }) };
+  const { server, port } = await startServer(verifier);
+  try {
+    const paths = ['/api/state', '/api/config', '/api/logs', '/api/stream', '/', '/app.js'];
+    const statuses = await Promise.all(paths.map((pathname) => getStatus(port, pathname, `127.0.0.1:${port}`)));
+    assert.deepEqual(statuses, [403, 403, 403, 403, 403, 403], paths.join(', '));
+    assert.equal(await getStatus(port, '/api/state', `127.0.0.1:${port}`, { 'x-voicevox-coding-token': TOKEN }), 200);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
 
 test('DNS リバインディングの GET は読み取り API も UI も 403 にする', async () => {
   const { server, port } = await startServer();
