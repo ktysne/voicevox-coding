@@ -1,16 +1,18 @@
 // VOICEVOX ENGINE の REST クライアント。
 import { MAX_WAV_DURATION_MS, parseWav } from './player.js';
+import { EngineTrust, NO_LISTENERS_REASON } from './engine-trust.js';
 
 const MAX_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_WAV_RESPONSE_BYTES = 64 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_BYTES = 4 * 1024;
 
 export class EngineError extends Error {
-  constructor(message, { status, cause } = {}) {
+  constructor(message, { status, cause, untrusted } = {}) {
     super(message);
     this.name = 'EngineError';
     this.status = status;
     this.cause = cause;
+    if (untrusted) this.untrusted = true;
   }
 }
 
@@ -69,8 +71,9 @@ async function readResponseBytes(res, { pathname, method, maxBytes, abortControl
 }
 
 export class VoicevoxEngine {
-  constructor(getEngineConfig) {
+  constructor(getEngineConfig, { trust = new EngineTrust() } = {}) {
     this.getEngineConfig = getEngineConfig;
+    this.trust = trust;
   }
 
   get baseUrl() {
@@ -82,10 +85,18 @@ export class VoicevoxEngine {
   }
 
   async #fetch(pathname, { method = 'GET', body, headers, timeoutMs, raw = false } = {}) {
+    // 確認の待ち中に設定が変わっても、確かめた接続先にだけ送る
+    const baseUrl = this.baseUrl;
+    const trust = await this.trust.check(baseUrl);
+    if (!trust.trusted) {
+      throw new EngineError(`ENGINE に接続できません (${baseUrl}): ${trust.reason}`, {
+        untrusted: trust.reason !== NO_LISTENERS_REASON,
+      });
+    }
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs ?? this.timeoutMs);
     try {
-      const res = await fetch(`${this.baseUrl}${pathname}`, {
+      const res = await fetch(`${baseUrl}${pathname}`, {
         method,
         body,
         headers,
@@ -112,11 +123,11 @@ export class VoicevoxEngine {
         abortController: ac,
         raw,
       });
-      return raw ? responseBytes : JSON.parse(responseBytes.toString('utf8'));
+      return raw ? { wav: responseBytes, pids: trust.pids, baseUrl } : JSON.parse(responseBytes.toString('utf8'));
     } catch (err) {
       if (err instanceof EngineError) throw err;
       if (err.name === 'AbortError') throw new EngineError(`ENGINE ${pathname} がタイムアウトしました`);
-      throw new EngineError(`ENGINE に接続できません (${this.baseUrl}): ${err.message}`, { cause: err });
+      throw new EngineError(`ENGINE に接続できません (${baseUrl}): ${err.message}`, { cause: err });
     } finally {
       clearTimeout(timer);
     }
@@ -131,7 +142,7 @@ export class VoicevoxEngine {
       const version = await this.version();
       return { available: true, version: String(version).replace(/"/g, ''), baseUrl: this.baseUrl };
     } catch (err) {
-      return { available: false, error: err.message, baseUrl: this.baseUrl };
+      return { available: false, ...(err.untrusted ? { untrusted: true } : {}), error: err.message, baseUrl: this.baseUrl };
     }
   }
 
@@ -169,12 +180,18 @@ export class VoicevoxEngine {
     // Depth 制限のある実装で壊れるネストなので、そのまま JSON 化して渡す
     const body = Buffer.from(JSON.stringify(query), 'utf8');
     const pathname = `/synthesis?speaker=${encodeURIComponent(speaker)}`;
-    const wav = await this.#fetch(pathname, {
+    const { wav, pids, baseUrl } = await this.#fetch(pathname, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
       raw: true,
     });
+    const trust = await this.trust.check(baseUrl);
+    if (!trust.trusted || pids.length !== trust.pids.length || pids.some((pid) => !trust.pids.includes(pid))) {
+      throw new EngineError(`ENGINE の音声合成中に待受プロセスが変わったか信頼を確認できません: ${trust.reason ?? ''}`, {
+        untrusted: true,
+      });
+    }
     if (!parseWav(wav)) {
       const tooLong = parseWav(wav, { maxDurationMs: Infinity });
       throw new EngineError(tooLong

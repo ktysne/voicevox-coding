@@ -29,12 +29,14 @@ process.env['PROGRAMFILES(X86)'] = 'X:\\fake\\Program Files (x86)';
 let existing = new Set();
 let powershell = { processes: '', registry: '' };
 let spawned = [];
+let killed = [];
 
 const origExecFile = childProcess.execFile;
 const origSpawn = childProcess.spawn;
 const origExistsSync = fs.existsSync;
 
 childProcess.execFile = (file, args, opts, cb) => {
+  if (file === 'taskkill.exe') killed.push(Number(args[1]));
   const script = args.at(-1) ?? '';
   if (/Get-Process/.test(script)) cb(null, powershell.processes);
   else if (/Uninstall/.test(script)) cb(null, powershell.registry);
@@ -66,6 +68,7 @@ beforeEach(() => {
   existing = new Set();
   powershell = { processes: '', registry: '' };
   spawned = [];
+  killed = [];
 });
 
 afterEach(() => {
@@ -146,4 +149,119 @@ test('設定した enginePath が存在すれば、そのパスを起動する',
   const r = await makeProcess(configured).start();
   assert.equal(r.started, true);
   assert.equal(spawned[0]?.exe, configured);
+});
+
+test('start は untrusted のとき force でも spawn しない', async () => {
+  const proc = makeProcess(LOCALAPPDATA_EXE);
+  existing.add(LOCALAPPDATA_EXE);
+  const warnings = [];
+  proc.log.warn = (message) => warnings.push(message);
+  proc.engine.status = async () => ({ available: false, untrusted: true, error: '別ユーザー (PID 10)' });
+  assert.deepEqual(await proc.start({ force: true }), { started: false, error: '別ユーザー (PID 10)' });
+  assert.deepEqual(spawned, []);
+  assert.deepEqual(warnings, ['別ユーザー (PID 10)']);
+});
+
+test('ensure は untrusted のとき start せず理由が変わったときだけ warn を出す', async () => {
+  const proc = makeProcess('');
+  let reason = '別ユーザー (PID 10)';
+  const warnings = [];
+  proc.engine.status = async () => ({ available: false, untrusted: true, error: reason });
+  proc.start = async () => assert.fail('起動してはいけない');
+  proc.log.warn = (message) => warnings.push(message);
+  assert.equal(await proc.ensure(), false);
+  assert.equal(await proc.ensure(), false);
+  reason = '確認できません (PID 11)';
+  assert.equal(await proc.ensure(), false);
+  assert.deepEqual(warnings, ['別ユーザー (PID 10)', '確認できません (PID 11)']);
+});
+
+const pidPath = path.join(tmpHome, '.voicevox-coding', 'engine.pid');
+function writeLivePid() {
+  fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+  fs.writeFileSync(pidPath, String(process.pid));
+}
+
+test('コンストラクターは現在の子プロセスの PID を trust に登録する', () => {
+  let managed;
+  const proc = new EngineProcess(() => ({}), { trust: { setManagedPids(fn) { managed = fn; } } }, null);
+  assert.deepEqual(managed(), []);
+  proc.child = { pid: 42 };
+  assert.deepEqual(managed(), [42]);
+});
+
+test('reclaimStale は PID が待受に含まれ応答するエンジンを引き継ぐ', async () => {
+  writeLivePid();
+  const proc = makeProcess('');
+  proc.engine.baseUrl = 'http://127.0.0.1:50021';
+  proc.engine.trust = { listeners: async (url) => { assert.equal(url, proc.engine.baseUrl); return [process.pid]; } };
+  proc.engine.status = async () => ({ available: true });
+  await proc.reclaimStale();
+  assert.equal(proc.startedByUs, true);
+  assert.deepEqual(killed, []);
+  assert.equal(fs.readFileSync(pidPath, 'utf8'), String(process.pid));
+});
+
+test('reclaimStale は待受が無く応答しない生存 PID を終了して PID ファイルを消す', async () => {
+  writeLivePid();
+  const proc = makeProcess('');
+  proc.engine.trust = { listeners: async () => [] };
+  await proc.reclaimStale();
+  assert.equal(proc.startedByUs, false);
+  assert.deepEqual(killed, [process.pid]);
+  assert.throws(() => fs.readFileSync(pidPath), { code: 'ENOENT' });
+});
+
+test('reclaimStale は待受に含まれない PID を終了せず PID ファイルだけ消す', async () => {
+  for (const available of [true, false]) {
+    writeLivePid();
+    const proc = makeProcess('');
+    proc.engine.trust = { listeners: async () => [process.pid + 1] };
+    proc.engine.status = async () => ({ available });
+    await proc.reclaimStale();
+    assert.equal(proc.startedByUs, false);
+    assert.deepEqual(killed, []);
+    assert.throws(() => fs.readFileSync(pidPath), { code: 'ENOENT' });
+  }
+});
+
+test('reclaimStale は trust が無い・外部ホスト・照会例外の場合は従来の status 判定を使う', async () => {
+  for (const trust of [undefined, { listeners: async () => null }, { listeners: async () => { throw new Error('netstat failed'); } }]) {
+    for (const available of [true, false]) {
+      writeLivePid();
+      killed = [];
+      const proc = makeProcess('');
+      proc.engine.trust = trust;
+      proc.engine.status = async () => ({ available });
+      await proc.reclaimStale();
+      assert.equal(proc.startedByUs, available);
+      assert.deepEqual(killed, available ? [] : [process.pid]);
+    }
+  }
+});
+
+test('reclaimStale は所有者を確かめられない待受を終了させず PID ファイルを残す', async () => {
+  for (const listeners of [async () => [process.pid], async () => { throw new Error('netstat failed'); }]) {
+    writeLivePid();
+    killed = [];
+    const proc = makeProcess('');
+    proc.engine.trust = { listeners };
+    proc.engine.status = async () => ({ available: false, untrusted: true, error: '確認できません (PID 1)' });
+    await proc.reclaimStale();
+    assert.equal(proc.startedByUs, false);
+    assert.deepEqual(killed, []);
+    assert.equal(fs.readFileSync(pidPath, 'utf8'), String(process.pid));
+  }
+});
+
+test('起動した子プロセスが終了したら所有者の照会を省く対象から外す', async () => {
+  let managed;
+  const proc = makeProcess(LOCALAPPDATA_EXE);
+  existing.add(LOCALAPPDATA_EXE);
+  proc.engine.trust = { setManagedPids(fn) { managed = fn; } };
+  proc.engine.trust.setManagedPids(() => (proc.child?.pid ? [proc.child.pid] : []));
+  await proc.start();
+  assert.deepEqual(managed(), [99999]);
+  proc.child.emit('exit', 0);
+  assert.deepEqual(managed(), []);
 });
