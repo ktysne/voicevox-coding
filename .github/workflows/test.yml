@@ -24,8 +24,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 20 は package.json の engines（>=20）の最小保証、24 は現行 LTS の互換確認
-        node-version: ['20.x', '24.x']
+        # 22 は package.json の engines（>=22）の最小保証、24 は現行 LTS の互換確認
+        node-version: ['22.x', '24.x']
     name: test (Node ${{ matrix.node-version }})
     steps:
       - uses: actions/checkout@v4

@@ -19,6 +19,6 @@
     "sync:check": "node tools/cross-review.js sync --check"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   }
 }

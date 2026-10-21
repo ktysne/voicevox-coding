@@ -31,7 +31,7 @@ VOICEVOX Coding 自体を開発するときの入口である。
 | `scripts/doctor.mjs` | エンジン、デーモン、フック登録、Codex の信頼状態を点検する |
 | `test/` | `node:test` による機能テストを置く。PowerShell スクリプトの文字コードやフック登録も確認する |
 | `tools/cross-review*.js`、`tools/cross-review.sync*.json` | ai-cross-review の実行、同期、配布対象の設定を扱う。同期対象の実装は直接編集しない |
-| `.github/workflows/test.yml` | Windows 上で Node.js 20 と 24 のテストを実行する |
+| `.github/workflows/test.yml` | Windows 上で Node.js 22 と 24 のテストを実行する |
 
 ## 検証コマンド
 

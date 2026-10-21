@@ -68,7 +68,7 @@ Claude Code と Codex は、どちらか一方だけでも導入できる。
 | 項目 | 内容 |
 |---|---|
 | OS | Windows |
-| Node.js | 20 以上（`node --version`）。Codex のフックは PATH 上の素の `node` で起動するため、システムの `PATH` から `node` を解決できる必要がある |
+| Node.js | 22 以上（`node --version`）。Codex のフックは PATH 上の素の `node` で起動するため、システムの `PATH` から `node` を解決できる必要がある |
 | VOICEVOX | インストールが必要。VOICEVOX アプリを起動しておく必要はない |
 | PowerShell 7 | セットアップ、更新、アンインストールに必要（[入手先](https://aka.ms/powershell)） |
 | Git | リポジトリの取得と `update.ps1` に使用する |

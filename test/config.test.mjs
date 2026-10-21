@@ -128,7 +128,7 @@ test('patch() に渡した mutationId も change イベントへエコーされ�
 // watch() は変更検知から 150ms 遅らせて再読み込みする（エディタの書き込み
 // 完了待ち）。node:test の mock.timers は Node バージョンによって
 // enable() の引数形式（配列 or { apis: [...] }）が異なり、
-// package.json の engines（node >=20）の下限では壊れる組み合わせがある。
+// package.json の engines の下限に近い版では壊れる組み合わせがある。
 // ここでは setTimeout/clearTimeout 自体を直接差し替えて、
 // 150ms 分の実待機をせず同期的にコールバックを実行させることで
 // タイマー API のバージョン差を気にせず済むようにする。
