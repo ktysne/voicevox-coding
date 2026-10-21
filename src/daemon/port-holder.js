@@ -19,3 +19,14 @@ export async function describePortHolder({ port, listListeners = defaultListList
   const owner = owners.includes('other') ? 'other' : owners.every((value) => value === 'same') ? 'same' : 'unknown';
   return { owner, pids };
 }
+
+export function reportPortInUse({ port, owner, pids, shouldOpen, log, openBrowser }) {
+  if (owner === 'same') {
+    log.error(`ポート ${port} は使用中です。デーモンが既に起動している可能性があります。`);
+    if (shouldOpen) openBrowser();
+  } else if (owner === 'other') {
+    log.error(`ポート ${port} を別のユーザーのプロセスが使っています (PID ${pids.join(', ')})`);
+  } else {
+    log.error(`ポート ${port} の持ち主を確認できません (PID ${pids.join(', ')})`);
+  }
+}

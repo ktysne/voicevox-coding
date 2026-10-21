@@ -3,6 +3,7 @@
 
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import { ConfigStore, CONFIG_PATH, CONFIG_DIR } from './config.js';
 import { Logger } from './logger.js';
@@ -11,7 +12,7 @@ import { EngineProcess } from './engine-process.js';
 import { Player } from './player.js';
 import { SpeechQueue } from './queue.js';
 import { Tray } from './tray.js';
-import { describePortHolder } from './port-holder.js';
+import { describePortHolder, reportPortInUse } from './port-holder.js';
 import { removeOwnRuntimeFile, writeRuntimeFile } from './runtime-file.js';
 import { createServer } from './server.js';
 import { syncEngineDictionary } from './dictionary.js';
@@ -98,12 +99,15 @@ const port = store.config.daemon?.port ?? 7591;
 const apiToken = crypto.randomBytes(32).toString('hex');
 
 const RUNTIME_PATH = path.join(CONFIG_DIR, 'runtime.json');
+const HOOK_REJECTED_PATH = path.join(CONFIG_DIR, 'hook-rejected.json');
 
 function publishRuntimeFile(port) {
   try {
     writeRuntimeFile(RUNTIME_PATH, { pid: process.pid, port, token: apiToken });
+    return true;
   } catch (err) {
-    log.warn(`runtime.json を書き込めません: ${err.message}`);
+    log.error(`runtime.json を書き込めません。フックが届きません: ${err.message}`);
+    return false;
   }
 }
 
@@ -124,16 +128,14 @@ server.on('error', async (err) => {
   // ログは非同期書き込みなので、exit の前に flush を待たないと診断ログが残らない
   if (err.code === 'EADDRINUSE') {
     const { owner, pids } = await describePortHolder({ port });
-    if (owner === 'same') {
-      log.error(`ポート ${port} は使用中です。デーモンが既に起動している可能性があります。`);
-      if (shouldOpen) {
-        spawn('cmd.exe', ['/c', 'start', '', `http://127.0.0.1:${port}/`], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-      }
-    } else if (owner === 'other') {
-      log.error(`ポート ${port} を別のユーザーのプロセスが使っています (PID ${pids.join(', ')})`);
-    } else {
-      log.error(`ポート ${port} の持ち主を確認できません (PID ${pids.join(', ')})`);
-    }
+    reportPortInUse({
+      port,
+      owner,
+      pids,
+      shouldOpen,
+      log,
+      openBrowser: () => spawn('cmd.exe', ['/c', 'start', '', `http://127.0.0.1:${port}/`], { detached: true, stdio: 'ignore', windowsHide: true }).unref(),
+    });
     await log.close().catch(() => {});
     process.exit(1);
   }
@@ -149,7 +151,9 @@ server.listen(port, '127.0.0.1', async () => {
   // 前回実行の一時 WAV の掃除は、ポート取得に成功した後で行う。
   // 二重起動した後発プロセスが、稼働中デーモンの再生待ちファイルを消してしまわないため。
   queue.cleanupEphemeral();
-  publishRuntimeFile(port);
+  if (publishRuntimeFile(port)) {
+    try { fs.unlinkSync(HOOK_REJECTED_PATH); } catch {}
+  }
   syncCommentaryMonitor();
 
   if (store.config.daemon?.tray !== false && !noTray) {

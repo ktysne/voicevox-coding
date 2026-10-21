@@ -41,9 +41,17 @@ function runHookClient({ home, port, input }) {
       env: { ...process.env, USERPROFILE: home, HOME: home, VOICEVOX_CODING_PORT: String(port) },
       stdio: ['pipe', 'ignore', 'ignore'],
     });
-    child.on('error', resolve);
-    child.on('exit', (code) => resolve(code));
-    child.stdin.on('error', () => {});
+    let code;
+    let stdinError = null;
+    let childExited = false;
+    let stdinClosed = false;
+    const finish = () => {
+      if (childExited && stdinClosed) resolve({ code, stdinError });
+    };
+    child.on('error', (error) => resolve({ error }));
+    child.on('exit', (exitCode) => { code = exitCode; childExited = true; finish(); });
+    child.stdin.on('error', (error) => { stdinError = error; });
+    child.stdin.on('close', () => { stdinClosed = true; finish(); });
     child.stdin.end(input);
   });
 }
@@ -63,7 +71,7 @@ test('トークンを持たない待受には、フックの本文を送らな�
     const code = await runHookClient({
       home, port, input: JSON.stringify({ hook_event_name: 'Stop', last_assistant_message: 'secret-dummy' }),
     });
-    assert.equal(code, 0);
+    assert.equal(code.code, 0);
     assert.equal(received.length, 1);
     assert.equal(received[0].url, '/hook/sealed');
     assert.ok(!JSON.stringify(received[0]).includes('a'.repeat(64)));
@@ -79,7 +87,8 @@ for (const runtime of [undefined, {}, { token: '' }, { token: 42 }]) {
     let requests = 0;
     const { server, port } = await listen((req, res) => { requests++; res.end('{}'); });
     try {
-      assert.equal(await runHookClient({ home: makeHome(runtime), port, input: '{"hook_event_name":"Stop"}' }), 0);
+      const result = await runHookClient({ home: makeHome(runtime), port, input: '{"hook_event_name":"Stop"}' });
+      assert.equal(result.code, 0);
       assert.equal(requests, 0);
     } finally {
       server.closeAllConnections();
@@ -87,6 +96,55 @@ for (const runtime of [undefined, {}, { token: '' }, { token: 42 }]) {
     }
   });
 }
+
+test('runtime.json が無い場合も stdin を読み切ってから終了する', async () => {
+  const result = await runHookClient({ home: makeHome(undefined), port: 7591, input: 'x'.repeat(8 * 1024 * 1024) });
+  assert.equal(result.code, 0);
+  assert.equal(result.stdinError, null);
+});
+
+test('sealed が 404 を返したとき拒否記録を残し、平文へ再送しない', async () => {
+  const received = [];
+  const { server, port } = await listen((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => {
+      received.push({ url: req.url, body });
+      res.writeHead(404).end();
+    });
+  });
+  try {
+    const home = makeHome({ token: 'secret-token' });
+    const payload = JSON.stringify({ hook_event_name: 'Stop', last_assistant_message: 'secret-body' });
+    const result = await runHookClient({ home, port, input: payload });
+    assert.equal(result.code, 0);
+    assert.deepEqual(received.map(({ url }) => url), ['/hook/sealed']);
+    assert.ok(!received[0].body.includes('secret-body'));
+    assert.ok(!received[0].body.includes('secret-token'));
+    const rejection = JSON.parse(fs.readFileSync(path.join(home, '.voicevox-coding', 'hook-rejected.json'), 'utf8'));
+    assert.deepEqual(Object.keys(rejection).sort(), ['at', 'status']);
+    assert.equal(rejection.status, 404);
+    assert.equal(new Date(rejection.at).toISOString(), rejection.at);
+    assert.ok(!JSON.stringify(rejection).includes('secret-body'));
+    assert.ok(!JSON.stringify(rejection).includes('secret-token'));
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('sealed の 2xx 応答では拒否記録を書かない', async () => {
+  const { server, port } = await listen((req, res) => res.writeHead(200).end('{}'));
+  try {
+    const home = makeHome({ token: 'secret-token' });
+    const result = await runHookClient({ home, port, input: '{"hook_event_name":"Stop"}' });
+    assert.equal(result.code, 0);
+    assert.equal(fs.existsSync(path.join(home, '.voicevox-coding', 'hook-rejected.json')), false);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
 
 test('単体コピーした hook-client の子プロセスから実サーバーの読み上げキューまで届く', async () => {
   const token = 'c'.repeat(64);

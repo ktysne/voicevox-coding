@@ -499,7 +499,7 @@ test('終了処理中でなければ拒否しない', () => {
   assert.equal(isRejectedDuringShutdown(undefined, 'POST', '/api/engine/start'), false);
 });
 
-test('暗号化フックは接続元照会を省き、再送時も応答には受理結果だけを返す', async () => {
+test('暗号化フックは接続元照会を省き、同じ封筒の再送ではキューへ追加しない', async () => {
   let calls = 0;
   const { server, port, store, queue } = await startServer({ start() {}, dispose() {}, async verifySocket() { calls++; return { sameUser: false }; } });
   const config = normalizeConfig({ targets: { claudeCode: { events: { Stop: { enabled: true, mode: 'fullText' } } } } });
@@ -513,10 +513,10 @@ test('暗号化フックは接続元照会を省き、再送時も応答には�
       const result = await fetch(`http://127.0.0.1:${port}/hook/sealed`, {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(sealed),
       });
-      assert.equal(result.status, 200);
-      assert.deepEqual(await result.json(), { ok: true });
+      assert.equal(result.status, i === 0 ? 200 : 403);
+      assert.deepEqual(await result.json(), i === 0 ? { ok: true } : { error: 'replayed sealed hook' });
     }
-    assert.equal(items.length, 2);
+    assert.equal(items.length, 1);
     assert.equal(items[0].text, '秘密です。');
     assert.equal(calls, 0);
   } finally {
@@ -525,7 +525,10 @@ test('暗号化フックは接続元照会を省き、再送時も応答には�
   }
 });
 
-test('暗号化フックは復号できない本文を 403 にして警告する', async () => {
+test('暗号化フックの拒否警告を 60 秒ごとにまとめ、抑制件数を次の行へ添える', async (t) => {
+  let now = 1_000_000;
+  const dateNow = mock.method(Date, 'now', () => now);
+  t.after(() => dateNow.mock.restore());
   const warnings = [];
   const log = { subscribe() {}, warn(message) { warnings.push(message); }, info() {}, debug() {}, error() {} };
   const { server, port } = await startServer(undefined, { log });
@@ -536,7 +539,14 @@ test('暗号化フックは復号できない本文を 403 にして警告する
       });
       assert.equal(result.status, 403);
     }
-    assert.equal(warnings.length, 3);
+    assert.equal(warnings.length, 1);
+    now += 60_000;
+    const next = await fetch(`http://127.0.0.1:${port}/hook/sealed`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(next.status, 403);
+    assert.equal(warnings.length, 2);
+    assert.match(warnings[1], /\(ほか 2 件\)$/);
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));

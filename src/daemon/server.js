@@ -28,6 +28,9 @@ const MIME = {
 const QUEUE_TEXT_PREVIEW_LENGTH = 30;
 const HOOK_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
 const SEALED_HOOK_BODY_LIMIT_BYTES = Math.ceil(HOOK_BODY_LIMIT_BYTES * 4 / 3) + 64 * 1024;
+const SEALED_HOOK_REPLAY_WINDOW_MS = 120_000;
+const SEALED_HOOK_REJECTION_LOG_INTERVAL_MS = 60_000;
+const MAX_REMEMBERED_SEALED_HOOKS = 10_000;
 
 function json(res, status, body) {
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
@@ -183,6 +186,30 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     start() {}, dispose() {}, verifySocket: async () => ({ sameUser: false }),
   });
   const sseClients = new Set();
+  const acceptedSealedHookIvs = new Map();
+  let lastSealedHookRejectionLogAt = null;
+  let suppressedSealedHookRejectionCount = 0;
+
+  const pruneAcceptedSealedHookIvs = (now) => {
+    for (const [iv, acceptedAt] of acceptedSealedHookIvs) {
+      if (now - acceptedAt >= SEALED_HOOK_REPLAY_WINDOW_MS) acceptedSealedHookIvs.delete(iv);
+    }
+  };
+
+  const warnSealedHookRejected = (reason) => {
+    const now = Date.now();
+    if (lastSealedHookRejectionLogAt !== null
+      && now - lastSealedHookRejectionLogAt < SEALED_HOOK_REJECTION_LOG_INTERVAL_MS) {
+      suppressedSealedHookRejectionCount++;
+      return;
+    }
+    const suffix = suppressedSealedHookRejectionCount > 0
+      ? ` (ほか ${suppressedSealedHookRejectionCount} 件)`
+      : '';
+    log.warn(`暗号化フックを拒否しました: ${reason}${suffix}`);
+    lastSealedHookRejectionLogAt = now;
+    suppressedSealedHookRejectionCount = 0;
+  };
 
   // 同じ警告を発話のたびに出すとログが埋まるので、一度出したものは覚えておく。
   // 設定を変えたら出し直したいので、config の変更で忘れる。
@@ -313,6 +340,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const { pathname } = url;
+    if (pathname === '/hook/sealed') pruneAcceptedSealedHookIvs(Date.now());
 
     if (!isLocalHostHeader(req.headers.host, port)) {
       log.warn(`要求を拒否しました: ${req.method} ${pathname} — ローカル以外の Host からの要求は受け付けません`);
@@ -354,7 +382,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
         try { envelope = JSON.parse(text); } catch {}
         const body = openSealedHook(token, envelope);
         if (!body.ok) {
-          log.warn(`暗号化フックを拒否しました: ${body.reason}`);
+          warnSealedHookRejected(body.reason);
           json(res, 403, { error: 'invalid sealed hook' });
           return;
         }
@@ -363,6 +391,17 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
           json(res, 413, { error: 'payload too large' });
           return;
         }
+        const acceptedAt = Date.now();
+        pruneAcceptedSealedHookIvs(acceptedAt);
+        if (acceptedSealedHookIvs.has(envelope.iv)) {
+          warnSealedHookRejected('封筒の再送');
+          json(res, 403, { error: 'replayed sealed hook' });
+          return;
+        }
+        if (acceptedSealedHookIvs.size >= MAX_REMEMBERED_SEALED_HOOKS) {
+          acceptedSealedHookIvs.delete(acceptedSealedHookIvs.keys().next().value);
+        }
+        acceptedSealedHookIvs.set(envelope.iv, acceptedAt);
         processHook(body);
         json(res, 200, { ok: true });
         return;

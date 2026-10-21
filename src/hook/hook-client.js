@@ -11,6 +11,7 @@ import os from 'node:os';
 const TARGET = process.argv[2] ?? 'claudeCode';
 const CONFIG_PATH = path.join(os.homedir(), '.voicevox-coding', 'config.json');
 const RUNTIME_PATH = path.join(os.homedir(), '.voicevox-coding', 'runtime.json');
+const HOOK_REJECTED_PATH = path.join(os.homedir(), '.voicevox-coding', 'hook-rejected.json');
 const DEFAULT_PORT = 7591;
 const TIMEOUT_MS = 2000;
 
@@ -44,9 +45,14 @@ function readStdin() {
 }
 
 async function main() {
-  const token = JSON.parse(fs.readFileSync(RUNTIME_PATH, 'utf8'))?.token;
-  if (typeof token !== 'string' || !token) return;
   const text = await readStdin();
+  let token;
+  try {
+    token = JSON.parse(fs.readFileSync(RUNTIME_PATH, 'utf8'))?.token;
+  } catch {
+    return;
+  }
+  if (typeof token !== 'string' || !token) return;
   if (!text.trim()) return;
 
   let payload;
@@ -66,12 +72,17 @@ async function main() {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
   try {
-    await fetch(`http://127.0.0.1:${resolvePort()}/hook/sealed`, {
+    const response = await fetch(`http://127.0.0.1:${resolvePort()}/hook/sealed`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
       signal: ac.signal,
     });
+    if (response.status === 403 || response.status === 404) {
+      try {
+        fs.writeFileSync(HOOK_REJECTED_PATH, JSON.stringify({ at: new Date().toISOString(), status: response.status }), 'utf8');
+      } catch {}
+    }
   } catch {
   } finally {
     clearTimeout(timer);

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { describePortHolder } from '../src/daemon/port-holder.js';
+import { describePortHolder, reportPortInUse } from '../src/daemon/port-holder.js';
 
 for (const [name, owners, expected] of [
   ['同じユーザー', ['same'], 'same'],
@@ -39,3 +39,39 @@ test('所有者照会の失敗が混じる場合は同一ユーザーとみな�
     assert.deepEqual(result, { owner: owner === 'other' ? 'other' : 'unknown', pids: [100, 200] });
   }
 });
+
+test('同じユーザーのポートならログを出し、要求されたときだけブラウザーを開く', () => {
+  for (const shouldOpen of [false, true]) {
+    const errors = [];
+    let opens = 0;
+    reportPortInUse({
+      port: 7591,
+      owner: 'same',
+      pids: [123],
+      shouldOpen,
+      log: { error(message) { errors.push(message); } },
+      openBrowser() { opens++; },
+    });
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /既に起動/);
+    assert.equal(opens, shouldOpen ? 1 : 0);
+  }
+});
+
+for (const owner of ['other', 'unknown']) {
+  test(`${owner} のポート所有者ではブラウザーを開かない`, () => {
+    const errors = [];
+    let opens = 0;
+    reportPortInUse({
+      port: 7591,
+      owner,
+      pids: [123],
+      shouldOpen: true,
+      log: { error(message) { errors.push(message); } },
+      openBrowser() { opens++; },
+    });
+    assert.equal(errors.length, 1);
+    assert.equal(opens, 0);
+    assert.match(errors[0], owner === 'other' ? /別のユーザー/ : /持ち主を確認できません/);
+  });
+}
