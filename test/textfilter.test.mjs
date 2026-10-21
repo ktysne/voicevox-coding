@@ -890,6 +890,9 @@ test('内部の入力上限で切った thinking ブロックの中身は読ま�
   const config = { ...F, maxChars: 0, maxSentences: 0, truncationSuffix: '省略' };
   const input = '前<thinking>' + 'あ'.repeat(49_990) + '</thinking>後';
   assert.deepEqual(filterText(input, config), { text: '前。省略。', marked: '前。省略。', truncated: true });
+  // 小文字にすると長さが変わる文字（İ）が前にあっても、後続のブロックの閉じタグを補う。
+  const dotted = '<thinking>İ</thinking>前<THINKING>' + 'あ'.repeat(49_990) + '</THINKING>後';
+  assert.equal(filterText(dotted, config).text, '前。省略。');
   // thinking を読む設定では、閉じタグを補わずに中身を読む。
   const read = filterText(input, { ...config, thinkingBlocks: false });
   assert.match(read.text, /^前 あ+。省略。$/);
@@ -901,6 +904,10 @@ test('内部の入力上限で切ったコードブロックは設定どおり�
     const input = `前\n${fence}js\n${'const secret = 123;\n'.repeat(3000)}${fence}\n後`;
     assert.equal(filterText(input, config).text, '前\n。コードは省略。。省略。');
     assert.equal(filterText(input, { ...config, codeBlock: 'omit' }).text, '前。省略。');
+    // コードを読む設定では、入力に無い閉じ記号を足さない。
+    const read = filterText(input, { ...config, codeBlock: 'read', markdownSymbols: false, inlineCode: 'read' });
+    assert.equal(read.text.split(fence).length, 2, read.text.slice(-40));
+    assert.match(read.text, /const secret = 123;/);
   }
   // 上限の手前で閉じたコードブロックの後ろに、閉じない囲みがあっても後者だけを補う。
   const pair = '前\n```\nx\n```\n中\n~~~\n' + 'y'.repeat(50_000);

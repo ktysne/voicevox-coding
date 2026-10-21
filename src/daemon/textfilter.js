@@ -37,14 +37,16 @@ function replaceThinking(text) {
 
 // replaceThinking と同じ順で開きタグと閉じタグを対応させ、最初に閉じないブロックの閉じタグを返す。
 function danglingThinkingCloser(text) {
-  const lower = text.toLowerCase();
+  const closes = /<\/(thinking|antml:thinking)>/gi;
   THINKING.lastIndex = 0;
   let m;
   while ((m = THINKING.exec(text))) {
-    const closer = `</${m[1].toLowerCase()}>`;
-    const close = lower.indexOf(closer, THINKING.lastIndex);
-    if (close < 0) return closer;
-    THINKING.lastIndex = close + closer.length;
+    const tag = m[1].toLowerCase();
+    closes.lastIndex = THINKING.lastIndex;
+    let close;
+    while ((close = closes.exec(text)) && close[1].toLowerCase() !== tag);
+    if (!close) return `</${tag}>`;
+    THINKING.lastIndex = closes.lastIndex;
   }
   return '';
 }
@@ -681,9 +683,10 @@ export function filterText(input, f = {}) {
 
   // 上限で切ると、閉じ記号が上限の先にあるブロックの中身が地の文として残る。閉じ記号を補って除去を成立させる。
   if (f.thinkingBlocks !== false) t = replaceThinking(inputTruncated ? t + danglingThinkingCloser(t) : t);
-  if (inputTruncated) t += danglingFenceCloser(t);
+  const codeBlockMode = f.codeBlock ?? 'placeholder';
+  if (inputTruncated && codeBlockMode !== 'read') t += danglingFenceCloser(t);
 
-  t = applyCodeBlocks(t, f.codeBlock ?? 'placeholder', f.codeBlockPlaceholder ?? 'コードは省略');
+  t = applyCodeBlocks(t, codeBlockMode, f.codeBlockPlaceholder ?? 'コードは省略');
   t = applyTables(t, f.table ?? 'omit');
 
   if (f.htmlTags !== false) t = replaceHtmlTags(t);
