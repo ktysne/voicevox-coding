@@ -14,7 +14,7 @@ Node.js の標準モジュールだけで動き、npm パッケージへの依�
 フックはイベントを常駐デーモンへ転送し、設定と読み上げ処理はデーモンに集約する。
 構成と機能の詳しい説明は [docs/usage.md](docs/usage.md) にある。
 
-動作要件は Windows、Node.js 20 以上、PowerShell 7、VOICEVOX である。
+動作要件は Windows、Node.js 22 以上、PowerShell 7、VOICEVOX である。
 
 ## 連携できるツール
 
