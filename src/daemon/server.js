@@ -25,6 +25,10 @@ const MIME = {
   '.ico': 'image/x-icon',
 };
 const QUEUE_TEXT_PREVIEW_LENGTH = 30;
+// 1 オリジン約 6 本の接続枠を使うブラウザーで複数タブを許容する。
+export const SSE_MAX_CLIENTS = 16;
+// PUT 本文上限の 4 MiB と同じ容量を、1 フレームの送信待ちに許容する。
+export const SSE_MAX_PENDING_BYTES = 4 * 1024 * 1024;
 
 function json(res, status, body) {
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
@@ -188,6 +192,27 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     start() {}, dispose() {}, verifySocket: async () => ({ sameUser: false }),
   });
   const sseClients = new Set();
+  const sseClientCleanup = new WeakMap();
+
+  const writeSse = (res, frame) => {
+    const cleanup = sseClientCleanup.get(res);
+    if (res.destroyed || res.writableEnded) {
+      cleanup?.();
+      return false;
+    }
+    if (res.writableLength > SSE_MAX_PENDING_BYTES) {
+      cleanup?.();
+      res.destroy();
+      return false;
+    }
+    try {
+      return res.write(frame);
+    } catch {
+      cleanup?.();
+      res.destroy();
+      return false;
+    }
+  };
 
   // 同じ警告を発話のたびに出すとログが埋まるので、一度出したものは覚えておく。
   // 設定を変えたら出し直したいので、config の変更で忘れる。
@@ -265,9 +290,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   const broadcast = (event, data) => {
     const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of sseClients) {
-      try {
-        res.write(frame);
-      } catch {}
+      writeSse(res, frame);
     }
   };
 
@@ -589,22 +612,28 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
 
       // --- SSE ---
       if (req.method === 'GET' && pathname === '/api/stream') {
+        if (sseClients.size >= SSE_MAX_CLIENTS) {
+          json(res, 503, { error: 'SSE の接続数が上限に達しています' });
+          return;
+        }
         res.writeHead(200, {
           'Content-Type': 'text/event-stream; charset=utf-8',
           'Cache-Control': 'no-cache',
           Connection: 'keep-alive',
         });
-        res.write(': connected\n\n');
         sseClients.add(res);
-        const keepAlive = setInterval(() => {
-          try {
-            res.write(': ping\n\n');
-          } catch {}
-        }, 20000);
-        req.on('close', () => {
-          clearInterval(keepAlive);
+        let keepAlive;
+        let cleaned = false;
+        const cleanup = () => {
+          if (cleaned) return;
+          cleaned = true;
           sseClients.delete(res);
-        });
+          clearInterval(keepAlive);
+        };
+        sseClientCleanup.set(res, cleanup);
+        res.once('close', cleanup);
+        writeSse(res, ': connected\n\n');
+        keepAlive = setInterval(() => writeSse(res, ': ping\n\n'), 20000);
         return;
       }
 
