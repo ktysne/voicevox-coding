@@ -24,6 +24,7 @@ const MIME = {
   '.svg': 'image/svg+xml',
   '.ico': 'image/x-icon',
 };
+const QUEUE_TEXT_PREVIEW_LENGTH = 30;
 
 function json(res, status, body) {
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
@@ -95,20 +96,20 @@ function hasValidToken(headers, token) {
   return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
 }
 
-function needsCallerCheck(method, pathname) {
-  return method !== 'GET' && method !== 'HEAD' && !CALLER_CHECK_EXEMPT_PATHS.includes(pathname);
+function needsCallerCheck(pathname) {
+  return !CALLER_CHECK_EXEMPT_PATHS.includes(pathname);
 }
 
 /**
  * 全要求の受け入れ判定。Host、接続元の OS ユーザー、変更系の規則の順に評価し、最初の拒否で打ち切る。
- * caller は接続元の確認の結果 ({ sameUser })。トークンを持つ要求は、昇格して動くトレイや更新スクリプトのため
- * 接続元が確かめられなくても通す。
+ * /hook 以外は読み取りも含め、同じ OS ユーザーか正しいトークンを要求する。トークンでも通すのは、
+ * 昇格して動くトレイや更新スクリプトでは接続元の SID を引けないことがあるためである。
  */
 export function authorizeRequest({ method, pathname, headers = {}, port, token, caller }) {
   if (!isLocalHostHeader(headers.host, port)) {
     return { ok: false, status: 403, error: 'ローカル以外の Host からの要求は受け付けません' };
   }
-  if (needsCallerCheck(method, pathname) && caller?.sameUser !== true && !hasValidToken(headers, token)) {
+  if (needsCallerCheck(pathname) && caller?.sameUser !== true && !hasValidToken(headers, token)) {
     return { ok: false, status: 403, error: '接続元の OS ユーザーを確認できません' };
   }
   if (method !== 'GET' && method !== 'HEAD') return checkMutationRequest({ pathname, headers, port, token });
@@ -123,6 +124,17 @@ export function isLocalHostHeader(host, port) {
   if (typeof host !== 'string') return false;
   const value = host.toLowerCase();
   return value === `127.0.0.1:${port}` || value === `localhost:${port}`;
+}
+
+export function summarizeQueueState(state) {
+  const summarizeText = (text) => text.length > QUEUE_TEXT_PREVIEW_LENGTH
+    ? `${text.slice(0, QUEUE_TEXT_PREVIEW_LENGTH)}…`
+    : text;
+  return {
+    ...state,
+    current: state.current ? { ...state.current, text: summarizeText(state.current.text) } : null,
+    queued: state.queued.map((item) => ({ ...item, text: summarizeText(item.text) })),
+  };
 }
 
 /**
@@ -258,7 +270,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     }
   };
 
-  queue.on('update', (state) => broadcast('queue', state));
+  queue.on('update', (state) => broadcast('queue', summarizeQueueState(state)));
   store.on('change', (cfg, revision, bootId, mutationId) => broadcast('config', { revision, config: cfg, bootId, mutationId }));
   log.subscribe((entry) => broadcast('log', entry));
   commentaryMonitor?.on('commentary', (payload) => speak('codex', 'Commentary', payload));
@@ -302,18 +314,18 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
         json(res, 503, { error: '終了処理中のため受け付けられません' });
         return;
       }
-      let caller = { sameUser: false };
-      if (needsCallerCheck(req.method, pathname)) {
-        try {
-          caller = await verifier.verifySocket(req.socket, port);
-        } catch {}
-      }
-      const verdict = authorizeRequest({ method: req.method, pathname, headers: req.headers, port, token, caller });
-      if (!verdict.ok) {
-        log.warn(`要求を拒否しました: ${req.method} ${pathname} — ${verdict.error}`);
-        json(res, verdict.status, { error: verdict.error });
-        return;
-      }
+    }
+    let caller = { sameUser: false };
+    if (needsCallerCheck(pathname)) {
+      try {
+        caller = await verifier.verifySocket(req.socket, port);
+      } catch {}
+    }
+    const verdict = authorizeRequest({ method: req.method, pathname, headers: req.headers, port, token, caller });
+    if (!verdict.ok) {
+      log.warn(`要求を拒否しました: ${req.method} ${pathname} — ${verdict.error}`);
+      json(res, verdict.status, { error: verdict.error });
+      return;
     }
 
     try {
@@ -346,7 +358,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
         json(res, 200, {
           engine: engineStatus,
           engineProcess: engineProcess?.status ?? { managed: false, pid: null, starting: false },
-          queue: queue.state,
+          queue: summarizeQueueState(queue.state),
           muted: Boolean(runtime?.muted),
           configPath: CONFIG_PATH,
         });
