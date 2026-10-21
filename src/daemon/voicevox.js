@@ -91,25 +91,27 @@ export class VoicevoxEngine {
         headers,
         signal: ac.signal,
       });
-      const maxBytes = !res.ok
-        ? MAX_ERROR_RESPONSE_BYTES
-        : raw
-          ? MAX_WAV_RESPONSE_BYTES
-          : MAX_JSON_RESPONSE_BYTES;
-      const responseBytes = await readResponseBytes(res, {
-        pathname,
-        method,
-        maxBytes,
-        abortController: ac,
-        raw: res.ok && raw,
-        truncate: !res.ok,
-      });
       if (!res.ok) {
-        const detail = responseBytes.toString('utf8');
+        // 本文は添えるだけなので、読めなくても status を保った EngineError にする(辞書同期が status で拒否を判定する)
+        const detail = await readResponseBytes(res, {
+          pathname,
+          method,
+          maxBytes: MAX_ERROR_RESPONSE_BYTES,
+          abortController: ac,
+          raw: false,
+          truncate: true,
+        }).then((bytes) => bytes.toString('utf8'), () => '');
         throw new EngineError(`ENGINE ${method} ${pathname} が ${res.status} を返しました: ${detail.slice(0, 300)}`, {
           status: res.status,
         });
       }
+      const responseBytes = await readResponseBytes(res, {
+        pathname,
+        method,
+        maxBytes: raw ? MAX_WAV_RESPONSE_BYTES : MAX_JSON_RESPONSE_BYTES,
+        abortController: ac,
+        raw,
+      });
       return raw ? responseBytes : JSON.parse(responseBytes.toString('utf8'));
     } catch (err) {
       if (err instanceof EngineError) throw err;

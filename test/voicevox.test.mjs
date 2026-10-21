@@ -192,6 +192,28 @@ test('長いエラー応答は本文を切り詰め、status を保った Engine
   assert.equal(reads, 1);
 });
 
+test('エラー応答の本文の受信に失敗しても status を保った EngineError になる', async () => {
+  const engine = makeEngine();
+  await assert.rejects(
+    () => withFetch(
+      async () => ({
+        ok: false,
+        status: 422,
+        headers: { get: () => null },
+        body: {
+          getReader: () => ({
+            read: async () => { throw new TypeError('terminated'); },
+            cancel: async () => {},
+            releaseLock() {},
+          }),
+        },
+      }),
+      () => engine.version(),
+    ),
+    (err) => err instanceof EngineError && err.status === 422,
+  );
+});
+
 test('JSON 応答が上限を超えると EngineError になる', async () => {
   const engine = makeEngine();
   await assert.rejects(
