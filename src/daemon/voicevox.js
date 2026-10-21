@@ -1,4 +1,9 @@
 // VOICEVOX ENGINE の REST クライアント。
+import { parseWav } from './player.js';
+
+const MAX_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_WAV_RESPONSE_BYTES = 64 * 1024 * 1024;
+const MAX_ERROR_RESPONSE_BYTES = 4 * 1024;
 
 export class EngineError extends Error {
   constructor(message, { status, cause } = {}) {
@@ -7,6 +12,60 @@ export class EngineError extends Error {
     this.status = status;
     this.cause = cause;
   }
+}
+
+function responseTooLarge(pathname, method, maxBytes) {
+  return new EngineError(`ENGINE ${method} ${pathname} の応答サイズが上限の ${maxBytes} バイトを超えています`);
+}
+
+function contentLength(res) {
+  const value = res.headers?.get?.('content-length')
+    ?? res.headers?.['content-length']
+    ?? res.headers?.['Content-Length'];
+  const length = Number(value);
+  return Number.isFinite(length) && length >= 0 ? length : null;
+}
+
+// truncate のときは上限で読むのをやめて先頭だけを返す。エラー応答の本文はメッセージに添えるだけなので、
+// 長くても応答のステータスを失わないようにする。
+async function readResponseBytes(res, { pathname, method, maxBytes, abortController, raw, truncate = false }) {
+  if (!truncate && contentLength(res) > maxBytes) {
+    abortController.abort();
+    throw responseTooLarge(pathname, method, maxBytes);
+  }
+
+  if (res.body?.getReader) {
+    const reader = res.body.getReader();
+    const chunks = [];
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+        if (totalBytes + chunk.length > maxBytes) {
+          reader.cancel().catch(() => {});
+          abortController.abort();
+          if (!truncate) throw responseTooLarge(pathname, method, maxBytes);
+          chunks.push(chunk.subarray(0, maxBytes - totalBytes));
+          totalBytes = maxBytes;
+          break;
+        }
+        chunks.push(chunk);
+        totalBytes += chunk.length;
+      }
+    } finally {
+      reader.releaseLock?.();
+    }
+    return Buffer.concat(chunks, totalBytes);
+  }
+
+  const bytes = raw
+    ? Buffer.from(await res.arrayBuffer())
+    : Buffer.from(await res.text(), 'utf8');
+  if (bytes.length <= maxBytes) return bytes;
+  if (truncate) return bytes.subarray(0, maxBytes);
+  throw responseTooLarge(pathname, method, maxBytes);
 }
 
 export class VoicevoxEngine {
@@ -32,13 +91,26 @@ export class VoicevoxEngine {
         headers,
         signal: ac.signal,
       });
+      const maxBytes = !res.ok
+        ? MAX_ERROR_RESPONSE_BYTES
+        : raw
+          ? MAX_WAV_RESPONSE_BYTES
+          : MAX_JSON_RESPONSE_BYTES;
+      const responseBytes = await readResponseBytes(res, {
+        pathname,
+        method,
+        maxBytes,
+        abortController: ac,
+        raw: res.ok && raw,
+        truncate: !res.ok,
+      });
       if (!res.ok) {
-        const detail = await res.text().catch(() => '');
+        const detail = responseBytes.toString('utf8');
         throw new EngineError(`ENGINE ${method} ${pathname} が ${res.status} を返しました: ${detail.slice(0, 300)}`, {
           status: res.status,
         });
       }
-      return raw ? Buffer.from(await res.arrayBuffer()) : await res.json();
+      return raw ? responseBytes : JSON.parse(responseBytes.toString('utf8'));
     } catch (err) {
       if (err instanceof EngineError) throw err;
       if (err.name === 'AbortError') throw new EngineError(`ENGINE ${pathname} がタイムアウトしました`);
@@ -94,12 +166,15 @@ export class VoicevoxEngine {
   async synthesis(query, speaker) {
     // Depth 制限のある実装で壊れるネストなので、そのまま JSON 化して渡す
     const body = Buffer.from(JSON.stringify(query), 'utf8');
-    return this.#fetch(`/synthesis?speaker=${encodeURIComponent(speaker)}`, {
+    const pathname = `/synthesis?speaker=${encodeURIComponent(speaker)}`;
+    const wav = await this.#fetch(pathname, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
       raw: true,
     });
+    if (!parseWav(wav)) throw new EngineError(`ENGINE が不正な WAV を返しました (${pathname})`);
+    return wav;
   }
 
   async synthesize(text, speaker, voiceParams) {

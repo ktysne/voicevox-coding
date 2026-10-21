@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { VoicevoxEngine } from '../src/daemon/voicevox.js';
+import { EngineError, VoicevoxEngine } from '../src/daemon/voicevox.js';
 import { VOICE_PARAMS } from '../src/daemon/catalog.js';
 
 // ENGINE を立てずに /audio_query と /synthesis の往復だけを確かめるため、
@@ -22,6 +22,33 @@ function jsonResponse(body) {
     json: async () => body,
     text: async () => JSON.stringify(body),
     arrayBuffer: async () => new ArrayBuffer(0),
+  };
+}
+
+function wavBytes() {
+  const wav = Buffer.alloc(48);
+  wav.write('RIFF', 0, 'ascii');
+  wav.writeUInt32LE(40, 4);
+  wav.write('WAVE', 8, 'ascii');
+  wav.write('fmt ', 12, 'ascii');
+  wav.writeUInt32LE(16, 16);
+  wav.writeUInt16LE(1, 20);
+  wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(24000, 24);
+  wav.writeUInt32LE(48000, 28);
+  wav.writeUInt16LE(2, 32);
+  wav.writeUInt16LE(16, 34);
+  wav.write('data', 36, 'ascii');
+  wav.writeUInt32LE(4, 40);
+  return wav;
+}
+
+function binaryResponse(wav) {
+  return {
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    arrayBuffer: async () => wav.buffer.slice(wav.byteOffset, wav.byteOffset + wav.byteLength),
   };
 }
 
@@ -121,6 +148,112 @@ test('ENGINE のエラー応答は status 付きの EngineError になる', asyn
   );
 });
 
+test('content-length が JSON 応答の上限を超えると本文を読まず EngineError になる', async () => {
+  const engine = makeEngine();
+  let bodyRead = false;
+  await assert.rejects(
+    () => withFetch(
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => String(8 * 1024 * 1024 + 1) },
+        text: async () => { bodyRead = true; return '{}'; },
+      }),
+      () => engine.version(),
+    ),
+    (err) => err instanceof EngineError && /\/version/.test(err.message) && /8388608/.test(err.message),
+  );
+  assert.equal(bodyRead, false);
+});
+
+test('長いエラー応答は本文を切り詰め、status を保った EngineError になる', async () => {
+  const engine = makeEngine();
+  let cancelled = false;
+  let reads = 0;
+  await assert.rejects(
+    () => withFetch(
+      async () => ({
+        ok: false,
+        status: 422,
+        headers: { get: () => String(10 * 1024 * 1024) },
+        body: {
+          getReader: () => ({
+            read: async () => (reads++ < 10 ? { done: false, value: new Uint8Array(1024 * 1024).fill(0x61) } : { done: true }),
+            cancel: async () => { cancelled = true; },
+            releaseLock() {},
+          }),
+        },
+      }),
+      () => engine.version(),
+    ),
+    (err) => err instanceof EngineError && err.status === 422,
+  );
+  assert.equal(cancelled, true);
+  assert.equal(reads, 1);
+});
+
+test('JSON 応答が上限を超えると EngineError になる', async () => {
+  const engine = makeEngine();
+  await assert.rejects(
+    () => withFetch(
+      async () => ({
+        ok: true,
+        status: 200,
+        headers: { get: () => null },
+        text: async () => ' '.repeat(8 * 1024 * 1024 + 1),
+      }),
+      () => engine.version(),
+    ),
+    (err) => err instanceof EngineError && /8388608/.test(err.message),
+  );
+});
+
+test('WAV ストリームが上限を超えると読み込みを中止して EngineError になる', async () => {
+  const engine = makeEngine();
+  const chunk = Buffer.alloc(1024 * 1024);
+  let index = 0;
+  let cancelled = false;
+  let signal;
+  await assert.rejects(
+    () => withFetch(
+      async (_url, init) => {
+        signal = init.signal;
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          body: {
+            getReader: () => ({
+              read: async () => index++ < 65 ? { done: false, value: chunk } : { done: true },
+              cancel: async () => { cancelled = true; },
+              releaseLock() {},
+            }),
+          },
+        };
+      },
+      () => engine.synthesis({}, 3),
+    ),
+    (err) => err instanceof EngineError && /synthesis/.test(err.message) && /67108864/.test(err.message),
+  );
+  assert.equal(cancelled, true);
+  assert.equal(signal.aborted, true);
+});
+
+test('synthesis は不正な WAV を EngineError にする', async () => {
+  const engine = makeEngine();
+  await assert.rejects(
+    () => withFetch(async () => binaryResponse(Buffer.from([1, 2, 3])), () => engine.synthesis({}, 3)),
+    (err) => err instanceof EngineError && /不正な WAV/.test(err.message),
+  );
+});
+
+test('synthesis は正しい WAV を返す', async () => {
+  const engine = makeEngine();
+  const wav = wavBytes();
+  const result = await withFetch(async () => binaryResponse(wav), () => engine.synthesis({}, 3));
+  assert.deepEqual(result, wav);
+});
+
 test('応答が来ないまま中断されたらタイムアウトの EngineError になる', async () => {
   const engine = makeEngine();
   await assert.rejects(
@@ -147,13 +280,7 @@ test('synthesize は上書き済みのクエリを /synthesis へ渡す', async 
     async (url, init) => {
       requests.push({ url, init });
       if (String(url).includes('/audio_query')) return jsonResponse(audioQueryBody());
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({}),
-        text: async () => '',
-        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer,
-      };
+      return binaryResponse(wavBytes());
     },
     () => engine.synthesize('てすと', 3, { pauseLengthScale: 1.6 }),
   );
