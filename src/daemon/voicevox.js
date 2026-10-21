@@ -1,5 +1,5 @@
 // VOICEVOX ENGINE の REST クライアント。
-import { parseWav } from './player.js';
+import { MAX_WAV_DURATION_MS, parseWav } from './player.js';
 
 const MAX_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
 const MAX_WAV_RESPONSE_BYTES = 64 * 1024 * 1024;
@@ -175,7 +175,12 @@ export class VoicevoxEngine {
       body,
       raw: true,
     });
-    if (!parseWav(wav)) throw new EngineError(`ENGINE が不正な WAV を返しました (${pathname})`);
+    if (!parseWav(wav)) {
+      const tooLong = parseWav(wav, { maxDurationMs: Infinity });
+      throw new EngineError(tooLong
+        ? `ENGINE が返した WAV の再生時間 (${tooLong.durationMs} ms) が上限の ${MAX_WAV_DURATION_MS} ms を超えています (${pathname})`
+        : `ENGINE が不正な WAV を返しました (${pathname})`);
+    }
     return wav;
   }
 

@@ -14,9 +14,10 @@ export const MAX_WAV_DURATION_MS = 5 * 60 * 1000;
 
 /**
  * PCM の WAV ヘッダを検証して形式と再生時間を返す。
- * 形式が不正なとき、または再生時間が MAX_WAV_DURATION_MS を超えるときは null を返す。
+ * 形式が不正なとき、または再生時間が maxDurationMs を超えるときは null を返す。
+ * 音素の無い文では ENGINE が data 0 バイトの WAV を返すので、0 バイトは正しい WAV として扱う。
  */
-export function parseWav(buf) {
+export function parseWav(buf, { maxDurationMs = MAX_WAV_DURATION_MS } = {}) {
   try {
     if (!Buffer.isBuffer(buf) || buf.length < 44) return null;
     if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
@@ -54,9 +55,9 @@ export function parseWav(buf) {
       if (nextOffset > buf.length) break;
       offset = nextOffset;
     }
-    if (!format || !data || data.dataSize <= 0) return null;
+    if (!format || !data) return null;
     const exactDurationMs = (data.dataSize / format.byteRate) * 1000;
-    if (exactDurationMs > MAX_WAV_DURATION_MS) return null;
+    if (exactDurationMs > maxDurationMs) return null;
     const durationMs = Math.round(exactDurationMs);
     return { ...format, ...data, durationMs };
   } catch {

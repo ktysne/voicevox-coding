@@ -246,7 +246,8 @@ test('WAV ストリームが上限を超えると読み込みを中止して Eng
           headers: { get: () => null },
           body: {
             getReader: () => ({
-              read: async () => index++ < 65 ? { done: false, value: chunk } : { done: true },
+              // 終わらないストリーム。上限を超えたチャンクで読むのをやめることを読んだ回数で確かめる
+              read: async () => { index++; return { done: false, value: chunk }; },
               cancel: async () => { cancelled = true; },
               releaseLock() {},
             }),
@@ -259,6 +260,7 @@ test('WAV ストリームが上限を超えると読み込みを中止して Eng
   );
   assert.equal(cancelled, true);
   assert.equal(signal.aborted, true);
+  assert.equal(index, 65);
 });
 
 test('synthesis は不正な WAV を EngineError にする', async () => {
@@ -311,4 +313,19 @@ test('synthesize は上書き済みのクエリを /synthesis へ渡す', async 
   const sent = JSON.parse(Buffer.from(synthesis.init.body).toString('utf8'));
   assert.equal(sent.pauseLengthScale, 1.6);
   assert.equal(query.pauseLengthScale, 1.6);
+});
+
+test('synthesis は再生時間が上限を超えた WAV を形式の不正と区別したメッセージで拒む', async () => {
+  const engine = makeEngine();
+  const wav = wavBytes();
+  // 24kHz / 16bit / モノラル (48000 B/s) で 5 分 + 1 秒ぶんの data を主張する
+  const dataSize = 48000 * 301;
+  const long = Buffer.alloc(44 + dataSize);
+  wav.copy(long, 0, 0, 44);
+  long.writeUInt32LE(36 + dataSize, 4);
+  long.writeUInt32LE(dataSize, 40);
+  await assert.rejects(
+    () => withFetch(async () => binaryResponse(long), () => engine.synthesis({}, 3)),
+    (err) => err instanceof EngineError && /再生時間/.test(err.message) && !/不正な WAV/.test(err.message),
+  );
 });

@@ -290,3 +290,25 @@ test('dispose 後は自動再起動しない', async () => {
   player.start();
   assert.equal(children.length, 1);
 });
+
+test('parseWav は 48000Hz・ステレオ・16bit の WAV を受け付ける', () => {
+  const wav = buildWav({ dataSize: 192000, sampleRate: 48000, channels: 2, blockAlign: 4, byteRate: 192000 });
+  const parsed = parseWav(wav);
+  assert.equal(parsed.sampleRate, 48000);
+  assert.equal(parsed.channels, 2);
+  assert.equal(parsed.durationMs, 1000);
+});
+
+test('parseWav は data が 0 バイトの WAV を再生時間 0 として受け付ける', () => {
+  // 音素の無い文 (記号だけ) を前後の無音 0 で合成すると、ENGINE はこの形を返す
+  const parsed = parseWav(buildWav({ dataSize: 0 }));
+  assert.equal(parsed.dataSize, 0);
+  assert.equal(parsed.durationMs, 0);
+  assert.equal(wavDurationMs(buildWav({ dataSize: 0 })), 0);
+});
+
+test('parseWav は maxDurationMs で再生時間の上限を変えられる', () => {
+  const wav = buildWav({ dataSize: 48000 });
+  assert.equal(parseWav(wav, { maxDurationMs: 999 }), null);
+  assert.equal(parseWav(wav, { maxDurationMs: Infinity }).durationMs, 1000);
+});
