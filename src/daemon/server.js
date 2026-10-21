@@ -321,6 +321,8 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       try {
         caller = await verifier.verifySocket(req.socket, port);
       } catch {}
+      // 待つ間に切れた接続の close は後から拾えないので、ここで捨てないと SSE の購読とタイマーが残る
+      if (req.destroyed || res.destroyed) return;
       // 確認を待つ間に終了処理が始まっていたら、止めたはずの子プロセスを起動し直さないよう拒否する
       if (isRejectedDuringShutdown(runtime, req.method, pathname)) {
         json(res, 503, { error: '終了処理中のため受け付けられません' });

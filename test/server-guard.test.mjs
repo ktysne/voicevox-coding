@@ -326,6 +326,35 @@ test('接続元の確認を待つ間に終了処理が始まったら、エン�
   }
 });
 
+test('接続元の確認を待つ間に切れた SSE の要求は購読に登録しない', async (t) => {
+  const intervals = [];
+  const original = globalThis.setInterval;
+  const spy = mock.method(globalThis, 'setInterval', (fn, ms, ...rest) => {
+    intervals.push(ms);
+    return original(fn, ms, ...rest);
+  });
+  t.after(() => spy.mock.restore());
+  let settled;
+  const verified = new Promise((resolve) => { settled = resolve; });
+  const verifier = { start() {}, dispose() {}, verifySocket: (socket) => new Promise((resolve) => {
+    socket.once('close', () => setImmediate(() => { resolve({ sameUser: true }); setImmediate(settled); }));
+  }) };
+  const { server, port } = await startServer(verifier);
+  try {
+    const req = http.request({ host: '127.0.0.1', port, path: '/api/stream', headers: { host: `127.0.0.1:${port}` } });
+    req.on('error', () => {});
+    req.end();
+    await new Promise((resolve) => server.once('connection', resolve));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    req.destroy();
+    await verified;
+    assert.equal(intervals.filter((ms) => ms === 20000).length, 0);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
 function get(port, pathname, host) {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path: pathname, method: 'GET', headers: { host } }, (res) => {
