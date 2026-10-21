@@ -3,7 +3,6 @@
 
 import { spawn } from 'node:child_process';
 import crypto from 'node:crypto';
-import fs from 'node:fs';
 import path from 'node:path';
 import { ConfigStore, CONFIG_PATH, CONFIG_DIR } from './config.js';
 import { Logger } from './logger.js';
@@ -13,6 +12,7 @@ import { Player } from './player.js';
 import { SpeechQueue } from './queue.js';
 import { Tray } from './tray.js';
 import { describePortHolder } from './port-holder.js';
+import { removeOwnRuntimeFile, writeRuntimeFile } from './runtime-file.js';
 import { createServer } from './server.js';
 import { syncEngineDictionary } from './dictionary.js';
 import { CodexCommentaryMonitor, commentaryEnabled } from './codex-commentary-monitor.js';
@@ -99,23 +99,12 @@ const apiToken = crypto.randomBytes(32).toString('hex');
 
 const RUNTIME_PATH = path.join(CONFIG_DIR, 'runtime.json');
 
-function writeRuntimeFile(port) {
-  const temporaryPath = `${RUNTIME_PATH}.${process.pid}.tmp`;
+function publishRuntimeFile(port) {
   try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(temporaryPath, JSON.stringify({ pid: process.pid, port, token: apiToken }, null, 2), 'utf8');
-    fs.renameSync(temporaryPath, RUNTIME_PATH);
+    writeRuntimeFile(RUNTIME_PATH, { pid: process.pid, port, token: apiToken });
   } catch (err) {
     log.warn(`runtime.json を書き込めません: ${err.message}`);
-  } finally {
-    try { fs.unlinkSync(temporaryPath); } catch {}
   }
-}
-
-function removeRuntimeFile() {
-  try {
-    fs.unlinkSync(RUNTIME_PATH);
-  } catch {}
 }
 
 const server = createServer({
@@ -160,7 +149,7 @@ server.listen(port, '127.0.0.1', async () => {
   // 前回実行の一時 WAV の掃除は、ポート取得に成功した後で行う。
   // 二重起動した後発プロセスが、稼働中デーモンの再生待ちファイルを消してしまわないため。
   queue.cleanupEphemeral();
-  writeRuntimeFile(port);
+  publishRuntimeFile(port);
   syncCommentaryMonitor();
 
   if (store.config.daemon?.tray !== false && !noTray) {
@@ -205,7 +194,7 @@ async function shutdown() {
   runtime.shuttingDown = true;
   server.close(() => {});
   log.info('デーモンを終了します');
-  removeRuntimeFile();
+  removeOwnRuntimeFile(RUNTIME_PATH, process.pid);
   clearInterval(healthTimer);
   store.close();
   tray?.stop();
