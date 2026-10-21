@@ -127,6 +127,8 @@ export class CallerVerifier {
       const send = () => {
         if (this.child !== generation) return;
         entry.sent = true;
+        // READY までは起動待ちの上限だけで見る。ここで測り始めないと、起動の遅いワーカーを要求側が打ち切る
+        entry.timer = setTimeout(() => this.#discard(generation, '接続元確認の応答待ちが上限を超えました'), this.timeoutMs);
         try {
           generation.child.stdin.write(`${id} ${socket.remotePort} ${serverPort}\n`);
         } catch {
@@ -134,7 +136,6 @@ export class CallerVerifier {
         }
       };
       this.pending.set(id, entry);
-      entry.timer = setTimeout(() => this.#discard(generation, '接続元確認の応答待ちが上限を超えました'), this.timeoutMs);
       if (generation.sid) send();
       else generation.waiters.add(send);
     });

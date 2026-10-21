@@ -118,6 +118,18 @@ test('READY 待ちにも上限があり、終了・起動失敗時の結果は�
   assert.equal(warnings.length, 1);
 });
 
+test('応答待ちの上限より遅く、起動待ちの上限より早く READY が届けば確認できる', async (t) => {
+  const { verifier, children } = fixture(t, { timeoutMs: 20, startTimeoutMs: 500 });
+  verifier.start();
+  const pending = verifier.verifySocket(socket(), 7591);
+  await delay(60);
+  children[0].line(`READY ${SID}`);
+  const id = children[0].commands[0].split(' ')[0];
+  children[0].line(`${id} OK ${SID}`);
+  assert.equal((await pending).sameUser, true);
+  assert.equal(children.length, 1);
+});
+
 test('同期的な起動失敗の再起動回数を制限し、警告は一度だけ出す', async () => {
   let starts = 0;
   const warnings = [];

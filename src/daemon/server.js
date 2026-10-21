@@ -316,10 +316,16 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       }
     }
     let caller = { sameUser: false };
-    if (needsCallerCheck(pathname)) {
+    // トークンを持つ要求は接続元を引かない。ワーカーの不調でトレイの操作が時間切れにならないようにするため
+    if (needsCallerCheck(pathname) && !hasValidToken(req.headers, token)) {
       try {
         caller = await verifier.verifySocket(req.socket, port);
       } catch {}
+      // 確認を待つ間に終了処理が始まっていたら、止めたはずの子プロセスを起動し直さないよう拒否する
+      if (isRejectedDuringShutdown(runtime, req.method, pathname)) {
+        json(res, 503, { error: '終了処理中のため受け付けられません' });
+        return;
+      }
     }
     const verdict = authorizeRequest({ method: req.method, pathname, headers: req.headers, port, token, caller });
     if (!verdict.ok) {

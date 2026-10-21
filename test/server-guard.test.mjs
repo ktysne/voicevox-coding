@@ -76,13 +76,14 @@ test('実サーバーは /hook 以外の要求で接続元を確認し、起動�
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'HEAD' })).status, 404);
     assert.equal((await fetch(`http://127.0.0.1:${port}/hook`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"event":"MessageDisplay"}' })).status, 200);
     assert.deepEqual(calls, ['start', 'verify', 'verify']);
+    // トークンを持つ要求は接続元を引かない
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json', 'x-voicevox-coding-token': TOKEN }, body: '{}' })).status, 200);
-    assert.deepEqual(calls, ['start', 'verify', 'verify', 'verify']);
+    assert.deepEqual(calls, ['start', 'verify', 'verify']);
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
-  assert.deepEqual(calls, ['start', 'verify', 'verify', 'verify', 'dispose']);
+  assert.deepEqual(calls, ['start', 'verify', 'verify', 'dispose']);
 });
 
 test('設定 API は変更した不正な enginePath を保存せず、同じ値と空文字は通す', async (t) => {
@@ -254,7 +255,7 @@ test('Host は 127.0.0.1 と localhost の自ポートだけを許す', () => {
   assert.equal(isLocalHostHeader(undefined, PORT), false);
 });
 
-async function startServer(callerVerifier = { start() {}, dispose() {}, verifySocket: async () => ({ sameUser: true }) }) {
+async function startServer(callerVerifier = { start() {}, dispose() {}, verifySocket: async () => ({ sameUser: true }) }, extra = {}) {
   const store = Object.assign(new EventEmitter(), { config: { targets: {} }, revision: 1, bootId: 'boot', profile: () => null,
     save(next) { this.config = normalizeConfig(next); this.revision++; return this.config; },
     patch(next) { return this.save(normalizeConfig(next, this.config)); },
@@ -266,7 +267,7 @@ async function startServer(callerVerifier = { start() {}, dispose() {}, verifySo
   await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
   const { port } = probe.address();
   await new Promise((resolve) => probe.close(resolve));
-  const server = createServer({ store, engine, queue, log, runtime: {}, port, token: TOKEN, callerVerifier });
+  const server = createServer({ store, engine, queue, log, runtime: {}, port, token: TOKEN, callerVerifier, ...extra });
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
   return { server, port, store, queue };
 }
@@ -284,6 +285,41 @@ test('別ユーザーの自 Origin 偽装 PUT を実サーバーで拒否する'
       method: 'PUT', headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: JSON.stringify({ targets: {} }),
     });
     assert.equal(result.status, 403);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('トークンを持つ変更系の要求は接続元を引かずに通し、Origin の検査は残す', async () => {
+  let calls = 0;
+  const { server, port } = await startServer({ start() {}, dispose() {}, verifySocket: async () => { calls++; return { sameUser: false }; } });
+  try {
+    const post = (headers) => fetch(`http://127.0.0.1:${port}/api/engine/start`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-voicevox-coding-token': TOKEN, ...headers }, body: '{}',
+    });
+    // engineProcess を渡していないので、受け入れ判定を通れば 501 になる
+    assert.equal((await post({})).status, 501);
+    assert.equal((await post({ origin: 'https://evil.example' })).status, 403);
+    assert.equal(calls, 0);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('接続元の確認を待つ間に終了処理が始まったら、エンジンを起動せず 503 を返す', async () => {
+  const runtime = { shuttingDown: false };
+  let started = false;
+  const engineProcess = { status: {}, start: async () => { started = true; return { started: true }; } };
+  const verifier = { start() {}, dispose() {}, verifySocket: async () => { runtime.shuttingDown = true; return { sameUser: true }; } };
+  const { server, port } = await startServer(verifier, { runtime, engineProcess });
+  try {
+    const result = await fetch(`http://127.0.0.1:${port}/api/engine/start`, {
+      method: 'POST', headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(result.status, 503);
+    assert.equal(started, false);
   } finally {
     server.closeAllConnections();
     server.close();
