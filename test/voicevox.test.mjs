@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EngineError, VoicevoxEngine } from '../src/daemon/voicevox.js';
 import { VOICE_PARAMS } from '../src/daemon/catalog.js';
-import { EngineTrust, parseNetstatListeners, NO_LISTENERS_REASON } from '../src/daemon/engine-trust.js';
+import { EngineTrust, parseNetstatListeners, NO_LISTENERS_REASON, queryProcessOwner, queryProcessLink } from '../src/daemon/engine-trust.js';
 
 // ENGINE を立てずに /audio_query と /synthesis の往復だけを確かめるため、
 // global の fetch を差し替えて応答を模す。
@@ -552,4 +552,39 @@ test('信頼の確認を待つ間に接続先が変わっても、確かめた�
   });
   assert.deepEqual(checked, ['http://127.0.0.1:50021']);
   assert.deepEqual(urls, ['http://127.0.0.1:50021/version']);
+});
+
+test('parseNetstatListeners は状態列の訳語に空白があっても読む', () => {
+  const output = '  TCP    127.0.0.1:50021    0.0.0.0:0    ABHÖREN WARTEND    10';
+  assert.deepEqual(parseNetstatListeners(output, 50021, '127.0.0.1'), [10]);
+});
+
+test('synthesis は待受の組だけが変わったとき、変わった PID をエラー文に含める', async () => {
+  let checks = 0;
+  const engine = new VoicevoxEngine(() => ({}), { trust: { check: async () => ({ trusted: true, pids: [++checks === 1 ? 10 : 11] }) } });
+  await withFetch(async () => binaryResponse(wavBytes()), async () => {
+    await assert.rejects(() => engine.synthesis({}, 3), (err) => /10/.test(err.message) && /11/.test(err.message) && !/: $/.test(err.message));
+  });
+});
+
+test('EngineTrust.isDescendantOf は親をたどって祖先を見つける', async () => {
+  const links = new Map([[30, { parentPid: 20, created: 300n }], [20, { parentPid: 10, created: 200n }], [10, { parentPid: 1, created: 100n }], [1, { parentPid: 0, created: 1n }]]);
+  const trust = new EngineTrust({ queryProcessLink: async (pid) => links.get(pid) ?? null });
+  assert.equal(await trust.isDescendantOf(30, 10), true);
+  assert.equal(await trust.isDescendantOf(30, 99), false);
+  assert.equal(await trust.isDescendantOf(10, 30), false);
+});
+
+test('EngineTrust.isDescendantOf は子より後に作られた親 (再利用された PID) を祖先とみなさない', async () => {
+  // 30 の本当の親は終了し、その PID 10 を後から作られた別のプロセスが使っている
+  const links = new Map([[30, { parentPid: 10, created: 300n }], [10, { parentPid: 1, created: 500n }]]);
+  const trust = new EngineTrust({ queryProcessLink: async (pid) => links.get(pid) ?? null });
+  assert.equal(await trust.isDescendantOf(30, 10), false);
+});
+
+test('queryProcessOwner と queryProcessLink は自分のプロセスを実際に照会できる', { skip: process.platform !== 'win32' }, async () => {
+  assert.equal(await queryProcessOwner(process.pid), 'same');
+  const self = await queryProcessLink(process.pid);
+  assert.equal(self.parentPid, process.ppid);
+  assert.ok((await queryProcessLink(process.ppid)).created <= self.created);
 });

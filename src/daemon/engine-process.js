@@ -184,11 +184,15 @@ export class EngineProcess {
     try {
       listeners = await this.engine.trust?.listeners(this.engine.baseUrl) ?? null;
     } catch {}
-    // 別のプロセスが待受しているなら、PID ファイルの PID は再利用されたものなので終了させない
+    // 待受が前回の PID でもその子孫でもなければ、PID ファイルの PID は再利用されたものなので終了させない
     if (listeners?.length && !listeners.includes(pid)) {
-      this.log?.info(`PID ${pid} はエンジンの待受ではないため、引き継がずに PID ファイルを消します`);
-      writePid(null);
-      return;
+      const descendant = status.available
+        && await this.#anyDescendantOf(listeners, pid);
+      if (!descendant) {
+        this.log?.info(`PID ${pid} はエンジンの待受ではないため、引き継がずに PID ファイルを消します`);
+        writePid(null);
+        return;
+      }
     }
     if (status.available) {
       // 生きていて応答もする。前回起動したものをそのまま使う
@@ -201,18 +205,29 @@ export class EngineProcess {
     writePid(null);
   }
 
+  async #anyDescendantOf(pids, ancestor) {
+    try {
+      for (const pid of pids) {
+        if (await this.engine.trust?.isDescendantOf?.(pid, ancestor)) return true;
+      }
+    } catch {}
+    return false;
+  }
+
   /**
-   * エンジンが応答するまで待つ。
-   * モデル読み込みがあるので初回は 20〜60 秒かかることがある。
+   * エンジンが応答するまで待つ。モデル読み込みがあるので初回は 20〜60 秒かかることがある。
+   * 待受が別ユーザーのものと分かったら、待っても応答しないので理由を返して抜ける。
+   * @returns {Promise<{ready:boolean, error?:string}>}
    */
   async waitUntilReady(timeoutMs = 90000) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       const s = await this.engine.status();
-      if (s.available) return true;
+      if (s.available) return { ready: true };
+      if (s.untrusted) return { ready: false, error: s.error };
       await new Promise((r) => setTimeout(r, 1000));
     }
-    return false;
+    return { ready: false };
   }
 
   /**
@@ -225,9 +240,10 @@ export class EngineProcess {
     this.starting = (async () => {
       const status = await this.engine.status();
       if (status.untrusted) {
-        this.log?.warn(status.error);
-        return { started: false, error: status.error };
+        this.#warnUntrusted(status.error);
+        return { started: false, untrusted: true, error: status.error };
       }
+      this.lastUntrustedReason = null;
       if (status.available && !force) {
         return { started: false, alreadyRunning: true };
       }
@@ -280,8 +296,12 @@ export class EngineProcess {
       this.startedByUs = true;
       writePid(child.pid);
 
-      const ready = await this.waitUntilReady(cfg.startTimeoutSec ? cfg.startTimeoutSec * 1000 : 90000);
-      if (!ready) {
+      const wait = await this.waitUntilReady(cfg.startTimeoutSec ? cfg.startTimeoutSec * 1000 : 90000);
+      if (wait.error) {
+        this.#warnUntrusted(wait.error);
+        return { started: true, untrusted: true, error: wait.error };
+      }
+      if (!wait.ready) {
         this.log?.error('エンジンが起動しましたが応答しません');
         return { started: true, error: 'エンジンが時間内に応答しませんでした' };
       }
@@ -315,13 +335,18 @@ export class EngineProcess {
     if (!cfg.autoStart) return false;
     const s = await this.engine.status();
     if (s.untrusted) {
-      if (this.lastUntrustedReason !== s.error) this.log?.warn(s.error);
-      this.lastUntrustedReason = s.error;
+      this.#warnUntrusted(s.error);
       return false;
     }
     this.lastUntrustedReason = null;
     if (s.available) return true;
     const r = await this.start();
     return r.started && !r.error;
+  }
+
+  // 健康確認は定期的に走るので、同じ理由の警告は続けて出さない。untrusted を返した経路の警告はここだけで出す
+  #warnUntrusted(reason) {
+    if (this.lastUntrustedReason !== reason) this.log?.warn(reason);
+    this.lastUntrustedReason = reason;
   }
 }

@@ -157,7 +157,7 @@ test('start は untrusted のとき force でも spawn しない', async () => {
   const warnings = [];
   proc.log.warn = (message) => warnings.push(message);
   proc.engine.status = async () => ({ available: false, untrusted: true, error: '別ユーザー (PID 10)' });
-  assert.deepEqual(await proc.start({ force: true }), { started: false, error: '別ユーザー (PID 10)' });
+  assert.deepEqual(await proc.start({ force: true }), { started: false, untrusted: true, error: '別ユーザー (PID 10)' });
   assert.deepEqual(spawned, []);
   assert.deepEqual(warnings, ['別ユーザー (PID 10)']);
 });
@@ -264,4 +264,70 @@ test('起動した子プロセスが終了したら所有者の照会を省く�
   assert.deepEqual(managed(), [99999]);
   proc.child.emit('exit', 0);
   assert.deepEqual(managed(), []);
+});
+
+test('reclaimStale は待受が前回の PID の子孫なら引き継ぐ', async () => {
+  writeLivePid();
+  killed = [];
+  const proc = makeProcess('');
+  const child = process.pid + 1;
+  proc.engine.trust = {
+    listeners: async () => [child],
+    isDescendantOf: async (pid, ancestor) => pid === child && ancestor === process.pid,
+  };
+  proc.engine.status = async () => ({ available: true });
+  await proc.reclaimStale();
+  assert.equal(proc.startedByUs, true);
+  assert.deepEqual(killed, []);
+  assert.equal(fs.readFileSync(pidPath, 'utf8'), String(process.pid));
+});
+
+test('reclaimStale は待受が前回の PID の子孫でなければ引き継がない', async () => {
+  for (const isDescendantOf of [async () => false, async () => { throw new Error('照会の失敗'); }]) {
+    writeLivePid();
+    killed = [];
+    const proc = makeProcess('');
+    proc.engine.trust = { listeners: async () => [process.pid + 1], isDescendantOf };
+    proc.engine.status = async () => ({ available: true });
+    await proc.reclaimStale();
+    assert.equal(proc.startedByUs, false);
+    assert.deepEqual(killed, []);
+    assert.throws(() => fs.readFileSync(pidPath), { code: 'ENOENT' });
+  }
+});
+
+test('起動後の待機は待受が別ユーザーのものと分かったら待たずに理由を返す', async () => {
+  const proc = makeProcess(LOCALAPPDATA_EXE);
+  existing.add(LOCALAPPDATA_EXE);
+  let calls = 0;
+  proc.engine.status = async () => (++calls === 1
+    ? { available: false }
+    : { available: false, untrusted: true, error: '別ユーザー (PID 10)' });
+  const started = Date.now();
+  assert.deepEqual(await proc.start(), { started: true, untrusted: true, error: '別ユーザー (PID 10)' });
+  assert.equal(calls, 2);
+  assert.ok(Date.now() - started < 900);
+});
+
+test('untrusted の警告は start と ensure のどの経路でも、同じ理由なら 1 回だけ出る', async () => {
+  const proc = makeProcess('');
+  const warnings = [];
+  proc.log.warn = (message) => warnings.push(message);
+  proc.engine.status = async () => ({ available: false, untrusted: true, error: '別ユーザー (PID 10)' });
+  const r = await proc.start();
+  assert.deepEqual(r, { started: false, untrusted: true, error: '別ユーザー (PID 10)' });
+  assert.equal(await proc.ensure(), false);
+  await proc.start();
+  assert.deepEqual(warnings, ['別ユーザー (PID 10)']);
+});
+
+test('起動後の待機で別ユーザーと分かった理由も警告する', async () => {
+  const proc = makeProcess(LOCALAPPDATA_EXE);
+  existing.add(LOCALAPPDATA_EXE);
+  const warnings = [];
+  proc.log.warn = (message) => warnings.push(message);
+  let calls = 0;
+  proc.engine.status = async () => (++calls === 1 ? { available: false } : { available: false, untrusted: true, error: '別ユーザー (PID 11)' });
+  assert.equal((await proc.start()).untrusted, true);
+  assert.deepEqual(warnings, ['別ユーザー (PID 11)']);
 });

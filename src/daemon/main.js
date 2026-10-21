@@ -170,7 +170,8 @@ server.listen(port, '127.0.0.1', async () => {
   let status = await engine.status();
   if (!status.available && store.config.engine?.autoStart) {
     const r = await engineProcess.start();
-    if (r.error) log.warn(r.error);
+    // untrusted の理由は EngineProcess が警告済み
+    if (r.error && !r.untrusted) log.warn(r.error);
     status = await engine.status();
   }
 

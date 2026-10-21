@@ -33,7 +33,8 @@ export function parseNetstatListeners(output, port, targetHost = 'localhost') {
   const pids = new Set();
   for (const line of output.split(/\r?\n/)) {
     const columns = line.trim().split(/\s+/);
-    if (columns[0] !== 'TCP' || columns.length !== 5) continue;
+    // 状態列は訳語に空白を含みうるので、列数を固定せず先頭の 3 列と末尾の PID だけを使う
+    if (columns[0] !== 'TCP' || columns.length < 5) continue;
     const [host, localPort] = splitAddress(columns[1]);
     const [, remotePort] = splitAddress(columns[2]);
     const pid = Number(columns.at(-1));
@@ -46,7 +47,8 @@ export function parseNetstatListeners(output, port, targetHost = 'localhost') {
 
 export function listListeners(port, host) {
   return new Promise((resolve, reject) => {
-    execFile('netstat.exe', ['-ano'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+    // 接続の多い環境では既定の 1 MB を超えて失敗し、エンジンを使えなくなるため広げる
+    execFile('netstat.exe', ['-ano'], { windowsHide: true, timeout: 5000, maxBuffer: 16 * 1024 * 1024 }, (err, stdout) => {
       if (err) reject(err);
       else resolve(parseNetstatListeners(String(stdout), port, host));
     });
@@ -73,10 +75,33 @@ export function queryProcessOwner(pid) {
   });
 }
 
+/** 親プロセスの PID と、プロセスの作成時刻(UTC の 100ns 単位)を返す。プロセスが無いか照会に失敗したら null。 */
+export function queryProcessLink(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return Promise.resolve(null);
+  const script = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop; `
+    + '"$($p.ParentProcessId) $($p.CreationDate.ToUniversalTime().Ticks)"';
+  return new Promise((resolve) => {
+    execFile('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { timeout: 15000, windowsHide: true },
+      (err, stdout) => {
+        const match = /^(\d+) (\d+)$/.exec(String(stdout ?? '').trim());
+        resolve(!err && match ? { parentPid: Number(match[1]), created: BigInt(match[2]) } : null);
+      });
+  });
+}
+
+const MAX_ANCESTOR_DEPTH = 4;
+
 export class EngineTrust {
-  constructor({ listListeners: list = listListeners, queryProcessOwner: query = queryProcessOwner } = {}) {
+  constructor({
+    listListeners: list = listListeners,
+    queryProcessOwner: query = queryProcessOwner,
+    queryProcessLink: linkOf = queryProcessLink,
+  } = {}) {
     this.listListeners = list;
     this.queryProcessOwner = query;
+    this.queryProcessLink = linkOf;
     this.managedPids = () => [];
     this.owners = new Map();
     this.pending = new Map();
@@ -85,6 +110,19 @@ export class EngineTrust {
 
   setManagedPids(fn) {
     this.managedPids = fn;
+  }
+
+  /** pid が ancestor の子孫か。起動したエンジンの子プロセスが待受を持つ構成を見分けるために使う。 */
+  async isDescendantOf(pid, ancestor) {
+    let child = await this.queryProcessLink(pid);
+    for (let depth = 0; child && depth < MAX_ANCESTOR_DEPTH; depth++) {
+      const parent = await this.queryProcessLink(child.parentPid);
+      // ParentProcessId は親の終了後も残り、PID は再利用される。子より後に作られた親は本当の親ではない
+      if (!parent || parent.created > child.created) return false;
+      if (child.parentPid === ancestor) return true;
+      child = parent;
+    }
+    return false;
   }
 
   async listeners(baseUrl) {

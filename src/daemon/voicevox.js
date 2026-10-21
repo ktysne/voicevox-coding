@@ -188,7 +188,8 @@ export class VoicevoxEngine {
     });
     const trust = await this.trust.check(baseUrl);
     if (!trust.trusted || pids.length !== trust.pids.length || pids.some((pid) => !trust.pids.includes(pid))) {
-      throw new EngineError(`ENGINE の音声合成中に待受プロセスが変わったか信頼を確認できません: ${trust.reason ?? ''}`, {
+      const reason = trust.trusted ? `待受の PID が ${pids.join(', ')} から ${trust.pids.join(', ')} に変わりました` : trust.reason;
+      throw new EngineError(`ENGINE の音声合成の応答を捨てました: ${reason}`, {
         untrusted: true,
       });
     }
