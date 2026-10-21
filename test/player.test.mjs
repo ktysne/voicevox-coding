@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { Player, appendWavSilence } from '../src/daemon/player.js';
+import { MAX_WAV_DURATION_MS, Player, appendWavSilence, parseWav, wavDurationMs } from '../src/daemon/player.js';
 
 /**
  * テスト用の最小 WAV (PCM) を組み立てる。data の後ろへ extraChunk を続けると、
@@ -41,6 +41,56 @@ function buildWav({
   buf.writeUInt32LE(buf.length - 8, 4);
   return buf;
 }
+
+test('parseWav は PCM の形式と再生時間を返す', () => {
+  const wav = buildWav({ dataSize: 48000 });
+  assert.deepEqual(parseWav(wav), {
+    sampleRate: 24000,
+    channels: 1,
+    bitsPerSample: 16,
+    byteRate: 48000,
+    blockAlign: 2,
+    dataOffset: 44,
+    dataSize: 48000,
+    durationMs: 1000,
+  });
+});
+
+test('parseWav は byteRate が不正な WAV を拒否する', () => {
+  const wav = buildWav({ dataSize: 1_000_000 });
+  wav.writeUInt32LE(1, 28);
+  assert.equal(parseWav(wav), null);
+});
+
+test('parseWav は WAVE_FORMAT_EXTENSIBLE を拒否する', () => {
+  const wav = buildWav();
+  wav.writeUInt16LE(0xfffe, 20);
+  assert.equal(parseWav(wav), null);
+});
+
+test('parseWav は 5 分を超える WAV を拒否する', () => {
+  const wav = buildWav({ dataSize: 48000 * 301 });
+  assert.equal(parseWav(wav), null);
+  assert.equal(MAX_WAV_DURATION_MS, 300000);
+});
+
+test('parseWav は宣言された data サイズをバッファ末尾で切り詰める', () => {
+  const wav = buildWav({ dataSize: 4 });
+  wav.writeUInt32LE(100, 40);
+  assert.equal(parseWav(wav).dataSize, 4);
+});
+
+test('parseWav はバッファを越えるチャンクサイズを例外なく拒否する', () => {
+  const wav = buildWav();
+  wav.writeUInt32LE(0xffffffff, 16);
+  assert.doesNotThrow(() => assert.equal(parseWav(wav), null));
+});
+
+test('wavDurationMs は不正な WAV に null を返す', () => {
+  const wav = buildWav();
+  wav.writeUInt32LE(1, 28);
+  assert.equal(wavDurationMs(wav), null);
+});
 
 test('appendWavSilence は無音を末尾へ継ぎ足し、data と RIFF のサイズを書き直す', () => {
   const buf = buildWav({ dataSize: 4, byteRate: 48000, blockAlign: 2, bitsPerSample: 16 });
@@ -239,4 +289,26 @@ test('dispose 後は自動再起動しない', async () => {
   assert.equal(player.child, null);
   player.start();
   assert.equal(children.length, 1);
+});
+
+test('parseWav は 48000Hz・ステレオ・16bit の WAV を受け付ける', () => {
+  const wav = buildWav({ dataSize: 192000, sampleRate: 48000, channels: 2, blockAlign: 4, byteRate: 192000 });
+  const parsed = parseWav(wav);
+  assert.equal(parsed.sampleRate, 48000);
+  assert.equal(parsed.channels, 2);
+  assert.equal(parsed.durationMs, 1000);
+});
+
+test('parseWav は data が 0 バイトの WAV を再生時間 0 として受け付ける', () => {
+  // 音素の無い文 (記号だけ) を前後の無音 0 で合成すると、ENGINE はこの形を返す
+  const parsed = parseWav(buildWav({ dataSize: 0 }));
+  assert.equal(parsed.dataSize, 0);
+  assert.equal(parsed.durationMs, 0);
+  assert.equal(wavDurationMs(buildWav({ dataSize: 0 })), 0);
+});
+
+test('parseWav は maxDurationMs で再生時間の上限を変えられる', () => {
+  const wav = buildWav({ dataSize: 48000 });
+  assert.equal(parseWav(wav, { maxDurationMs: 999 }), null);
+  assert.equal(parseWav(wav, { maxDurationMs: Infinity }).durationMs, 1000);
 });

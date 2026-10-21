@@ -10,7 +10,8 @@ import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { CACHE_DIR } from './config.js';
 import { VOICE_PARAMS } from './catalog.js';
-import { wavDurationMs, appendWavSilence } from './player.js';
+import { MAX_WAV_DURATION_MS, parseWav, appendWavSilence } from './player.js';
+import { EngineError } from './voicevox.js';
 import { LIST_BOUNDARY, DEFAULT_LIST_PAUSE_SEC, stripListBoundaries } from './textfilter.js';
 
 const SENTENCE_SPLIT = /(?<=[。．！？!?\n])/;
@@ -153,13 +154,15 @@ export class SpeechQueue extends EventEmitter {
    * @param {import('./player.js').Player} player
    * @param {() => object} getConfig
    * @param {object} logger
+   * @param {{ waitFn?: (durationMs: number) => Promise<void> }} [options]
    */
-  constructor(engine, player, getConfig, logger) {
+  constructor(engine, player, getConfig, logger, { waitFn } = {}) {
     super();
     this.engine = engine;
     this.player = player;
     this.getConfig = getConfig;
     this.log = logger;
+    this.waitFn = waitFn ?? ((durationMs) => this.#wait(durationMs));
     this.queue = [];
     this.current = null;
     this.running = false;
@@ -352,13 +355,18 @@ export class SpeechQueue extends EventEmitter {
     if (useCache && fs.existsSync(file)) {
       try {
         const buf = fs.readFileSync(file);
-        this.#recordCacheHit(file);
-        this.#protectWav(file);
-        // 整理は書き込み時だけでなくヒット時にも確認する。上限を実行中に
-        // 縮小した後の発話がヒットばかりだと、いつまでも古い上限のまま残る
-        this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
-        // キーに padMs が入っている以上、ヒットしたファイルは既に無音を継ぎ足し済み。
-        return { file, durationMs: wavDurationMs(buf), pausePadded: padMs > 0 };
+        const cachedWav = parseWav(buf);
+        if (!cachedWav) {
+          fs.unlinkSync(file);
+        } else {
+          this.#recordCacheHit(file);
+          this.#protectWav(file);
+          // 整理は書き込み時だけでなくヒット時にも確認する。上限を実行中に
+          // 縮小した後の発話がヒットばかりだと、いつまでも古い上限のまま残る
+          this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
+          // キーに padMs が入っている以上、ヒットしたファイルは既に無音を継ぎ足し済み。
+          return { file, durationMs: cachedWav.durationMs, pausePadded: padMs > 0 };
+        }
       } catch {
         // キャッシュが壊れていたら作り直す
       }
@@ -382,6 +390,9 @@ export class SpeechQueue extends EventEmitter {
         file = path.join(CACHE_DIR, `${noPauseKey}.wav`);
       }
     }
+    // キャッシュには形式と再生時間の上限を満たす WAV だけを書く
+    const parsedWav = parseWav(wav);
+    if (!parsedWav) throw new EngineError('ENGINE が不正な WAV を返しました');
     fs.mkdirSync(CACHE_DIR, { recursive: true });
     const tmp = `${file}.tmp`;
     try {
@@ -401,7 +412,7 @@ export class SpeechQueue extends EventEmitter {
       this.#maybePruneCache(cacheMaxEntriesOf(cfg.daemon?.cacheMaxEntries));
     }
     // durationMs は継ぎ足したあとの wav から求める（間のぶんも再生時間に含める）。
-    return { file, durationMs: wavDurationMs(wav), ephemeral: !useCache, pausePadded };
+    return { file, durationMs: parsedWav.durationMs, ephemeral: !useCache, pausePadded };
   }
 
   /** 一時 WAV を削除する。再生ワーカーは PLAY 時に全体をメモリへ読むので、再生後の削除は安全。 */
@@ -696,7 +707,7 @@ export class SpeechQueue extends EventEmitter {
             break;
           }
 
-          await this.#wait(audio.durationMs ?? 1500);
+          await this.waitFn(Math.min(audio.durationMs ?? 1500, MAX_WAV_DURATION_MS));
           this.#discardAudio(audio);
 
           // 次チャンクまたは次発話がある間だけ、再生完了直後から無音をループする候補になる。
@@ -735,7 +746,7 @@ export class SpeechQueue extends EventEmitter {
             // 待っている間も無音が出力されるため、間のあとの音声の出だしが欠けない。
             // HOLD に失敗したときは黙って待たず、間を諦めて次のチャンクへ進む。
             if (holdStarted && needsPause) {
-              await this.#wait(utterance.pauseMs);
+              await this.waitFn(utterance.pauseMs);
             }
           }
         }

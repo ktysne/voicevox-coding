@@ -10,33 +10,63 @@ const WORKER_PS1 = path.join(path.dirname(fileURLToPath(import.meta.url)), 'play
 
 // ワーカーの応答待ち上限。超えたらワーカーごと作り直す
 const DEFAULT_TIMEOUT_MS = 10000;
+export const MAX_WAV_DURATION_MS = 5 * 60 * 1000;
 
 /**
- * WAV ヘッダから再生時間（ミリ秒）を求める。
- * ENGINE の出力は 24kHz / 16bit / モノラルだが、決め打ちせずヘッダを読む。
+ * PCM の WAV ヘッダを検証して形式と再生時間を返す。
+ * 形式が不正なとき、または再生時間が maxDurationMs を超えるときは null を返す。
+ * 音素の無い文では ENGINE が data 0 バイトの WAV を返すので、0 バイトは正しい WAV として扱う。
  */
-export function wavDurationMs(buf) {
+export function parseWav(buf, { maxDurationMs = MAX_WAV_DURATION_MS } = {}) {
   try {
-    if (buf.length < 44 || buf.toString('ascii', 0, 4) !== 'RIFF') return null;
+    if (!Buffer.isBuffer(buf) || buf.length < 44) return null;
+    if (buf.toString('ascii', 0, 4) !== 'RIFF' || buf.toString('ascii', 8, 12) !== 'WAVE') return null;
+
     let offset = 12;
-    let byteRate = null;
-    let dataSize = null;
-    while (offset + 8 <= buf.length) {
+    let format = null;
+    let data = null;
+    while (offset <= buf.length - 8) {
       const id = buf.toString('ascii', offset, offset + 4);
       const size = buf.readUInt32LE(offset + 4);
+      const chunkDataOffset = offset + 8;
       if (id === 'fmt ') {
-        byteRate = buf.readUInt32LE(offset + 16);
-      } else if (id === 'data') {
-        dataSize = Math.min(size, buf.length - (offset + 8));
-        break;
+        if (size < 16 || chunkDataOffset > buf.length - 16) return null;
+        const audioFormat = buf.readUInt16LE(chunkDataOffset);
+        const channels = buf.readUInt16LE(chunkDataOffset + 2);
+        const sampleRate = buf.readUInt32LE(chunkDataOffset + 4);
+        const byteRate = buf.readUInt32LE(chunkDataOffset + 8);
+        const blockAlign = buf.readUInt16LE(chunkDataOffset + 12);
+        const bitsPerSample = buf.readUInt16LE(chunkDataOffset + 14);
+        if (audioFormat !== 1) return null;
+        if (channels < 1 || channels > 2) return null;
+        if (sampleRate < 8000 || sampleRate > 192000) return null;
+        if (![8, 16, 24, 32].includes(bitsPerSample)) return null;
+        if (blockAlign !== channels * bitsPerSample / 8) return null;
+        if (byteRate !== sampleRate * blockAlign) return null;
+        format = { sampleRate, channels, bitsPerSample, byteRate, blockAlign };
+      } else if (id === 'data' && data === null) {
+        data = {
+          dataOffset: chunkDataOffset,
+          dataSize: Math.min(size, buf.length - chunkDataOffset),
+        };
       }
-      offset += 8 + size + (size % 2);
+
+      const nextOffset = chunkDataOffset + size + (size % 2);
+      if (nextOffset > buf.length) break;
+      offset = nextOffset;
     }
-    if (!byteRate || !dataSize) return null;
-    return Math.round((dataSize / byteRate) * 1000);
+    if (!format || !data) return null;
+    const exactDurationMs = (data.dataSize / format.byteRate) * 1000;
+    if (exactDurationMs > maxDurationMs) return null;
+    const durationMs = Math.round(exactDurationMs);
+    return { ...format, ...data, durationMs };
   } catch {
     return null;
   }
+}
+
+export function wavDurationMs(buf) {
+  return parseWav(buf)?.durationMs ?? null;
 }
 
 /**

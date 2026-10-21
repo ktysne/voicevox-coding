@@ -5,6 +5,7 @@ import { beforeEach, afterEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CACHE_DIR } from '../src/daemon/config.js';
 import { SpeechQueue, chunkText } from '../src/daemon/queue.js';
+import { MAX_WAV_DURATION_MS } from '../src/daemon/player.js';
 import { LIST_BOUNDARY } from '../src/daemon/textfilter.js';
 
 // SpeechQueue は再生対象をキャッシュへ書くため、テストでは I/O だけ抑止する。
@@ -38,6 +39,15 @@ const WAV = (() => {
   buf.writeUInt32LE(dataSize, 40);
   return buf;
 })();
+
+function wavForDuration(durationMs) {
+  const dataSize = 48000 * durationMs / 1000;
+  const buf = Buffer.alloc(44 + dataSize);
+  WAV.copy(buf, 0, 0, 44);
+  buf.writeUInt32LE(buf.length - 8, 4);
+  buf.writeUInt32LE(dataSize, 40);
+  return buf;
+}
 
 // data の後ろに別チャンク (JUNK) が続く WAV。appendWavSilence が「扱えない形式」として
 // null を返すことを再現するのに使う（wavDurationMs はこれまでどおり読めるので速く終わる）。
@@ -134,7 +144,7 @@ function cleanupCache(files, existing) {
  * ことがあるため、必ず restore してから付け直す）。
  * 呼び出し元は Date.now を自前でモックして時刻を進めること。
  */
-function mockCacheDisk() {
+function mockCacheDisk({ contents = new Map() } = {}) {
   const disk = new Map(); // ファイルパス -> mtimeMs
   const unlinked = [];
   const readdirCalls = [];
@@ -142,13 +152,15 @@ function mockCacheDisk() {
   const enoent = (p) => Object.assign(new Error(`ENOENT: ${p}`), { code: 'ENOENT' });
 
   fs.renameSync.mock.restore();
-  mock.method(fs, 'renameSync', (_tmp, file) => {
+  mock.method(fs, 'renameSync', (tmp, file) => {
     disk.set(file, Date.now());
+    contents.set(file, contents.get(tmp) ?? WAV);
+    contents.delete(tmp);
   });
   mock.method(fs, 'existsSync', (p) => disk.has(p));
   mock.method(fs, 'readFileSync', (p) => {
     if (!disk.has(p)) throw enoent(p);
-    return WAV;
+    return contents.get(p) ?? WAV;
   });
   const readdirFail = { value: false }; // true にすると走査を EPERM で失敗させる
   mock.method(fs, 'readdirSync', (dir) => {
@@ -169,6 +181,7 @@ function mockCacheDisk() {
     if (!disk.has(p)) throw enoent(p);
     unlinked.push(p);
     disk.delete(p);
+    contents.delete(p);
   });
   const utimesAsync = { value: false }; // true にすると完了をテスト側から制御する
   const utimesPending = []; // utimesAsync 時の完了関数の列
@@ -186,7 +199,7 @@ function mockCacheDisk() {
     else finish();
   });
 
-  return { disk, unlinked, readdirCalls, utimesCalls, locked, utimesFail, readdirFail, statFail, utimesAsync, utimesPending };
+  return { disk, unlinked, contents, readdirCalls, utimesCalls, locked, utimesFail, readdirFail, statFail, utimesAsync, utimesPending };
 }
 
 /** キャッシュ有効・上限指定ありの SpeechQueue を作る（#42 のキャッシュ索引テスト用）。 */
@@ -610,6 +623,78 @@ test('無音を継ぎ足せないときは HOLD 中に指定時間だけ間を�
   assert.deepEqual(player.calls.map(([kind]) => kind), ['play', 'hold', 'play']);
   const gap = player.playAt[1] - player.playAt[0];
   assert.ok(gap >= 120, `間が短すぎます: ${gap}ms`);
+});
+
+test('キャッシュ内の不正な WAV は削除して合成し直す', async () => {
+  const contents = new Map();
+  const { disk, unlinked } = mockCacheDisk({ contents });
+  const [file] = cacheFilesFor(['壊れたキャッシュ']);
+  const invalidWav = Buffer.from(WAV);
+  invalidWav.writeUInt32LE(1, 28);
+  disk.set(file, Date.now());
+  contents.set(file, invalidWav);
+
+  let synthesizeCalls = 0;
+  const engine = { synthesize: async () => { synthesizeCalls += 1; return { wav: WAV }; } };
+  const player = new FakePlayer();
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: true, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} });
+  queue.enqueue({ target: 'test', event: 'test', text: '壊れたキャッシュ', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.deepEqual(unlinked, [file]);
+  assert.equal(synthesizeCalls, 1);
+  assert.deepEqual(player.calls.map(([kind]) => kind), ['play']);
+  assert.ok(disk.has(file));
+});
+
+test('不正な合成 WAV はキャッシュへ書かない', async () => {
+  fs.writeFileSync.mock.restore();
+  const writes = [];
+  mock.method(fs, 'writeFileSync', (file) => writes.push(file));
+  const invalidWav = Buffer.from(WAV);
+  invalidWav.writeUInt32LE(1, 28);
+  const player = new FakePlayer();
+  const engine = { synthesize: async () => ({ wav: invalidWav }) };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: true, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} });
+  queue.on('error', () => {});
+  queue.enqueue({ target: 'test', event: 'test', text: '不正な合成結果', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.deepEqual(writes, []);
+  assert.deepEqual(player.calls, []);
+});
+
+test('#wait に渡す再生時間は WAV の上限内に収まる', async () => {
+  const waitDurations = [];
+  const player = new FakePlayer();
+  const engine = { synthesize: async () => ({ wav: wavForDuration(MAX_WAV_DURATION_MS) }) };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: false, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} }, {
+    waitFn: async (durationMs) => waitDurations.push(durationMs),
+  });
+  queue.enqueue({ target: 'test', event: 'test', text: '上限時間の発話', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.deepEqual(waitDurations, [MAX_WAV_DURATION_MS]);
+  assert.ok(waitDurations.every((durationMs) => durationMs <= MAX_WAV_DURATION_MS));
+});
+
+test('上限を超える WAV の巨大な再生時間は #wait に渡らない', async () => {
+  const waitDurations = [];
+  const player = new FakePlayer();
+  const engine = { synthesize: async () => ({ wav: wavForDuration(MAX_WAV_DURATION_MS + 1000) }) };
+  const config = () => ({ daemon: { chunkChars: 100, cacheEnabled: false, cacheMaxEntries: 1000 } });
+  const queue = new SpeechQueue(engine, player, config, { warn() {} }, {
+    waitFn: async (durationMs) => waitDurations.push(durationMs),
+  });
+  queue.on('error', () => {});
+  queue.enqueue({ target: 'test', event: 'test', text: '上限超過の発話', speaker: 1, voice: {}, queuePolicy: { policy: 'enqueue' } });
+  await waitIdle(queue);
+
+  assert.deepEqual(waitDurations, []);
+  assert.deepEqual(player.calls, []);
 });
 
 test('間つきのキャッシュヒットでは HOLD と追加の待ちを入れない (#15)', async () => {
