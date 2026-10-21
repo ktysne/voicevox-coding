@@ -91,6 +91,48 @@ test('実サーバーは /hook 以外の要求で接続元を確認し、起動�
   assert.deepEqual(calls, ['start', 'verify', 'verify', 'dispose']);
 });
 
+test('静的 UI は許可されたパスだけを対応する Content-Type で返す', async () => {
+  const { server, port } = await startServer();
+  try {
+    for (const [pathname, contentType] of [
+      ['/', 'text/html; charset=utf-8'],
+      ['/index.html', 'text/html; charset=utf-8'],
+      ['/app.js', 'text/javascript; charset=utf-8'],
+      ['/style.css', 'text/css; charset=utf-8'],
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}${pathname}`);
+      assert.equal(response.status, 200, pathname);
+      assert.equal(response.headers.get('content-type'), contentType, pathname);
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('許可されていない静的パスは readFile を呼ばず 404 を返す', async (t) => {
+  const originalReadFile = fs.readFile;
+  const readPaths = [];
+  const readFile = mock.method(fs, 'readFile', (...args) => {
+    readPaths.push(args[0]);
+    return originalReadFile(...args);
+  });
+  t.after(() => readFile.mock.restore());
+  const { server, port } = await startServer();
+  try {
+    for (const pathname of ['/CON', '/nul', '/COM1', '/con.txt', '/APP.JS', '/app.js/', '/package.json', '/..%2fpackage.json']) {
+      const response = await fetch(`http://127.0.0.1:${port}${pathname}`);
+      assert.equal(response.status, 404, pathname);
+      assert.equal(response.headers.get('content-type'), 'text/plain; charset=utf-8', pathname);
+      assert.equal(await response.text(), 'not found', pathname);
+    }
+    assert.equal(readPaths.length, 0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
 test('設定 API は変更した不正な enginePath を保存せず、同じ値と空文字は通す', async (t) => {
   const stat = mock.method(fs, 'statSync', () => { throw new Error('missing'); });
   t.after(() => stat.mock.restore());
