@@ -886,12 +886,25 @@ test('内部の入力上限でサロゲートペアを分割しない', () => {
   }
 });
 
-test('内部の入力上限は正規表現による整形より先に適用される', () => {
-  const input = '<thinking>' + 'あ'.repeat(49_990) + '</thinking>後';
-  const text = 'あ'.repeat(49_990) + '。省略。';
-  assert.deepEqual(filterText(input, { ...F, maxChars: 0, maxSentences: 0, truncationSuffix: '省略' }), {
-    text, marked: text, truncated: true,
-  });
+test('内部の入力上限で切った thinking ブロックの中身は読まない', () => {
+  const config = { ...F, maxChars: 0, maxSentences: 0, truncationSuffix: '省略' };
+  const input = '前<thinking>' + 'あ'.repeat(49_990) + '</thinking>後';
+  assert.deepEqual(filterText(input, config), { text: '前。省略。', marked: '前。省略。', truncated: true });
+  // thinking を読む設定では、閉じタグを補わずに中身を読む。
+  const read = filterText(input, { ...config, thinkingBlocks: false });
+  assert.match(read.text, /^前 あ+。省略。$/);
+});
+
+test('内部の入力上限で切ったコードブロックは設定どおりに省略する', () => {
+  const config = { ...F, maxChars: 0, maxSentences: 0, truncationSuffix: '省略' };
+  for (const fence of ['```', '~~~']) {
+    const input = `前\n${fence}js\n${'const secret = 123;\n'.repeat(3000)}${fence}\n後`;
+    assert.equal(filterText(input, config).text, '前\n。コードは省略。。省略。');
+    assert.equal(filterText(input, { ...config, codeBlock: 'omit' }).text, '前。省略。');
+  }
+  // 上限の手前で閉じたコードブロックの後ろに、閉じない囲みがあっても後者だけを補う。
+  const pair = '前\n```\nx\n```\n中\n~~~\n' + 'y'.repeat(50_000);
+  assert.equal(filterText(pair, config).text, '前\n。コードは省略。\n中\n。コードは省略。。省略。');
 });
 
 test('タグと行頭記号の除去は改行や Unicode 空白を含む一致範囲を保つ', () => {

@@ -35,6 +35,35 @@ function replaceThinking(text) {
   return parts.join('') + text.slice(last);
 }
 
+// replaceThinking と同じ順で開きタグと閉じタグを対応させ、最初に閉じないブロックの閉じタグを返す。
+function danglingThinkingCloser(text) {
+  const lower = text.toLowerCase();
+  THINKING.lastIndex = 0;
+  let m;
+  while ((m = THINKING.exec(text))) {
+    const closer = `</${m[1].toLowerCase()}>`;
+    const close = lower.indexOf(closer, THINKING.lastIndex);
+    if (close < 0) return closer;
+    THINKING.lastIndex = close + closer.length;
+  }
+  return '';
+}
+
+// FENCED_CODE と同じ順で囲みを対応させ、最初に閉じない囲みの閉じ記号を返す。
+function danglingFenceCloser(text) {
+  let pos = 0;
+  for (;;) {
+    const backtick = text.indexOf('```', pos);
+    const tilde = text.indexOf('~~~', pos);
+    if (backtick < 0 && tilde < 0) return '';
+    const open = tilde < 0 || (backtick >= 0 && backtick < tilde) ? backtick : tilde;
+    const fence = text.slice(open, open + 3);
+    const close = text.indexOf(fence, open + 3);
+    if (close < 0) return `\n${fence}`;
+    pos = close + 3;
+  }
+}
+
 function replaceMarkdownLinks(text, pattern, image) {
   const parts = [];
   let last = 0;
@@ -650,7 +679,9 @@ export function filterText(input, f = {}) {
   const inputTruncated = inputEnd < input.length;
   let t = input.slice(0, inputEnd);
 
-  if (f.thinkingBlocks !== false) t = replaceThinking(t);
+  // 上限で切ると、閉じ記号が上限の先にあるブロックの中身が地の文として残る。閉じ記号を補って除去を成立させる。
+  if (f.thinkingBlocks !== false) t = replaceThinking(inputTruncated ? t + danglingThinkingCloser(t) : t);
+  if (inputTruncated) t += danglingFenceCloser(t);
 
   t = applyCodeBlocks(t, f.codeBlock ?? 'placeholder', f.codeBlockPlaceholder ?? 'コードは省略');
   t = applyTables(t, f.table ?? 'omit');
