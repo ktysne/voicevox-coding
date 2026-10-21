@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EngineError, VoicevoxEngine } from '../src/daemon/voicevox.js';
 import { VOICE_PARAMS } from '../src/daemon/catalog.js';
-import { EngineTrust, parseNetstatListeners, NO_LISTENERS_REASON } from '../src/daemon/engine-trust.js';
+import { EngineTrust, parseNetstatListeners, NO_LISTENERS_REASON, queryProcessOwner, queryParentPid } from '../src/daemon/engine-trust.js';
 
 // ENGINE を立てずに /audio_query と /synthesis の往復だけを確かめるため、
 // global の fetch を差し替えて応答を模す。
@@ -552,4 +552,30 @@ test('信頼の確認を待つ間に接続先が変わっても、確かめた�
   });
   assert.deepEqual(checked, ['http://127.0.0.1:50021']);
   assert.deepEqual(urls, ['http://127.0.0.1:50021/version']);
+});
+
+test('parseNetstatListeners は状態列の訳語に空白があっても読む', () => {
+  const output = '  TCP    127.0.0.1:50021    0.0.0.0:0    ABHÖREN WARTEND    10';
+  assert.deepEqual(parseNetstatListeners(output, 50021, '127.0.0.1'), [10]);
+});
+
+test('synthesis は待受の組だけが変わったとき、変わった PID をエラー文に含める', async () => {
+  let checks = 0;
+  const engine = new VoicevoxEngine(() => ({}), { trust: { check: async () => ({ trusted: true, pids: [++checks === 1 ? 10 : 11] }) } });
+  await withFetch(async () => binaryResponse(wavBytes()), async () => {
+    await assert.rejects(() => engine.synthesis({}, 3), (err) => /10/.test(err.message) && /11/.test(err.message) && !/: $/.test(err.message));
+  });
+});
+
+test('EngineTrust.isDescendantOf は親をたどって祖先を見つける', async () => {
+  const parents = new Map([[30, 20], [20, 10], [10, 1]]);
+  const trust = new EngineTrust({ queryParentPid: async (pid) => parents.get(pid) ?? null });
+  assert.equal(await trust.isDescendantOf(30, 10), true);
+  assert.equal(await trust.isDescendantOf(30, 99), false);
+  assert.equal(await trust.isDescendantOf(10, 30), false);
+});
+
+test('queryProcessOwner と queryParentPid は自分のプロセスを実際に照会できる', { skip: process.platform !== 'win32' }, async () => {
+  assert.equal(await queryProcessOwner(process.pid), 'same');
+  assert.equal(await queryParentPid(process.pid), process.ppid);
 });
