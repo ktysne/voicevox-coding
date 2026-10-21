@@ -19,7 +19,16 @@ function splitAddress(address) {
   return [address.slice(0, colon), address.slice(colon + 1)];
 }
 
-export function parseNetstatListeners(output, port) {
+// 接続先のホストへの接続を受けうる待受のローカルアドレスか。localhost はどちらのファミリーにも解決しうる。
+function acceptsConnectionsTo(localHost, targetHost) {
+  const v4 = localHost === '0.0.0.0' || (isLoopbackV4(localHost) && (targetHost === 'localhost' || localHost === targetHost));
+  const v6 = localHost === '[::]' || localHost === '[::1]';
+  if (targetHost === 'localhost') return v4 || v6;
+  if (targetHost === '[::1]' || targetHost === '::1') return v6;
+  return v4;
+}
+
+export function parseNetstatListeners(output, port, targetHost = 'localhost') {
   const pids = new Set();
   for (const line of output.split(/\r?\n/)) {
     const columns = line.trim().split(/\s+/);
@@ -28,17 +37,17 @@ export function parseNetstatListeners(output, port) {
     const [, remotePort] = splitAddress(columns[2]);
     const pid = Number(columns.at(-1));
     if (Number(localPort) !== Number(port) || remotePort !== '0') continue;
-    if (!isLoopbackV4(host) && !['0.0.0.0', '[::1]', '[::]'].includes(host)) continue;
+    if (!acceptsConnectionsTo(host, targetHost)) continue;
     if (/^\d+$/.test(columns.at(-1)) && Number.isSafeInteger(pid) && pid > 0) pids.add(pid);
   }
   return [...pids];
 }
 
-export function listListeners(port) {
+export function listListeners(port, host) {
   return new Promise((resolve, reject) => {
     execFile('netstat.exe', ['-ano'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
       if (err) reject(err);
-      else resolve(parseNetstatListeners(String(stdout), port));
+      else resolve(parseNetstatListeners(String(stdout), port, host));
     });
   });
 }
@@ -70,6 +79,7 @@ export class EngineTrust {
     this.managedPids = () => [];
     this.owners = new Map();
     this.pending = new Map();
+    this.stalePending = new WeakSet();
   }
 
   setManagedPids(fn) {
@@ -79,7 +89,7 @@ export class EngineTrust {
   async listeners(baseUrl) {
     const url = new URL(baseUrl);
     if (!isLoopback(url.hostname)) return null;
-    return this.listListeners(Number(url.port) || (url.protocol === 'https:' ? 443 : 80));
+    return this.listListeners(Number(url.port) || (url.protocol === 'https:' ? 443 : 80), url.hostname);
   }
 
   async check(baseUrl) {
@@ -88,6 +98,7 @@ export class EngineTrust {
       pids = await this.listeners(baseUrl);
     } catch (err) {
       this.owners.clear();
+      for (const pending of this.pending.values()) this.stalePending.add(pending);
       this.pending.clear();
       return { trusted: false, pids: [], reason: `ENGINE の待受を確認できません: ${err.message}` };
     }
@@ -95,9 +106,11 @@ export class EngineTrust {
     for (const pid of this.owners.keys()) {
       if (!pids.includes(pid)) this.owners.delete(pid);
     }
-    // 消えた PID の照会結果を、再利用された PID のキャッシュへ戻さない。
-    for (const pid of this.pending.keys()) {
-      if (!pids.includes(pid)) this.pending.delete(pid);
+    // 照会中に PID が待受から消えた結果は、再利用された PID のものかもしれないので許可にもキャッシュにも使わない
+    for (const [pid, pending] of this.pending) {
+      if (pids.includes(pid)) continue;
+      this.stalePending.add(pending);
+      this.pending.delete(pid);
     }
     if (!pids.length) return { trusted: false, pids, reason: NO_LISTENERS_REASON };
     const managed = this.managedPids();
@@ -110,6 +123,7 @@ export class EngineTrust {
         this.pending.set(pid, pending);
       }
       const owner = await pending;
+      if (this.stalePending.has(pending)) return 'unknown';
       if (this.pending.get(pid) === pending) {
         this.pending.delete(pid);
         if (owner === 'same' || owner === 'other') this.owners.set(pid, owner);

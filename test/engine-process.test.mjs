@@ -239,3 +239,29 @@ test('reclaimStale は trust が無い・外部ホスト・照会例外の場合
     }
   }
 });
+
+test('reclaimStale は所有者を確かめられない待受を終了させず PID ファイルを残す', async () => {
+  for (const listeners of [async () => [process.pid], async () => { throw new Error('netstat failed'); }]) {
+    writeLivePid();
+    killed = [];
+    const proc = makeProcess('');
+    proc.engine.trust = { listeners };
+    proc.engine.status = async () => ({ available: false, untrusted: true, error: '確認できません (PID 1)' });
+    await proc.reclaimStale();
+    assert.equal(proc.startedByUs, false);
+    assert.deepEqual(killed, []);
+    assert.equal(fs.readFileSync(pidPath, 'utf8'), String(process.pid));
+  }
+});
+
+test('起動した子プロセスが終了したら所有者の照会を省く対象から外す', async () => {
+  let managed;
+  const proc = makeProcess(LOCALAPPDATA_EXE);
+  existing.add(LOCALAPPDATA_EXE);
+  proc.engine.trust = { setManagedPids(fn) { managed = fn; } };
+  proc.engine.trust.setManagedPids(() => (proc.child?.pid ? [proc.child.pid] : []));
+  await proc.start();
+  assert.deepEqual(managed(), [99999]);
+  proc.child.emit('exit', 0);
+  assert.deepEqual(managed(), []);
+});

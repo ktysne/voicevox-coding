@@ -498,3 +498,46 @@ test('synthesis は応答後に所有者を確認できなければ WAV を返�
     await assert.rejects(() => engine.synthesis({}, 3), (err) => err instanceof EngineError && err.untrusted === true);
   });
 });
+
+test('parseNetstatListeners は接続先のアドレスファミリーで受けうる待受だけを返す', () => {
+  const output = `
+  TCP 127.0.0.1:50021 0.0.0.0:0 LISTENING 10
+  TCP 127.20.30.40:50021 0.0.0.0:0 LISTENING 11
+  TCP [::1]:50021 [::]:0 LISTENING 12
+  TCP 0.0.0.0:50021 0.0.0.0:0 LISTENING 13
+  TCP [::]:50021 [::]:0 LISTENING 14`;
+  assert.deepEqual(parseNetstatListeners(output, 50021, '127.0.0.1'), [10, 13]);
+  assert.deepEqual(parseNetstatListeners(output, 50021, '[::1]'), [12, 14]);
+  assert.deepEqual(parseNetstatListeners(output, 50021, 'localhost'), [10, 11, 12, 13, 14]);
+});
+
+test('EngineTrust は照会中に待受から消えた PID の結果を許可に使わない', async () => {
+  let pids = [10];
+  let finish;
+  const trust = new EngineTrust({ listListeners: async () => pids, queryProcessOwner: () => new Promise((resolve) => { finish = resolve; }) });
+  const oldCheck = trust.check(LOCAL_ENGINE);
+  await new Promise((resolve) => setImmediate(resolve));
+  pids = [];
+  await trust.check(LOCAL_ENGINE);
+  finish('same');
+  assert.equal((await oldCheck).trusted, false);
+});
+
+test('信頼の確認を待つ間に接続先が変わっても、確かめた接続先にだけ送る', async () => {
+  let baseUrl = 'http://127.0.0.1:50021';
+  let release;
+  const checked = [];
+  const engine = new VoicevoxEngine(() => ({ baseUrl, timeoutSec: 5 }), {
+    trust: { check: async (url) => { checked.push(url); await new Promise((resolve) => { release = resolve; }); return { trusted: true, pids: [10] }; } },
+  });
+  const urls = [];
+  await withFetch(async (url) => { urls.push(String(url)); return jsonResponse('0.25.2'); }, async () => {
+    const pending = engine.version();
+    await new Promise((resolve) => setImmediate(resolve));
+    baseUrl = 'http://192.168.1.50:50021';
+    release();
+    await pending;
+  });
+  assert.deepEqual(checked, ['http://127.0.0.1:50021']);
+  assert.deepEqual(urls, ['http://127.0.0.1:50021/version']);
+});

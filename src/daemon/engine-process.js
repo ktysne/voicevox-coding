@@ -175,6 +175,11 @@ export class EngineProcess {
       return;
     }
     const status = await this.engine.status();
+    // 所有者を確かめられない待受は応答しないとは限らないので、終了させずに次の起動へ持ち越す
+    if (status.untrusted) {
+      this.log?.warn(`前回のエンジン (PID ${pid}) の引き継ぎを見送ります: ${status.error}`);
+      return;
+    }
     let listeners = null;
     try {
       listeners = await this.engine.trust?.listeners(this.engine.baseUrl) ?? null;
@@ -266,6 +271,10 @@ export class EngineProcess {
       });
       child.unref();
       child.on('error', (err) => this.log?.error(`エンジンの起動に失敗しました: ${err.message}`));
+      // 終了後の PID は再利用されうるので、所有者の照会を省く対象から外す
+      child.on('exit', () => {
+        if (this.child === child) this.child = null;
+      });
 
       this.child = child;
       this.startedByUs = true;
