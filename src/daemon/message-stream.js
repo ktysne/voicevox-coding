@@ -8,6 +8,30 @@
 
 const DEFAULT_GRACE_MS = 400;
 const DEFAULT_TTL_MS = 120_000;
+// 番号は認証の無い入口から届く。欠番の検出と連結の処理量を番号の大きさに縛られないよう上限で捨てる。
+const MAX_DELTA_INDEX = 10_000;
+
+// final のフラッシュは delta が空のことがあり欠番と区別できないので、final の番号は欠番に数えない。
+function getMissingRanges(indices, finalIndex) {
+  const missing = [];
+  let rangeStart = 0;
+
+  for (const index of indices) {
+    if (index >= finalIndex) break;
+    if (index > rangeStart) {
+      const rangeEnd = index - 1;
+      missing.push(rangeStart === rangeEnd ? `${rangeStart}` : `${rangeStart}-${rangeEnd}`);
+    }
+    rangeStart = index + 1;
+  }
+
+  if (rangeStart < finalIndex) {
+    const rangeEnd = finalIndex - 1;
+    missing.push(rangeStart === rangeEnd ? `${rangeStart}` : `${rangeStart}-${rangeEnd}`);
+  }
+
+  return missing.join(',');
+}
 
 export class MessageAccumulator {
   /**
@@ -30,7 +54,12 @@ export class MessageAccumulator {
    */
   push(target, payload) {
     const messageId = payload?.message_id ?? payload?.turn_id ?? 'unknown';
-    const index = Number.isInteger(payload?.index) ? payload.index : 0;
+    const rawIndex = payload?.index;
+    const index = Number.isInteger(rawIndex) ? rawIndex : 0;
+    if (Number.isInteger(rawIndex) && (index < 0 || index > MAX_DELTA_INDEX)) {
+      this.log?.debug(`MessageDisplay: 範囲外の断片 index ${index} を破棄しました (message ${messageId})`);
+      return { buffering: true };
+    }
     const delta = typeof payload?.delta === 'string' ? payload.delta : '';
     const isFinal = payload?.final === true;
 
@@ -61,13 +90,9 @@ export class MessageAccumulator {
 
     const indices = [...buf.deltas.keys()].sort((a, b) => a - b);
     if (buf.finalIndex !== null) {
-      const missing = [];
-      for (let i = 0; i <= buf.finalIndex; i += 1) {
-        // final のフラッシュは delta が空のことがある。欠番と区別できないので参考情報にとどめる
-        if (!buf.deltas.has(i) && i !== buf.finalIndex) missing.push(i);
-      }
-      if (missing.length > 0) {
-        this.log?.debug(`MessageDisplay: 断片 ${missing.join(',')} が届きませんでした (message ${messageId})`);
+      const missingRanges = getMissingRanges(indices, buf.finalIndex);
+      if (missingRanges) {
+        this.log?.debug(`MessageDisplay: 断片 ${missingRanges} が届きませんでした (message ${messageId})`);
       }
     }
 
