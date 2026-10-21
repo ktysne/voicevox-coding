@@ -9,6 +9,9 @@ const WORKER_PS1 = fileURLToPath(new URL('./caller-worker.ps1', import.meta.url)
 // ワーカーは起動時に C# をコンパイルするので、ログオン直後など負荷が高いときは数秒かかる
 const DEFAULT_START_TIMEOUT_MS = 15000;
 const DEFAULT_TIMEOUT_MS = 3000;
+// 作り直しをやめると、デーモンを再起動するまで管理画面が使えなくなる。間隔を広げながら続ける
+const DEFAULT_RESTART_DELAY_MS = 1000;
+const DEFAULT_MAX_RESTART_DELAY_MS = 60000;
 
 /** 判定が決まらないとき(ワーカーの不調を含む)は sameUser:false を返し、拒否側に倒す。 */
 export class CallerVerifier {
@@ -16,16 +19,18 @@ export class CallerVerifier {
     spawnFn = spawn,
     startTimeoutMs = DEFAULT_START_TIMEOUT_MS,
     timeoutMs = DEFAULT_TIMEOUT_MS,
-    restartDelayMs = 1000,
-    maxRestarts = 5,
+    restartDelayMs = DEFAULT_RESTART_DELAY_MS,
+    maxRestartDelayMs = DEFAULT_MAX_RESTART_DELAY_MS,
   } = {}) {
     this.log = logger;
-    Object.assign(this, { spawnFn, startTimeoutMs, timeoutMs, restartDelayMs, maxRestarts });
+    Object.assign(this, { spawnFn, startTimeoutMs, timeoutMs, restartDelayMs, maxRestartDelayMs });
     this.child = null;
     this.pending = new Map();
+    this.generationWaiters = new Set();
     this.cache = new WeakMap();
     this.nextId = 0;
     this.restartCount = 0;
+    this.restartTimer = null;
     this.disposed = false;
     this.warned = false;
   }
@@ -60,7 +65,11 @@ export class CallerVerifier {
           if (!response) continue;
           const entry = this.pending.get(response[1]);
           if (!entry || entry.generation !== generation || !entry.sent) continue;
-          entry.finish({ sameUser: response[3] === generation.sid, ...(response[4] ? { reason: response[4] } : {}) }, true);
+          const reason = response[4];
+          // denied はプロセスを開けなかった(他のユーザーのプロセス)ことを表し、接続の間は変わらない。
+          // それ以外の ERR は表の取得などの一時的な失敗なので、次の要求で引き直す
+          const cacheable = !reason || reason === 'denied';
+          entry.finish({ sameUser: response[3] === generation.sid, ...(reason ? { reason } : {}) }, cacheable);
         }
       });
       child.stderr.on('data', () => this.#warn('接続元確認ワーカーがエラーを出力しました'));
@@ -71,6 +80,8 @@ export class CallerVerifier {
     } catch (err) {
       this.#discard(generation, `接続元確認ワーカーを起動できません: ${err.message}`);
     }
+    if (this.child !== generation) return;
+    for (const waiter of [...this.generationWaiters]) waiter(generation);
   }
 
   #warn(reason) {
@@ -89,14 +100,28 @@ export class CallerVerifier {
     generation.child?.kill?.();
     if (this.disposed) return;
     this.#warn(reason);
-    if (this.restartCount < this.maxRestarts) {
-      this.restartCount += 1;
-      this.restartTimer = setTimeout(() => {
-        this.restartTimer = null;
-        this.start();
-      }, this.restartDelayMs);
-      this.restartTimer.unref?.();
-    }
+    const delay = Math.min(this.restartDelayMs * 2 ** this.restartCount, this.maxRestartDelayMs);
+    this.restartCount += 1;
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      this.start();
+    }, delay);
+    this.restartTimer.unref?.();
+  }
+
+  /** 次の世代ができるのを、起動待ちの上限まで待つ。できなければ null。 */
+  #nextGeneration() {
+    if (this.disposed) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const waiter = (generation) => {
+        clearTimeout(timer);
+        this.generationWaiters.delete(waiter);
+        resolve(generation);
+      };
+      const timer = setTimeout(() => waiter(null), this.startTimeoutMs);
+      timer.unref?.();
+      this.generationWaiters.add(waiter);
+    });
   }
 
   async verifySocket(socket, serverPort) {
@@ -104,13 +129,13 @@ export class CallerVerifier {
       return { sameUser: false, reason: 'IPv4 ループバック以外の接続です' };
     }
     if (this.cache.has(socket)) return this.cache.get(socket);
-    const generation = this.child;
-    if (!generation || this.disposed) {
-      this.#warn('接続元確認ワーカーが利用できません');
-      return { sameUser: false, reason: '接続元確認ワーカーが利用できません' };
-    }
     if (![socket.remotePort, serverPort].every((p) => Number.isInteger(p) && p > 0 && p <= 65535)) {
       return { sameUser: false, reason: 'ポートが不正です' };
+    }
+    const generation = this.child ?? await this.#nextGeneration();
+    if (!generation || this.child !== generation || this.disposed) {
+      this.#warn('接続元確認ワーカーが利用できません');
+      return { sameUser: false, reason: '接続元確認ワーカーが利用できません' };
     }
     return new Promise((resolve) => {
       const id = String(++this.nextId);
@@ -145,6 +170,7 @@ export class CallerVerifier {
     this.disposed = true;
     clearTimeout(this.restartTimer);
     this.restartTimer = null;
+    for (const waiter of [...this.generationWaiters]) waiter(null);
     if (this.child) this.#discard(this.child, '接続元確認ワーカーを終了しました');
   }
 }

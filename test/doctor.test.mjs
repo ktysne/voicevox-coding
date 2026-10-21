@@ -5,6 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   codexHomeMatches,
+  daemonHeaders,
   missingToolEvents,
   normalizeInstallManifest,
   extraToolEvents,
@@ -181,4 +182,18 @@ test('isOurHookCommand: 配置先の絶対パスで厳密に識別し、類似�
   assert.equal(isOurHookCommand('node "C:\\other\\their-hook-client.js" x', hook), false);
   assert.equal(isOurHookCommand('node hook-client.js claudeCode', hook), false);
   assert.equal(isOurHookCommand('', hook), false);
+});
+
+test('daemonHeaders: runtime.json のトークンを付け、読めないときは何も付けない', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vvc-doctor-'));
+  try {
+    const runtime = path.join(dir, 'runtime.json');
+    assert.deepEqual(daemonHeaders(runtime), {});
+    fs.writeFileSync(runtime, JSON.stringify({ pid: 1, port: 7591, token: 'abc' }));
+    assert.deepEqual(daemonHeaders(runtime), { 'X-VoiceVox-Coding-Token': 'abc' });
+    fs.writeFileSync(runtime, JSON.stringify({ pid: 1, token: '' }));
+    assert.deepEqual(daemonHeaders(runtime), {});
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

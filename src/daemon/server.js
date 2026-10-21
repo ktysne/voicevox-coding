@@ -127,9 +127,10 @@ export function isLocalHostHeader(host, port) {
 }
 
 export function summarizeQueueState(state) {
-  const summarizeText = (text) => text.length > QUEUE_TEXT_PREVIEW_LENGTH
-    ? `${text.slice(0, QUEUE_TEXT_PREVIEW_LENGTH)}…`
-    : text;
+  const summarizeText = (text) => {
+    if (typeof text !== 'string') return '';
+    return text.length > QUEUE_TEXT_PREVIEW_LENGTH ? `${text.slice(0, QUEUE_TEXT_PREVIEW_LENGTH)}…` : text;
+  };
   return {
     ...state,
     current: state.current ? { ...state.current, text: summarizeText(state.current.text) } : null,

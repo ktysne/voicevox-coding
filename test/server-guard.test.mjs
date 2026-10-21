@@ -66,6 +66,11 @@ test('キュー本文の要約は current が null で queued が空でも状態
   assert.deepEqual(guards.summarizeQueueState(state), state);
 });
 
+test('キュー本文の要約は文字列でない本文を空文字にする', () => {
+  const state = { running: true, current: { id: 1, text: null }, queued: [{ id: 2, text: 42 }] };
+  assert.deepEqual(guards.summarizeQueueState(state), { running: true, current: { id: 1, text: '' }, queued: [{ id: 2, text: '' }] });
+});
+
 test('実サーバーは /hook 以外の要求で接続元を確認し、起動と終了で verifier を管理する', async () => {
   const calls = [];
   const verifier = { start() { calls.push('start'); }, dispose() { calls.push('dispose'); },
