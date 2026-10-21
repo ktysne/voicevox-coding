@@ -157,10 +157,9 @@ test('start は untrusted のとき force でも spawn しない', async () => {
   const warnings = [];
   proc.log.warn = (message) => warnings.push(message);
   proc.engine.status = async () => ({ available: false, untrusted: true, error: '別ユーザー (PID 10)' });
-  assert.deepEqual(await proc.start({ force: true }), { started: false, error: '別ユーザー (PID 10)' });
+  assert.deepEqual(await proc.start({ force: true }), { started: false, untrusted: true, error: '別ユーザー (PID 10)' });
   assert.deepEqual(spawned, []);
-  // 警告は error を受け取った呼び出し側が出すので、start 自身は出さない (二重に出さないため)
-  assert.deepEqual(warnings, []);
+  assert.deepEqual(warnings, ['別ユーザー (PID 10)']);
 });
 
 test('ensure は untrusted のとき start せず理由が変わったときだけ warn を出す', async () => {
@@ -305,7 +304,30 @@ test('起動後の待機は待受が別ユーザーのものと分かったら�
     ? { available: false }
     : { available: false, untrusted: true, error: '別ユーザー (PID 10)' });
   const started = Date.now();
-  assert.deepEqual(await proc.start(), { started: true, error: '別ユーザー (PID 10)' });
+  assert.deepEqual(await proc.start(), { started: true, untrusted: true, error: '別ユーザー (PID 10)' });
   assert.equal(calls, 2);
   assert.ok(Date.now() - started < 900);
+});
+
+test('untrusted の警告は start と ensure のどの経路でも、同じ理由なら 1 回だけ出る', async () => {
+  const proc = makeProcess('');
+  const warnings = [];
+  proc.log.warn = (message) => warnings.push(message);
+  proc.engine.status = async () => ({ available: false, untrusted: true, error: '別ユーザー (PID 10)' });
+  const r = await proc.start();
+  assert.deepEqual(r, { started: false, untrusted: true, error: '別ユーザー (PID 10)' });
+  assert.equal(await proc.ensure(), false);
+  await proc.start();
+  assert.deepEqual(warnings, ['別ユーザー (PID 10)']);
+});
+
+test('起動後の待機で別ユーザーと分かった理由も警告する', async () => {
+  const proc = makeProcess(LOCALAPPDATA_EXE);
+  existing.add(LOCALAPPDATA_EXE);
+  const warnings = [];
+  proc.log.warn = (message) => warnings.push(message);
+  let calls = 0;
+  proc.engine.status = async () => (++calls === 1 ? { available: false } : { available: false, untrusted: true, error: '別ユーザー (PID 11)' });
+  assert.equal((await proc.start()).untrusted, true);
+  assert.deepEqual(warnings, ['別ユーザー (PID 11)']);
 });

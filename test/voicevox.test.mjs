@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EngineError, VoicevoxEngine } from '../src/daemon/voicevox.js';
 import { VOICE_PARAMS } from '../src/daemon/catalog.js';
-import { EngineTrust, parseNetstatListeners, NO_LISTENERS_REASON, queryProcessOwner, queryParentPid } from '../src/daemon/engine-trust.js';
+import { EngineTrust, parseNetstatListeners, NO_LISTENERS_REASON, queryProcessOwner, queryProcessLink } from '../src/daemon/engine-trust.js';
 
 // ENGINE を立てずに /audio_query と /synthesis の往復だけを確かめるため、
 // global の fetch を差し替えて応答を模す。
@@ -568,14 +568,23 @@ test('synthesis は待受の組だけが変わったとき、変わった PID �
 });
 
 test('EngineTrust.isDescendantOf は親をたどって祖先を見つける', async () => {
-  const parents = new Map([[30, 20], [20, 10], [10, 1]]);
-  const trust = new EngineTrust({ queryParentPid: async (pid) => parents.get(pid) ?? null });
+  const links = new Map([[30, { parentPid: 20, created: 300n }], [20, { parentPid: 10, created: 200n }], [10, { parentPid: 1, created: 100n }], [1, { parentPid: 0, created: 1n }]]);
+  const trust = new EngineTrust({ queryProcessLink: async (pid) => links.get(pid) ?? null });
   assert.equal(await trust.isDescendantOf(30, 10), true);
   assert.equal(await trust.isDescendantOf(30, 99), false);
   assert.equal(await trust.isDescendantOf(10, 30), false);
 });
 
-test('queryProcessOwner と queryParentPid は自分のプロセスを実際に照会できる', { skip: process.platform !== 'win32' }, async () => {
+test('EngineTrust.isDescendantOf は子より後に作られた親 (再利用された PID) を祖先とみなさない', async () => {
+  // 30 の本当の親は終了し、その PID 10 を後から作られた別のプロセスが使っている
+  const links = new Map([[30, { parentPid: 10, created: 300n }], [10, { parentPid: 1, created: 500n }]]);
+  const trust = new EngineTrust({ queryProcessLink: async (pid) => links.get(pid) ?? null });
+  assert.equal(await trust.isDescendantOf(30, 10), false);
+});
+
+test('queryProcessOwner と queryProcessLink は自分のプロセスを実際に照会できる', { skip: process.platform !== 'win32' }, async () => {
   assert.equal(await queryProcessOwner(process.pid), 'same');
-  assert.equal(await queryParentPid(process.pid), process.ppid);
+  const self = await queryProcessLink(process.pid);
+  assert.equal(self.parentPid, process.ppid);
+  assert.ok((await queryProcessLink(process.ppid)).created <= self.created);
 });

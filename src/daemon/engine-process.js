@@ -239,8 +239,11 @@ export class EngineProcess {
 
     this.starting = (async () => {
       const status = await this.engine.status();
-      // 警告は呼び出し側が error を出す (ensure は理由が変わったときだけ出す)
-      if (status.untrusted) return { started: false, error: status.error };
+      if (status.untrusted) {
+        this.#warnUntrusted(status.error);
+        return { started: false, untrusted: true, error: status.error };
+      }
+      this.lastUntrustedReason = null;
       if (status.available && !force) {
         return { started: false, alreadyRunning: true };
       }
@@ -294,7 +297,10 @@ export class EngineProcess {
       writePid(child.pid);
 
       const wait = await this.waitUntilReady(cfg.startTimeoutSec ? cfg.startTimeoutSec * 1000 : 90000);
-      if (wait.error) return { started: true, error: wait.error };
+      if (wait.error) {
+        this.#warnUntrusted(wait.error);
+        return { started: true, untrusted: true, error: wait.error };
+      }
       if (!wait.ready) {
         this.log?.error('エンジンが起動しましたが応答しません');
         return { started: true, error: 'エンジンが時間内に応答しませんでした' };
@@ -329,13 +335,18 @@ export class EngineProcess {
     if (!cfg.autoStart) return false;
     const s = await this.engine.status();
     if (s.untrusted) {
-      if (this.lastUntrustedReason !== s.error) this.log?.warn(s.error);
-      this.lastUntrustedReason = s.error;
+      this.#warnUntrusted(s.error);
       return false;
     }
     this.lastUntrustedReason = null;
     if (s.available) return true;
     const r = await this.start();
     return r.started && !r.error;
+  }
+
+  // 健康確認は定期的に走るので、同じ理由の警告は続けて出さない。untrusted を返した経路の警告はここだけで出す
+  #warnUntrusted(reason) {
+    if (this.lastUntrustedReason !== reason) this.log?.warn(reason);
+    this.lastUntrustedReason = reason;
   }
 }

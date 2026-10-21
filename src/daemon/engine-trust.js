@@ -75,17 +75,18 @@ export function queryProcessOwner(pid) {
   });
 }
 
-/** 親プロセスの PID を返す。プロセスが無いか照会に失敗したら null。 */
-export function queryParentPid(pid) {
+/** 親プロセスの PID と、プロセスの作成時刻(UTC の 100ns 単位)を返す。プロセスが無いか照会に失敗したら null。 */
+export function queryProcessLink(pid) {
   if (!Number.isSafeInteger(pid) || pid <= 0) return Promise.resolve(null);
-  const script = `(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop).ParentProcessId`;
+  const script = `$p = Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}' -ErrorAction Stop; `
+    + '"$($p.ParentProcessId) $($p.CreationDate.ToUniversalTime().Ticks)"';
   return new Promise((resolve) => {
     execFile('powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
       { timeout: 15000, windowsHide: true },
       (err, stdout) => {
-        const parent = Number(String(stdout ?? '').trim());
-        resolve(!err && Number.isSafeInteger(parent) && parent > 0 ? parent : null);
+        const match = /^(\d+) (\d+)$/.exec(String(stdout ?? '').trim());
+        resolve(!err && match ? { parentPid: Number(match[1]), created: BigInt(match[2]) } : null);
       });
   });
 }
@@ -96,11 +97,11 @@ export class EngineTrust {
   constructor({
     listListeners: list = listListeners,
     queryProcessOwner: query = queryProcessOwner,
-    queryParentPid: parentOf = queryParentPid,
+    queryProcessLink: linkOf = queryProcessLink,
   } = {}) {
     this.listListeners = list;
     this.queryProcessOwner = query;
-    this.queryParentPid = parentOf;
+    this.queryProcessLink = linkOf;
     this.managedPids = () => [];
     this.owners = new Map();
     this.pending = new Map();
@@ -113,11 +114,13 @@ export class EngineTrust {
 
   /** pid が ancestor の子孫か。起動したエンジンの子プロセスが待受を持つ構成を見分けるために使う。 */
   async isDescendantOf(pid, ancestor) {
-    let current = pid;
-    for (let depth = 0; depth < MAX_ANCESTOR_DEPTH; depth++) {
-      current = await this.queryParentPid(current);
-      if (current === null) return false;
-      if (current === ancestor) return true;
+    let child = await this.queryProcessLink(pid);
+    for (let depth = 0; child && depth < MAX_ANCESTOR_DEPTH; depth++) {
+      const parent = await this.queryProcessLink(child.parentPid);
+      // ParentProcessId は親の終了後も残り、PID は再利用される。子より後に作られた親は本当の親ではない
+      if (!parent || parent.created > child.created) return false;
+      if (child.parentPid === ancestor) return true;
+      child = parent;
     }
     return false;
   }
