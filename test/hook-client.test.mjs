@@ -146,6 +146,26 @@ test('sealed の 2xx 応答では拒否記録を書かない', async () => {
   }
 });
 
+for (const [label, at, kept] of [
+  ['送信より前の拒否記録は 2xx 応答で消す', '2000-01-01T00:00:00.000Z', false],
+  ['送信より後の拒否記録は 2xx 応答でも消さない', '2999-01-01T00:00:00.000Z', true],
+]) {
+  test(label, async () => {
+    const { server, port } = await listen((req, res) => res.writeHead(200).end('{}'));
+    try {
+      const home = makeHome({ token: 'secret-token' });
+      const marker = path.join(home, '.voicevox-coding', 'hook-rejected.json');
+      fs.writeFileSync(marker, JSON.stringify({ at, status: 403 }));
+      const result = await runHookClient({ home, port, input: '{"hook_event_name":"Stop"}' });
+      assert.equal(result.code, 0);
+      assert.equal(fs.existsSync(marker), kept);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+}
+
 test('単体コピーした hook-client の子プロセスから実サーバーの読み上げキューまで届く', async () => {
   const token = 'c'.repeat(64);
   const home = makeHome({ token });

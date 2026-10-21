@@ -71,6 +71,7 @@ async function main() {
   const body = { v: 1, iv: iv.toString('base64'), ct: ct.toString('base64'), tag: cipher.getAuthTag().toString('base64') };
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), TIMEOUT_MS);
+  const sentAt = Date.now();
   try {
     const response = await fetch(`http://127.0.0.1:${resolvePort()}/hook/sealed`, {
       method: 'POST',
@@ -81,6 +82,12 @@ async function main() {
     if (response.status === 403 || response.status === 404) {
       try {
         fs.writeFileSync(HOOK_REJECTED_PATH, JSON.stringify({ at: new Date().toISOString(), status: response.status }), 'utf8');
+      } catch {}
+    } else if (response.ok) {
+      // 並行するフックが送信後に残した新しい拒否の印は消さない
+      try {
+        const rejectedAt = Date.parse(JSON.parse(fs.readFileSync(HOOK_REJECTED_PATH, 'utf8'))?.at);
+        if (!(rejectedAt >= sentAt)) fs.unlinkSync(HOOK_REJECTED_PATH);
       } catch {}
     }
   } catch {
