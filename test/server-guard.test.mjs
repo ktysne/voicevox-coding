@@ -2,18 +2,98 @@
 // 外部 Web ページからのドライブバイ操作を拒否しつつ、
 // 管理 UI・トレイ・フッククライアントの正規経路を通すこと。
 
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
+import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { EventEmitter } from 'node:events';
 import { checkMutationRequest, isRejectedDuringShutdown, isLocalHostHeader, createServer } from '../src/daemon/server.js';
+import * as guards from '../src/daemon/server.js';
+import { normalizeConfig } from '../src/daemon/config.js';
 
 const PORT = 7591;
 const TOKEN = 'a'.repeat(64);
 
-function check(pathname, headers) {
-  return checkMutationRequest({ pathname, headers: { host: `127.0.0.1:${PORT}`, ...headers }, port: PORT, token: TOKEN });
+function check(pathname, headers, caller = { sameUser: true }, method = 'POST') {
+  return guards.authorizeRequest({ method, caller, pathname, headers: { host: `127.0.0.1:${PORT}`, ...headers }, port: PORT, token: TOKEN });
 }
+
+test('別ユーザーでも正しいトークンなら通り、CSRF 検査は残る', () => {
+  for (const origin of [undefined, `http://127.0.0.1:${PORT}`]) {
+    assert.equal(check('/api/config', { origin, 'x-voicevox-coding-token': TOKEN }, { sameUser: false }).ok, true);
+  }
+  for (const token of [undefined, '', 'short', 'b'.repeat(64), [TOKEN]]) {
+    assert.equal(check('/api/config', { origin: `http://127.0.0.1:${PORT}`, 'x-voicevox-coding-token': token }, { sameUser: false }).status, 403);
+  }
+  assert.equal(check('/api/config', { origin: 'https://evil.example', 'x-voicevox-coding-token': TOKEN }, { sameUser: false }).status, 403);
+  assert.equal(check('/api/config', {}, { sameUser: true }).status, 403);
+});
+
+test('Host、接続元、Content-Type の順で検査し GET/HEAD と /hook は接続元確認を免除する', () => {
+  assert.match(check('/api/config', { host: 'evil', 'content-type': 'text/plain' }, { sameUser: false }).error, /Host/);
+  assert.match(check('/api/config', { 'content-type': 'text/plain' }, { sameUser: false }).error, /OS/);
+  assert.equal(check('/api/config', { 'content-type': 'text/plain' }, { sameUser: true }).status, 415);
+  for (const method of ['GET', 'HEAD']) assert.equal(check('/api/config', {}, { sameUser: false }, method).ok, true);
+  assert.equal(check('/hook', { 'content-type': 'application/json' }, { sameUser: false }).ok, true);
+});
+
+test('実サーバーは必要な経路だけ接続元を確認し、起動と終了で verifier を管理する', async () => {
+  const calls = [];
+  const verifier = { start() { calls.push('start'); }, dispose() { calls.push('dispose'); },
+    async verifySocket(socket, port) { assert.equal(socket.remoteAddress, '127.0.0.1'); assert.ok(port > 0); calls.push('verify'); return { sameUser: false }; } };
+  const { server, port } = await startServer(verifier);
+  try {
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`)).status, 200);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'HEAD' })).status, 404);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/hook`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"event":"MessageDisplay"}' })).status, 200);
+    assert.deepEqual(calls, ['start']);
+    assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json', origin: `http://127.0.0.1:${port}` }, body: '{}' })).status, 403);
+    assert.deepEqual(calls, ['start', 'verify']);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+  assert.deepEqual(calls, ['start', 'verify', 'dispose']);
+});
+
+test('設定 API は変更した不正な enginePath を保存せず、同じ値と空文字は通す', async (t) => {
+  const stat = mock.method(fs, 'statSync', () => { throw new Error('missing'); });
+  t.after(() => stat.mock.restore());
+  const { server, port, store } = await startServer();
+  store.config = normalizeConfig({ engine: { enginePath: 'C:\\legacy.exe' } });
+  const send = (method, body) => fetch(`http://127.0.0.1:${port}/api/config`, {
+    method, headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+  try {
+    for (const method of ['PUT', 'POST']) {
+      for (const enginePath of ['C:\\bad.exe', 'C:\\missing\\run.exe', '//host/share/run.exe', false, 42, {}]) {
+        const before = structuredClone(store.config);
+        const revision = store.revision;
+        const result = await send(method, { engine: { enginePath }, daemon: { port: 9999 } });
+        assert.equal(result.status, 400, `${method}: ${JSON.stringify(enginePath)}`);
+        assert.deepEqual(store.config, before);
+        assert.equal(store.revision, revision);
+      }
+      assert.equal((await send(method, { engine: { enginePath: 'C:\\legacy.exe' } })).status, 200);
+    }
+    const calls = stat.mock.callCount();
+    assert.equal((await send('POST', { daemon: { port: 8000 } })).status, 200);
+    assert.equal(store.config.engine.enginePath, 'C:\\legacy.exe');
+    assert.equal((await send('PUT', { engine: { enginePath: '' } })).status, 200);
+    assert.equal(stat.mock.callCount(), calls);
+    stat.mock.restore();
+    const validStat = mock.method(fs, 'statSync', () => ({ isFile: () => true }));
+    t.after(() => validStat.mock.restore());
+    for (const method of ['PUT', 'POST']) {
+      const enginePath = `C:\\${method}\\run.exe`;
+      assert.equal((await send(method, { engine: { enginePath } })).status, 200);
+      assert.equal(store.config.engine.enginePath, enginePath);
+    }
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
 
 test('悪意ある Origin の text/plain 単純リクエストを拒否する', () => {
   const r = check('/api/config', { origin: 'https://evil.example', 'content-type': 'text/plain' });
@@ -36,7 +116,7 @@ test('ホスト名が一致してもポートが違う Origin は拒否する', 
   assert.equal(r.ok, false);
 });
 
-test('管理 UI の同一オリジン要求はトークン無しで通る (sendBeacon 互換)', () => {
+test('同じ OS ユーザーの管理 UI は同一オリジンならトークン無しで通る (sendBeacon 互換)', () => {
   const r = check('/api/config', { origin: `http://127.0.0.1:${PORT}`, 'content-type': 'application/json' });
   assert.equal(r.ok, true);
 });
@@ -145,8 +225,11 @@ test('Host は 127.0.0.1 と localhost の自ポートだけを許す', () => {
   assert.equal(isLocalHostHeader(undefined, PORT), false);
 });
 
-async function startServer() {
-  const store = Object.assign(new EventEmitter(), { config: { targets: {} }, revision: 1, bootId: 'boot', profile: () => null });
+async function startServer(callerVerifier = { start() {}, dispose() {}, verifySocket: async () => ({ sameUser: true }) }, extra = {}) {
+  const store = Object.assign(new EventEmitter(), { config: { targets: {} }, revision: 1, bootId: 'boot', profile: () => null,
+    save(next) { this.config = normalizeConfig(next); this.revision++; return this.config; },
+    patch(next) { return this.save(normalizeConfig(next, this.config)); },
+  });
   const queue = Object.assign(new EventEmitter(), { state: {} });
   const log = { subscribe() {}, warn() {}, info() {}, debug() {}, error() {}, recent: () => [] };
   const engine = { status: async () => ({}) };
@@ -154,10 +237,64 @@ async function startServer() {
   await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
   const { port } = probe.address();
   await new Promise((resolve) => probe.close(resolve));
-  const server = createServer({ store, engine, queue, log, runtime: {}, port, token: TOKEN });
+  const server = createServer({ store, engine, queue, log, runtime: {}, port, token: TOKEN, callerVerifier, ...extra });
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
-  return { server, port };
+  return { server, port, store };
 }
+
+test('別ユーザーの自 Origin 偽装を判定関数で拒否する', () => {
+  const result = guards.authorizeRequest({ method: 'PUT', pathname: '/api/config', port: PORT, token: TOKEN,
+    caller: { sameUser: false }, headers: { host: `127.0.0.1:${PORT}`, origin: `http://127.0.0.1:${PORT}`, 'content-type': 'application/json' } });
+  assert.equal(result.status, 403);
+});
+
+test('別ユーザーの自 Origin 偽装 PUT を実サーバーで拒否する', async () => {
+  const { server, port } = await startServer({ start() {}, dispose() {}, verifySocket: async () => ({ sameUser: false }) });
+  try {
+    const result = await fetch(`http://127.0.0.1:${port}/api/config`, {
+      method: 'PUT', headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: JSON.stringify({ targets: {} }),
+    });
+    assert.equal(result.status, 403);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('トークンを持つ変更系の要求は接続元を引かずに通し、Origin の検査は残す', async () => {
+  let calls = 0;
+  const { server, port } = await startServer({ start() {}, dispose() {}, verifySocket: async () => { calls++; return { sameUser: false }; } });
+  try {
+    const post = (headers) => fetch(`http://127.0.0.1:${port}/api/engine/start`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-voicevox-coding-token': TOKEN, ...headers }, body: '{}',
+    });
+    // engineProcess を渡していないので、受け入れ判定を通れば 501 になる
+    assert.equal((await post({})).status, 501);
+    assert.equal((await post({ origin: 'https://evil.example' })).status, 403);
+    assert.equal(calls, 0);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('接続元の確認を待つ間に終了処理が始まったら、エンジンを起動せず 503 を返す', async () => {
+  const runtime = { shuttingDown: false };
+  let started = false;
+  const engineProcess = { status: {}, start: async () => { started = true; return { started: true }; } };
+  const verifier = { start() {}, dispose() {}, verifySocket: async () => { runtime.shuttingDown = true; return { sameUser: true }; } };
+  const { server, port } = await startServer(verifier, { runtime, engineProcess });
+  try {
+    const result = await fetch(`http://127.0.0.1:${port}/api/engine/start`, {
+      method: 'POST', headers: { origin: `http://127.0.0.1:${port}`, 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(result.status, 503);
+    assert.equal(started, false);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
 
 function get(port, pathname, host) {
   return new Promise((resolve, reject) => {

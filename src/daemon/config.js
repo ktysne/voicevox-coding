@@ -15,6 +15,25 @@ export const CONFIG_PATH = path.join(CONFIG_DIR, 'config.json');
 export const CACHE_DIR = path.join(CONFIG_DIR, 'cache');
 export const LOG_PATH = path.join(CONFIG_DIR, 'daemon.log');
 
+/** API から指定された engine.enginePath の検証。問題があれば利用者向けの文、無ければ null を返す。 */
+export function validateEnginePath(p) {
+  if (typeof p !== 'string' || !/^[a-z]:[\\/]/i.test(p) || !path.win32.isAbsolute(p)) {
+    return 'エンジンのパスはドライブ文字付きの絶対パスを指定してください';
+  }
+  if (/^[\\/]{2}/.test(p) || path.win32.basename(p).toLowerCase() !== 'run.exe') {
+    return 'エンジンにはローカルの run.exe を指定してください';
+  }
+  try {
+    if (fs.statSync(p).isFile()) return null;
+  } catch {}
+  return 'エンジンのパスに存在する通常のファイルを指定してください';
+}
+
+/** base に next を重ねて保存したときの設定を、保存せずに返す。引数は書き換えない。 */
+export function normalizeConfig(next, base = defaultConfig()) {
+  return reconcileProfiles(deepMerge(defaultConfig(), deepMerge(structuredClone(base), structuredClone(next))));
+}
+
 function defaultVoice() {
   const v = {};
   for (const p of VOICE_PARAMS) v[p.key] = p.default;

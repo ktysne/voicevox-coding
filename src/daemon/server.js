@@ -2,6 +2,7 @@
 // 127.0.0.1 のみで待ち受ける。
 
 import http from 'node:http';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -9,7 +10,8 @@ import { EVENTS, VOICE_PARAMS, TARGETS, eventsForTarget } from './catalog.js';
 import { resolveUtterance, matchesIgnorePattern, resetIgnoreMatchState } from './events.js';
 import { filterText, stripListBoundaries, mapListSegments } from './textfilter.js';
 import { applyReplacements, syncEngineDictionary, validateEngineWord } from './dictionary.js';
-import { CONFIG_PATH } from './config.js';
+import { CONFIG_PATH, normalizeConfig, validateEnginePath } from './config.js';
+import { CallerVerifier } from './caller-check.js';
 import { detectEnginePath } from './engine-process.js';
 import { MessageAccumulator } from './message-stream.js';
 
@@ -81,6 +83,37 @@ export function isRejectedDuringShutdown(runtime, method, pathname) {
 }
 
 const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
+// フックは昇格したプロセスや WSL の中継からも届き、同じ SID もトークンも持たないことがあるため除外する。
+// TODO(#84): hook-client がトークンを送るようになったら /hook を外す。
+const CALLER_CHECK_EXEMPT_PATHS = ['/hook'];
+
+function hasValidToken(headers, token) {
+  const supplied = headers['x-voicevox-coding-token'];
+  if (typeof supplied !== 'string' || typeof token !== 'string' || !token) return false;
+  const expected = Buffer.from(token);
+  const actual = Buffer.from(supplied);
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+function needsCallerCheck(method, pathname) {
+  return method !== 'GET' && method !== 'HEAD' && !CALLER_CHECK_EXEMPT_PATHS.includes(pathname);
+}
+
+/**
+ * 全要求の受け入れ判定。Host、接続元の OS ユーザー、変更系の規則の順に評価し、最初の拒否で打ち切る。
+ * caller は接続元の確認の結果 ({ sameUser })。トークンを持つ要求は、昇格して動くトレイや更新スクリプトのため
+ * 接続元が確かめられなくても通す。
+ */
+export function authorizeRequest({ method, pathname, headers = {}, port, token, caller }) {
+  if (!isLocalHostHeader(headers.host, port)) {
+    return { ok: false, status: 403, error: 'ローカル以外の Host からの要求は受け付けません' };
+  }
+  if (needsCallerCheck(method, pathname) && caller?.sameUser !== true && !hasValidToken(headers, token)) {
+    return { ok: false, status: 403, error: '接続元の OS ユーザーを確認できません' };
+  }
+  if (method !== 'GET' && method !== 'HEAD') return checkMutationRequest({ pathname, headers, port, token });
+  return { ok: true };
+}
 
 /**
  * Host ヘッダーがこのデーモン自身を指しているか。DNS リバインディングでは攻撃者のドメインが
@@ -93,21 +126,11 @@ export function isLocalHostHeader(host, port) {
 }
 
 /**
- * 状態変更リクエスト（GET/HEAD 以外）の受け入れ判定。
- * 外部 Web ページからのドライブバイ操作（CSRF / DNS リバインディング）を副作用の前に拒否する。
- *
- * 経路ごとの扱い:
- *   - ブラウザ（Origin ヘッダーあり）… 自オリジンのみ許可。Origin はブラウザが強制付与するため
- *     攻撃ページには偽装できない。管理 UI の sendBeacon はヘッダーを追加できないので、
- *     この経路はトークンではなく Origin で判定する。
- *   - ブラウザ以外のローカルクライアント（Origin なし）… /api/* は起動ごとのトークンを要求する。
- *     /hook だけはフック定義を変えずに済ませるためトークン不要（JSON の Content-Type は必須）。
- *   - クロスオリジンの application/json はプリフライトが必要になり、CORS 応答を返さないため
- *     ブラウザ側で遮断される。text/plain などの単純リクエストは Content-Type 検証で拒否する。
- *
- * 脅威モデルは「外部 Web ページからの CSRF / DNS リバインディング」。同一ユーザーの
- * ローカルプロセスは対象外とする（トークンも設定ファイルも同じ権限で読めるため、
- * ここで防いでも境界にならない）。
+ * 状態変更の要求 (GET/HEAD 以外) の Content-Type、Origin、トークンの判定。
+ * 同じユーザーのブラウザーが開いた外部ページからの要求も接続元の確認を通るので、CSRF はここで防ぐ。
+ *   - Origin あり: 自オリジンだけ通す。管理 UI の sendBeacon はヘッダーを足せないので、トークンは見ない。
+ *   - Origin なし: /api/* はトークン必須。/hook はトークン不要の代わりに JSON の Content-Type を必須にする。
+ *   - クロスオリジンの JSON はプリフライトで遮断されるので、単純リクエストを Content-Type で拒否する。
  */
 export function checkMutationRequest({ pathname, headers = {}, port, token }) {
   if (!isLocalHostHeader(headers.host, port)) {
@@ -141,13 +164,16 @@ export function checkMutationRequest({ pathname, headers = {}, port, token }) {
   }
 
   if (pathname === '/hook') return { ok: true };
-  if (!token || headers['x-voicevox-coding-token'] !== token) {
+  if (!hasValidToken(headers, token)) {
     return { ok: false, status: 403, error: '認証トークンが一致しません' };
   }
   return { ok: true };
 }
 
-export function createServer({ store, engine, queue, log, engineProcess, runtime, commentaryMonitor, onShutdown, port, token }) {
+export function createServer({ store, engine, queue, log, engineProcess, runtime, commentaryMonitor, onShutdown, port, token, callerVerifier }) {
+  const verifier = callerVerifier ?? (process.platform === 'win32' ? new CallerVerifier(log) : {
+    start() {}, dispose() {}, verifySocket: async () => ({ sameUser: false }),
+  });
   const sseClients = new Set();
 
   // 同じ警告を発話のたびに出すとログが埋まるので、一度出したものは覚えておく。
@@ -276,9 +302,19 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
         json(res, 503, { error: '終了処理中のため受け付けられません' });
         return;
       }
-      // /api/shutdown はこの下の検証（Origin / トークン / Content-Type）を
-      // 終了処理中でも従来どおり通る。ガードで安全性は弱めない。
-      const verdict = checkMutationRequest({ pathname, headers: req.headers, port, token });
+      let caller = { sameUser: false };
+      // トークンを持つ要求は接続元を引かない。ワーカーの不調でトレイの操作が時間切れにならないようにするため
+      if (needsCallerCheck(req.method, pathname) && !hasValidToken(req.headers, token)) {
+        try {
+          caller = await verifier.verifySocket(req.socket, port);
+        } catch {}
+        // 確認を待つ間に終了処理が始まっていたら、止めたはずの子プロセスを起動し直さないよう拒否する
+        if (isRejectedDuringShutdown(runtime, req.method, pathname)) {
+          json(res, 503, { error: '終了処理中のため受け付けられません' });
+          return;
+        }
+      }
+      const verdict = authorizeRequest({ method: req.method, pathname, headers: req.headers, port, token, caller });
       if (!verdict.ok) {
         log.warn(`要求を拒否しました: ${req.method} ${pathname} — ${verdict.error}`);
         json(res, verdict.status, { error: verdict.error });
@@ -406,6 +442,15 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       if ((req.method === 'PUT' || req.method === 'POST') && pathname === '/api/config') {
         const mutationId = readMutationId(req);
         const body = await readJson(req);
+        const candidate = normalizeConfig(body, req.method === 'POST' ? store.config : undefined);
+        const enginePath = candidate.engine?.enginePath;
+        if (enginePath !== '' && enginePath !== store.config.engine?.enginePath) {
+          const error = validateEnginePath(enginePath);
+          if (error) {
+            json(res, 400, { error });
+            return;
+          }
+        }
         const next = req.method === 'PUT' ? store.save(body, mutationId) : store.patch(body, mutationId);
         log.info('設定を更新しました');
         json(res, 200, { config: next, revision: store.revision, bootId: store.bootId, mutationId });
@@ -560,5 +605,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     }
   });
 
+  server.on('listening', () => verifier.start());
+  server.on('close', () => verifier.dispose());
   return server;
 }

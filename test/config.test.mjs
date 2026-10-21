@@ -7,7 +7,34 @@
 import fs from 'node:fs';
 import { beforeEach, afterEach, mock, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { ConfigStore } from '../src/daemon/config.js';
+import { ConfigStore, normalizeConfig, validateEnginePath } from '../src/daemon/config.js';
+
+test('enginePath はドライブ付き絶対パスの実在する run.exe のみ許す', () => {
+  const seen = [];
+  mock.method(fs, 'statSync', (p) => { seen.push(p); return { isFile: () => true }; });
+  assert.equal(validateEnginePath('C:\\VOICEVOX\\run.exe'), null);
+  assert.equal(validateEnginePath('d:/VOICEVOX/RUN.EXE'), null);
+  for (const invalid of [null, 1, {}, '', 'run.exe', 'C:run.exe', '/run.exe', '\\run.exe',
+    '\\\\host\\share\\run.exe', '//host/share/run.exe', '\\\\?\\C:\\run.exe', 'C:\\other.exe']) {
+    assert.equal(typeof validateEnginePath(invalid), 'string', String(invalid));
+  }
+  assert.equal(seen.length, 2);
+});
+
+test('enginePath はディレクトリ、存在しないファイル、読み取れないファイルを拒否する', () => {
+  mock.method(fs, 'statSync', () => ({ isFile: () => false }));
+  assert.equal(typeof validateEnginePath('C:\\run.exe'), 'string');
+  mock.method(fs, 'statSync', () => { throw new Error('ENOENT'); });
+  assert.equal(typeof validateEnginePath('C:\\run.exe'), 'string');
+});
+
+test('設定の保存候補の作成は現在の設定や入力を変更しない', () => {
+  const base = { engine: { enginePath: 'C:\\old.exe' }, targets: { codex: { events: {} } } };
+  const input = { engine: { enginePath: 'C:\\new.exe' } };
+  const before = structuredClone({ base, input });
+  assert.equal(normalizeConfig(input, base).engine.enginePath, 'C:\\new.exe');
+  assert.deepEqual({ base, input }, before);
+});
 
 beforeEach(() => {
   mock.method(fs, 'mkdirSync', () => undefined);
