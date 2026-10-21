@@ -154,6 +154,8 @@ export class EngineProcess {
     this.child = null;
     this.startedByUs = false;
     this.starting = null;
+    this.lastUntrustedReason = null;
+    engine.trust?.setManagedPids?.(() => (this.child?.pid ? [this.child.pid] : []));
   }
 
   get status() {
@@ -173,6 +175,16 @@ export class EngineProcess {
       return;
     }
     const status = await this.engine.status();
+    let listeners = null;
+    try {
+      listeners = await this.engine.trust?.listeners(this.engine.baseUrl) ?? null;
+    } catch {}
+    // 別のプロセスが待受しているなら、PID ファイルの PID は再利用されたものなので終了させない
+    if (listeners?.length && !listeners.includes(pid)) {
+      this.log?.info(`PID ${pid} はエンジンの待受ではないため、引き継がずに PID ファイルを消します`);
+      writePid(null);
+      return;
+    }
     if (status.available) {
       // 生きていて応答もする。前回起動したものをそのまま使う
       this.startedByUs = true;
@@ -207,6 +219,10 @@ export class EngineProcess {
 
     this.starting = (async () => {
       const status = await this.engine.status();
+      if (status.untrusted) {
+        this.log?.warn(status.error);
+        return { started: false, error: status.error };
+      }
       if (status.available && !force) {
         return { started: false, alreadyRunning: true };
       }
@@ -289,6 +305,12 @@ export class EngineProcess {
     const cfg = this.getConfig().engine;
     if (!cfg.autoStart) return false;
     const s = await this.engine.status();
+    if (s.untrusted) {
+      if (this.lastUntrustedReason !== s.error) this.log?.warn(s.error);
+      this.lastUntrustedReason = s.error;
+      return false;
+    }
+    this.lastUntrustedReason = null;
     if (s.available) return true;
     const r = await this.start();
     return r.started && !r.error;
