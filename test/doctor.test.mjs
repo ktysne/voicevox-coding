@@ -10,6 +10,7 @@ import {
   normalizeInstallManifest,
   extraToolEvents,
   isOurHookCommand,
+  hookRejectionWarning,
   normalizePathForComparison,
   parseCodexInitializeResult,
   readJson,
@@ -193,6 +194,21 @@ test('daemonHeaders: runtime.json のトークンを付け、読めないとき�
     assert.deepEqual(daemonHeaders(runtime), { 'X-VoiceVox-Coding-Token': 'abc' });
     fs.writeFileSync(runtime, JSON.stringify({ pid: 1, token: '' }));
     assert.deepEqual(daemonHeaders(runtime), {});
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('hook-rejected.json を診断警告に整形し、存在しない場合は何も出さない', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vvc-doctor-'));
+  const rejection = path.join(dir, 'hook-rejected.json');
+  try {
+    assert.equal(hookRejectionWarning(rejection), null);
+    fs.writeFileSync(rejection, JSON.stringify({ at: '2026-10-22T00:00:00.000Z', status: 404 }));
+    assert.equal(
+      hookRejectionWarning(rejection),
+      'フックがデーモンに拒否されました(2026-10-22T00:00:00.000Z、HTTP 404)。デーモンが古いか、runtime.json が古い可能性があります。デーモンを再起動してください',
+    );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

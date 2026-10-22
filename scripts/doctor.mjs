@@ -13,6 +13,7 @@ const CONFIG_PATH = path.join(HOME, '.voicevox-coding', 'config.json');
 const HOOK_CLIENT = path.join(HOME, '.voicevox-coding', 'hook-client.js');
 const MANIFEST_PATH = path.join(HOME, '.voicevox-coding', 'install.json');
 const RUNTIME_PATH = path.join(HOME, '.voicevox-coding', 'runtime.json');
+const HOOK_REJECTED_PATH = path.join(HOME, '.voicevox-coding', 'hook-rejected.json');
 const CLAUDE_SETTINGS = path.join(HOME, '.claude', 'settings.json');
 const CODEX_HOME = process.env.CODEX_HOME || path.join(HOME, '.codex');
 const CODEX_HOOKS = path.join(CODEX_HOME, 'hooks.json');
@@ -52,6 +53,14 @@ async function checkEngine(baseUrl) {
 export function daemonHeaders(runtimePath = RUNTIME_PATH) {
   const token = readJson(runtimePath)?.token;
   return typeof token === 'string' && token ? { 'X-VoiceVox-Coding-Token': token } : {};
+}
+
+export function hookRejectionWarning(filePath = HOOK_REJECTED_PATH) {
+  if (!fs.existsSync(filePath)) return null;
+  const rejection = readJson(filePath);
+  const at = typeof rejection?.at === 'string' ? rejection.at : '不明';
+  const status = Number.isInteger(rejection?.status) ? rejection.status : '不明';
+  return `フックがデーモンに拒否されました(${at}、HTTP ${status})。デーモンが古いか、runtime.json が古い可能性があります。デーモンを再起動してください`;
 }
 
 async function checkDaemon(port) {
@@ -341,6 +350,8 @@ async function main() {
   // --- フッククライアント ---
   if (fs.existsSync(HOOK_CLIENT)) ok('フッククライアント', HOOK_CLIENT);
   else fail('フッククライアント', `${HOOK_CLIENT} がありません。${rerunGuide(manifestExists)}`);
+  const hookRejection = hookRejectionWarning();
+  if (hookRejection) warn('フック', hookRejection);
 
   // --- エンジン・デーモン ---
   const engineUp = await checkEngine(baseUrl);

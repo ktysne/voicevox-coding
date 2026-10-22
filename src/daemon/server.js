@@ -13,22 +13,29 @@ import { applyReplacements, syncEngineDictionary, validateEngineWord } from './d
 import { CONFIG_PATH, normalizeConfig, validateEnginePath } from './config.js';
 import { CallerVerifier } from './caller-check.js';
 import { detectEnginePath } from './engine-process.js';
+import { openSealedHook } from './hook-seal.js';
 import { MessageAccumulator } from './message-stream.js';
 
 const UI_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'ui');
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-};
+// パス名を完全一致で引く。字面の検査だけでは Windows の予約デバイス名(CON など)が fs.readFile に届くため。
+const STATIC_FILES = new Map([
+  ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/index.html', ['index.html', 'text/html; charset=utf-8']],
+  ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/style.css', ['style.css', 'text/css; charset=utf-8']],
+]);
 const QUEUE_TEXT_PREVIEW_LENGTH = 30;
 // 1 オリジン約 6 本の接続枠を使うブラウザーで複数タブを許容する。
 export const SSE_MAX_CLIENTS = 16;
 // PUT 本文上限の 4 MiB と同じ容量を、1 フレームの送信待ちに許容する。
 export const SSE_MAX_PENDING_BYTES = 4 * 1024 * 1024;
+
+const HOOK_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
+const SEALED_HOOK_BODY_LIMIT_BYTES = Math.ceil(HOOK_BODY_LIMIT_BYTES * 4 / 3) + 64 * 1024;
+const SEALED_HOOK_REPLAY_WINDOW_MS = 120_000;
+const SEALED_HOOK_REJECTION_LOG_INTERVAL_MS = 60_000;
+const MAX_REMEMBERED_SEALED_HOOKS = 10_000;
 
 function json(res, status, body) {
   const payload = Buffer.from(JSON.stringify(body), 'utf8');
@@ -40,19 +47,22 @@ function json(res, status, body) {
   res.end(payload);
 }
 
-function readBody(req, limit = 4 * 1024 * 1024) {
+function readBody(req, limit = HOOK_BODY_LIMIT_BYTES) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
-    req.on('data', (c) => {
+    const onData = (c) => {
       size += c.length;
       if (size > limit) {
+        // 残りを読まずに止め、413 を返した後で接続を閉じる(呼び出し側が Connection: close を付ける)
+        req.off('data', onData);
+        req.pause();
         reject(new Error('payload too large'));
-        req.destroy();
         return;
       }
       chunks.push(c);
-    });
+    };
+    req.on('data', onData);
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
@@ -88,9 +98,8 @@ export function isRejectedDuringShutdown(runtime, method, pathname) {
 }
 
 const LOCAL_HOSTNAMES = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
-// フックは昇格したプロセスや WSL の中継からも届き、同じ SID もトークンも持たないことがあるため除外する。
-// TODO(#84): hook-client がトークンを送るようになったら /hook を外す。
-const CALLER_CHECK_EXEMPT_PATHS = ['/hook'];
+// 暗号化フックは復号時の認証で検査し、接続元の OS ユーザー照会を省く。
+const CALLER_CHECK_EXEMPT_PATHS = ['/hook/sealed'];
 
 function hasValidToken(headers, token) {
   const supplied = headers['x-voicevox-coding-token'];
@@ -104,11 +113,7 @@ function needsCallerCheck(pathname) {
   return !CALLER_CHECK_EXEMPT_PATHS.includes(pathname);
 }
 
-/**
- * 全要求の受け入れ判定。Host、接続元の OS ユーザー、変更系の規則の順に評価し、最初の拒否で打ち切る。
- * /hook 以外は読み取りも含め、同じ OS ユーザーか正しいトークンを要求する。トークンでも通すのは、
- * 昇格して動くトレイや更新スクリプトでは接続元の SID を引けないことがあるためである。
- */
+/** 暗号化フック以外では、Host と変更系の規則に加えて同じ OS ユーザーか共有トークンを要求する。 */
 export function authorizeRequest({ method, pathname, headers = {}, port, token, caller }) {
   if (!isLocalHostHeader(headers.host, port)) {
     return { ok: false, status: 403, error: 'ローカル以外の Host からの要求は受け付けません' };
@@ -142,13 +147,7 @@ export function summarizeQueueState(state) {
   };
 }
 
-/**
- * 状態変更の要求 (GET/HEAD 以外) の Content-Type、Origin、トークンの判定。
- * 同じユーザーのブラウザーが開いた外部ページからの要求も接続元の確認を通るので、CSRF はここで防ぐ。
- *   - Origin あり: 自オリジンだけ通す。管理 UI の sendBeacon はヘッダーを足せないので、トークンは見ない。
- *   - Origin なし: /api/* はトークン必須。/hook はトークン不要の代わりに JSON の Content-Type を必須にする。
- *   - クロスオリジンの JSON はプリフライトで遮断されるので、単純リクエストを Content-Type で拒否する。
- */
+/** 状態変更要求の Content-Type と Origin を検査し、管理 API にはトークンも要求する。 */
 export function checkMutationRequest({ pathname, headers = {}, port, token }) {
   if (!isLocalHostHeader(headers.host, port)) {
     return { ok: false, status: 403, error: 'ローカル以外の Host からの要求は受け付けません' };
@@ -160,9 +159,9 @@ export function checkMutationRequest({ pathname, headers = {}, port, token }) {
   if (contentType !== undefined && mediaType !== 'application/json') {
     return { ok: false, status: 415, error: 'Content-Type は application/json のみ受け付けます' };
   }
-  // 本文を読む /hook は Content-Type の省略も認めない（トークン免除の代わりの必須条件）
-  if (pathname === '/hook' && contentType === undefined) {
-    return { ok: false, status: 415, error: '/hook は Content-Type: application/json が必要です' };
+  // フックの本文は JSON に限定し、ブラウザーの単純リクエストを拒否する。
+  if (['/hook', '/hook/sealed'].includes(pathname) && contentType === undefined) {
+    return { ok: false, status: 415, error: `${pathname} は Content-Type: application/json が必要です` };
   }
 
   const origin = headers.origin;
@@ -180,7 +179,7 @@ export function checkMutationRequest({ pathname, headers = {}, port, token }) {
     return { ok: true };
   }
 
-  if (pathname === '/hook') return { ok: true };
+  if (['/hook', '/hook/sealed'].includes(pathname)) return { ok: true };
   if (!hasValidToken(headers, token)) {
     return { ok: false, status: 403, error: '認証トークンが一致しません' };
   }
@@ -212,6 +211,31 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       res.destroy();
       return false;
     }
+  };
+
+  const acceptedSealedHookIvs = new Map();
+  let lastSealedHookRejectionLogAt = null;
+  let suppressedSealedHookRejectionCount = 0;
+
+  const pruneAcceptedSealedHookIvs = (now) => {
+    for (const [iv, acceptedAt] of acceptedSealedHookIvs) {
+      if (now - acceptedAt >= SEALED_HOOK_REPLAY_WINDOW_MS) acceptedSealedHookIvs.delete(iv);
+    }
+  };
+
+  const warnSealedHookRejected = (reason) => {
+    const now = Date.now();
+    if (lastSealedHookRejectionLogAt !== null
+      && now - lastSealedHookRejectionLogAt < SEALED_HOOK_REJECTION_LOG_INTERVAL_MS) {
+      suppressedSealedHookRejectionCount++;
+      return;
+    }
+    const suffix = suppressedSealedHookRejectionCount > 0
+      ? ` (ほか ${suppressedSealedHookRejectionCount} 件)`
+      : '';
+    log.warn(`暗号化フックを拒否しました: ${reason}${suffix}`);
+    lastSealedHookRejectionLogAt = now;
+    suppressedSealedHookRejectionCount = 0;
   };
 
   // 同じ警告を発話のたびに出すとログが埋まるので、一度出したものは覚えておく。
@@ -287,6 +311,21 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     { logger: log },
   );
 
+  const processHook = (body) => {
+    const target = body.target;
+    const payload = body.payload ?? {};
+    const eventName = payload.hook_event_name ?? body.event;
+    if (eventName === 'MessageDisplay') {
+      const profile = store.profile(target);
+      if (!profile || profile.events?.MessageDisplay?.enabled === false) {
+        return { spoken: false, reason: 'event-disabled' };
+      }
+      accumulator.push(target, payload);
+      return { spoken: false, reason: 'buffering' };
+    }
+    return speak(target, eventName, payload);
+  };
+
   const broadcast = (event, data) => {
     const frame = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
     for (const res of sseClients) {
@@ -300,20 +339,20 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   commentaryMonitor?.on('commentary', (payload) => speak('codex', 'Commentary', payload));
 
   const serveStatic = (req, res, pathname) => {
-    const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-    const file = path.resolve(UI_DIR, rel);
-    const relative = path.relative(UI_DIR, file);
-    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      res.writeHead(403).end('forbidden');
+    const entry = STATIC_FILES.get(pathname);
+    if (!entry) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found');
       return;
     }
+    const [filename, contentType] = entry;
+    const file = path.join(UI_DIR, filename);
     fs.readFile(file, (err, buf) => {
       if (err) {
         res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found');
         return;
       }
       res.writeHead(200, {
-        'Content-Type': MIME[path.extname(file)] ?? 'application/octet-stream',
+        'Content-Type': contentType,
         'Cache-Control': 'no-store',
         // 管理 UI を外部ページの iframe に埋め込ませない（クリックジャッキング対策）
         'X-Frame-Options': 'DENY',
@@ -326,6 +365,7 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://127.0.0.1');
     const { pathname } = url;
+    if (pathname === '/hook/sealed') pruneAcceptedSealedHookIvs(Date.now());
 
     if (!isLocalHostHeader(req.headers.host, port)) {
       log.warn(`要求を拒否しました: ${req.method} ${pathname} — ローカル以外の Host からの要求は受け付けません`);
@@ -361,26 +401,38 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
     }
 
     try {
-      // --- フック受信 ---
-      if (req.method === 'POST' && pathname === '/hook') {
-        const body = await readJson(req);
-        const target = body.target;
-        const payload = body.payload ?? {};
-        const eventName = payload.hook_event_name ?? body.event;
-
-        // 途中経過は 1 メッセージにつき何度も届く。組み立てが終わるまでは何もしない。
-        if (eventName === 'MessageDisplay') {
-          const profile = store.profile(target);
-          if (!profile || profile.events?.MessageDisplay?.enabled === false) {
-            json(res, 200, { spoken: false, reason: 'event-disabled' });
-            return;
-          }
-          accumulator.push(target, payload);
-          json(res, 200, { spoken: false, reason: 'buffering' });
+      if (req.method === 'POST' && pathname === '/hook/sealed') {
+        const text = await readBody(req, SEALED_HOOK_BODY_LIMIT_BYTES);
+        let envelope;
+        try { envelope = JSON.parse(text); } catch {}
+        const body = openSealedHook(token, envelope);
+        if (!body.ok) {
+          warnSealedHookRejected(body.reason);
+          json(res, 403, { error: 'invalid sealed hook' });
           return;
         }
-
-        json(res, 200, speak(target, eventName, payload));
+        // GCM の暗号文と復号後の平文は同じバイト長になる。
+        if (Buffer.from(envelope.ct, 'base64').length > HOOK_BODY_LIMIT_BYTES) {
+          json(res, 413, { error: 'payload too large' });
+          return;
+        }
+        const acceptedAt = Date.now();
+        pruneAcceptedSealedHookIvs(acceptedAt);
+        if (acceptedSealedHookIvs.has(envelope.iv)) {
+          warnSealedHookRejected('封筒の再送');
+          json(res, 403, { error: 'replayed sealed hook' });
+          return;
+        }
+        if (acceptedSealedHookIvs.size >= MAX_REMEMBERED_SEALED_HOOKS) {
+          acceptedSealedHookIvs.delete(acceptedSealedHookIvs.keys().next().value);
+        }
+        acceptedSealedHookIvs.set(envelope.iv, acceptedAt);
+        processHook(body);
+        json(res, 200, { ok: true });
+        return;
+      }
+      if (req.method === 'POST' && pathname === '/hook') {
+        json(res, 200, processHook(await readJson(req)));
         return;
       }
 
@@ -645,6 +697,11 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
       json(res, 404, { error: 'not found' });
     } catch (err) {
       log.error(`API エラー ${req.method} ${pathname}: ${err.message}`);
+      if (err.message === 'payload too large') {
+        res.setHeader('Connection', 'close');
+        json(res, 413, { error: err.message });
+        return;
+      }
       json(res, 500, { error: err.message });
     }
   });

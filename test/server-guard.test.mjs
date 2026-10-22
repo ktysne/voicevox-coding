@@ -10,6 +10,7 @@ import net from 'node:net';
 import { EventEmitter } from 'node:events';
 import { checkMutationRequest, isRejectedDuringShutdown, isLocalHostHeader, createServer } from '../src/daemon/server.js';
 import * as guards from '../src/daemon/server.js';
+import { sealHookBody } from '../src/daemon/hook-seal.js';
 import { normalizeConfig } from '../src/daemon/config.js';
 
 const PORT = 7591;
@@ -40,7 +41,8 @@ test('Host、接続元、Content-Type の順で検査し GET/HEAD も接続元�
     assert.equal(check('/api/config', {}, { sameUser: true }, method).ok, true);
   }
   assert.equal(check('/api/state', { 'x-voicevox-coding-token': TOKEN }, { sameUser: false }, 'GET').ok, true);
-  assert.equal(check('/hook', { 'content-type': 'application/json' }, { sameUser: false }).ok, true);
+  assert.equal(check('/hook', { 'content-type': 'application/json' }, { sameUser: false }).status, 403);
+  assert.equal(check('/hook/sealed', { 'content-type': 'application/json' }, { sameUser: false }).ok, true);
 });
 
 test('キュー本文は 30 文字を超える場合だけ省略記号付きで切る', () => {
@@ -73,7 +75,7 @@ test('キュー本文の要約は文字列でない本文を空文字にする',
   assert.deepEqual(guards.summarizeQueueState(state), { running: true, current: { id: 1, text: '' }, queued: [{ id: 2, text: '' }] });
 });
 
-test('実サーバーは /hook 以外の要求で接続元を確認し、起動と終了で verifier を管理する', async () => {
+test('実サーバーは平文 /hook も接続元を確認し、起動と終了で verifier を管理する', async () => {
   const calls = [];
   const verifier = { start() { calls.push('start'); }, dispose() { calls.push('dispose'); },
     async verifySocket(socket, port) { assert.equal(socket.remoteAddress, '127.0.0.1'); assert.ok(port > 0); calls.push('verify'); return { sameUser: true }; } };
@@ -82,15 +84,57 @@ test('実サーバーは /hook 以外の要求で接続元を確認し、起動�
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`)).status, 200);
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'HEAD' })).status, 404);
     assert.equal((await fetch(`http://127.0.0.1:${port}/hook`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"event":"MessageDisplay"}' })).status, 200);
-    assert.deepEqual(calls, ['start', 'verify', 'verify']);
+    assert.deepEqual(calls, ['start', 'verify', 'verify', 'verify']);
     // トークンを持つ要求は接続元を引かない
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/config`, { method: 'PUT', headers: { 'content-type': 'application/json', 'x-voicevox-coding-token': TOKEN }, body: '{}' })).status, 200);
-    assert.deepEqual(calls, ['start', 'verify', 'verify']);
+    assert.deepEqual(calls, ['start', 'verify', 'verify', 'verify']);
   } finally {
     server.closeAllConnections();
     await new Promise((resolve) => server.close(resolve));
   }
-  assert.deepEqual(calls, ['start', 'verify', 'verify', 'dispose']);
+  assert.deepEqual(calls, ['start', 'verify', 'verify', 'verify', 'dispose']);
+});
+
+test('静的 UI は許可されたパスだけを対応する Content-Type で返す', async () => {
+  const { server, port } = await startServer();
+  try {
+    for (const [pathname, contentType] of [
+      ['/', 'text/html; charset=utf-8'],
+      ['/index.html', 'text/html; charset=utf-8'],
+      ['/app.js', 'text/javascript; charset=utf-8'],
+      ['/style.css', 'text/css; charset=utf-8'],
+    ]) {
+      const response = await fetch(`http://127.0.0.1:${port}${pathname}`);
+      assert.equal(response.status, 200, pathname);
+      assert.equal(response.headers.get('content-type'), contentType, pathname);
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('許可されていない静的パスは readFile を呼ばず 404 を返す', async (t) => {
+  const originalReadFile = fs.readFile;
+  const readPaths = [];
+  const readFile = mock.method(fs, 'readFile', (...args) => {
+    readPaths.push(args[0]);
+    return originalReadFile(...args);
+  });
+  t.after(() => readFile.mock.restore());
+  const { server, port } = await startServer();
+  try {
+    for (const pathname of ['/CON', '/nul', '/COM1', '/con.txt', '/APP.JS', '/app.js/', '/package.json', '/..%2fpackage.json']) {
+      const response = await fetch(`http://127.0.0.1:${port}${pathname}`);
+      assert.equal(response.status, 404, pathname);
+      assert.equal(response.headers.get('content-type'), 'text/plain; charset=utf-8', pathname);
+      assert.equal(await response.text(), 'not found', pathname);
+    }
+    assert.equal(readPaths.length, 0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test('設定 API は変更した不正な enginePath を保存せず、同じ値と空文字は通す', async (t) => {
@@ -169,7 +213,7 @@ test('DNS リバインディング (外部 Host ヘッダー) を拒否する', 
   assert.equal(r.status, 403);
 });
 
-test('フッククライアント (Origin なし・JSON) は /hook にトークン無しで届く', () => {
+test('同じ OS ユーザーの平文フックは Origin なし・JSON で届く', () => {
   const r = check('/hook', { 'content-type': 'application/json' });
   assert.equal(r.ok, true);
 });
@@ -592,4 +636,116 @@ test('終了処理中でも /api/shutdown と GET は通す（安全性の検証
 test('終了処理中でなければ拒否しない', () => {
   assert.equal(isRejectedDuringShutdown({ shuttingDown: false }, 'POST', '/api/engine/start'), false);
   assert.equal(isRejectedDuringShutdown(undefined, 'POST', '/api/engine/start'), false);
+});
+
+test('暗号化フックは接続元照会を省き、同じ封筒の再送ではキューへ追加しない', async () => {
+  let calls = 0;
+  const { server, port, store, queue } = await startServer({ start() {}, dispose() {}, async verifySocket() { calls++; return { sameUser: false }; } });
+  const config = normalizeConfig({ targets: { claudeCode: { events: { Stop: { enabled: true, mode: 'fullText' } } } } });
+  store.config = config;
+  store.profile = (target) => config.targets[target];
+  const items = [];
+  queue.enqueue = (item) => { items.push(item); return { accepted: true }; };
+  try {
+    const sealed = sealHookBody(TOKEN, { target: 'claudeCode', payload: { hook_event_name: 'Stop', last_assistant_message: '秘密です。' } });
+    for (let i = 0; i < 2; i++) {
+      const result = await fetch(`http://127.0.0.1:${port}/hook/sealed`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(sealed),
+      });
+      assert.equal(result.status, i === 0 ? 200 : 403);
+      assert.deepEqual(await result.json(), i === 0 ? { ok: true } : { error: 'replayed sealed hook' });
+    }
+    assert.equal(items.length, 1);
+    assert.equal(items[0].text, '秘密です。');
+    assert.equal(calls, 0);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('暗号化フックの拒否警告を 60 秒ごとにまとめ、抑制件数を次の行へ添える', async (t) => {
+  let now = 1_000_000;
+  const dateNow = mock.method(Date, 'now', () => now);
+  t.after(() => dateNow.mock.restore());
+  const warnings = [];
+  const log = { subscribe() {}, warn(message) { warnings.push(message); }, info() {}, debug() {}, error() {} };
+  const { server, port } = await startServer(undefined, { log });
+  try {
+    for (const body of ['{}', 'bad-json', JSON.stringify(sealHookBody('wrong', { target: 'claudeCode', payload: {} }))]) {
+      const result = await fetch(`http://127.0.0.1:${port}/hook/sealed`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body,
+      });
+      assert.equal(result.status, 403);
+    }
+    assert.equal(warnings.length, 1);
+    now += 60_000;
+    const next = await fetch(`http://127.0.0.1:${port}/hook/sealed`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    assert.equal(next.status, 403);
+    assert.equal(warnings.length, 2);
+    assert.match(warnings[1], /\(ほか 2 件\)$/);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('暗号化フックは復号した平文の UTF-8 バイト長が 4 MiB を超えると 413 を返す', async () => {
+  const { server, port } = await startServer();
+  const now = Date.now();
+  const base = { target: 'claudeCode', payload: '', ts: now };
+  const overhead = Buffer.byteLength(JSON.stringify(base));
+  try {
+    for (const extra of [0, 1]) {
+      const payload = 'あ'.repeat(Math.floor((4 * 1024 * 1024 - overhead) / 3))
+        + 'a'.repeat((4 * 1024 * 1024 - overhead) % 3 + extra);
+      const result = await fetch(`http://127.0.0.1:${port}/hook/sealed`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(sealHookBody(TOKEN, { target: 'claudeCode', payload }, now)),
+      });
+      assert.equal(result.status, extra ? 413 : 200);
+      assert.deepEqual(await result.json(), extra ? { error: 'payload too large' } : { ok: true });
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('暗号化フックの受信上限超過は payload too large を返す', async () => {
+  const { server, port } = await startServer();
+  try {
+    const result = await fetch(`http://127.0.0.1:${port}/hook/sealed`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: 'a'.repeat(Math.ceil(4 * 1024 * 1024 * 4 / 3) + 64 * 1024 + 1),
+    });
+    assert.equal(result.status, 413);
+    assert.deepEqual(await result.json(), { error: 'payload too large' });
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('平文フックは同じユーザーか正しいトークンを要求する', async () => {
+  const { server, port } = await startServer({ start() {}, dispose() {}, verifySocket: async () => ({ sameUser: false }) });
+  try {
+    for (const token of [undefined, 'wrong', TOKEN]) {
+      const headers = { 'content-type': 'application/json' };
+      if (token) headers['x-voicevox-coding-token'] = token;
+      const result = await fetch(`http://127.0.0.1:${port}/hook`, { method: 'POST', headers, body: '{}' });
+      assert.equal(result.status, token === TOKEN ? 200 : 403);
+    }
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('暗号化フックは JSON の Content-Type を必須とし、外部 Origin を拒否する', () => {
+  assert.equal(check('/hook/sealed', {}, { sameUser: false }).status, 415);
+  assert.equal(check('/hook/sealed', { 'content-type': 'text/plain' }, { sameUser: false }).status, 415);
+  assert.equal(check('/hook/sealed', { 'content-type': 'application/json', origin: 'https://evil.example' }, { sameUser: false }).status, 403);
 });

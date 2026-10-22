@@ -12,6 +12,8 @@ import { EngineProcess } from './engine-process.js';
 import { Player } from './player.js';
 import { SpeechQueue } from './queue.js';
 import { Tray } from './tray.js';
+import { describePortHolder, reportPortInUse } from './port-holder.js';
+import { removeOwnRuntimeFile, writeRuntimeFile } from './runtime-file.js';
 import { createServer } from './server.js';
 import { syncEngineDictionary } from './dictionary.js';
 import { CodexCommentaryMonitor, commentaryEnabled } from './codex-commentary-monitor.js';
@@ -93,27 +95,20 @@ function startHealthCheck() {
 
 const port = store.config.daemon?.port ?? 7591;
 
-// 状態変更 API 用のトークン。起動ごとに変わり、トレイなどローカルクライアントにだけ渡す
+// フックの暗号化とローカル API の認証に使う共有トークンは起動ごとに更新する。
 const apiToken = crypto.randomBytes(32).toString('hex');
 
-// 更新スクリプトなど同一ユーザーのローカルツールが /api/shutdown を呼べるよう、
-// トークンをファイルにも書き出す（AUD-01 の脅威モデルはブラウザ経由の攻撃であり、
-// 同一ユーザーのローカルプロセスは対象外）。
 const RUNTIME_PATH = path.join(CONFIG_DIR, 'runtime.json');
+const HOOK_REJECTED_PATH = path.join(CONFIG_DIR, 'hook-rejected.json');
 
-function writeRuntimeFile(port) {
+function publishRuntimeFile(port) {
   try {
-    fs.mkdirSync(CONFIG_DIR, { recursive: true });
-    fs.writeFileSync(RUNTIME_PATH, JSON.stringify({ pid: process.pid, port, token: apiToken }, null, 2), 'utf8');
+    writeRuntimeFile(RUNTIME_PATH, { pid: process.pid, port, token: apiToken });
+    return true;
   } catch (err) {
-    log.warn(`runtime.json を書き込めません: ${err.message}`);
+    log.error(`runtime.json を書き込めません。フックが届きません: ${err.message}`);
+    return false;
   }
-}
-
-function removeRuntimeFile() {
-  try {
-    fs.unlinkSync(RUNTIME_PATH);
-  } catch {}
 }
 
 const server = createServer({
@@ -132,11 +127,15 @@ const server = createServer({
 server.on('error', async (err) => {
   // ログは非同期書き込みなので、exit の前に flush を待たないと診断ログが残らない
   if (err.code === 'EADDRINUSE') {
-    log.error(`ポート ${port} は使用中です。デーモンが既に起動している可能性があります。`);
-    if (shouldOpen) {
-      // 既に起動しているなら、コンソールを開くだけで用は足りる
-      spawn('cmd.exe', ['/c', 'start', '', `http://127.0.0.1:${port}/`], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-    }
+    const { owner, pids } = await describePortHolder({ port });
+    reportPortInUse({
+      port,
+      owner,
+      pids,
+      shouldOpen,
+      log,
+      openBrowser: () => spawn('cmd.exe', ['/c', 'start', '', `http://127.0.0.1:${port}/`], { detached: true, stdio: 'ignore', windowsHide: true }).unref(),
+    });
     await log.close().catch(() => {});
     process.exit(1);
   }
@@ -152,7 +151,9 @@ server.listen(port, '127.0.0.1', async () => {
   // 前回実行の一時 WAV の掃除は、ポート取得に成功した後で行う。
   // 二重起動した後発プロセスが、稼働中デーモンの再生待ちファイルを消してしまわないため。
   queue.cleanupEphemeral();
-  writeRuntimeFile(port);
+  if (publishRuntimeFile(port)) {
+    try { fs.unlinkSync(HOOK_REJECTED_PATH); } catch {}
+  }
   syncCommentaryMonitor();
 
   if (store.config.daemon?.tray !== false && !noTray) {
@@ -198,7 +199,7 @@ async function shutdown() {
   runtime.shuttingDown = true;
   server.close(() => {});
   log.info('デーモンを終了します');
-  removeRuntimeFile();
+  removeOwnRuntimeFile(RUNTIME_PATH, process.pid);
   clearInterval(healthTimer);
   store.close();
   tray?.stop();
