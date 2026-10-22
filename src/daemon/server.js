@@ -18,13 +18,13 @@ import { MessageAccumulator } from './message-stream.js';
 
 const UI_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'ui');
 
-const MIME = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'text/javascript; charset=utf-8',
-  '.css': 'text/css; charset=utf-8',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-};
+// パス名を完全一致で引く。字面の検査だけでは Windows の予約デバイス名(CON など)が fs.readFile に届くため。
+const STATIC_FILES = new Map([
+  ['/', ['index.html', 'text/html; charset=utf-8']],
+  ['/index.html', ['index.html', 'text/html; charset=utf-8']],
+  ['/app.js', ['app.js', 'text/javascript; charset=utf-8']],
+  ['/style.css', ['style.css', 'text/css; charset=utf-8']],
+]);
 const QUEUE_TEXT_PREVIEW_LENGTH = 30;
 const HOOK_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
 const SEALED_HOOK_BODY_LIMIT_BYTES = Math.ceil(HOOK_BODY_LIMIT_BYTES * 4 / 3) + 64 * 1024;
@@ -314,20 +314,20 @@ export function createServer({ store, engine, queue, log, engineProcess, runtime
   commentaryMonitor?.on('commentary', (payload) => speak('codex', 'Commentary', payload));
 
   const serveStatic = (req, res, pathname) => {
-    const rel = pathname === '/' ? 'index.html' : pathname.replace(/^\/+/, '');
-    const file = path.resolve(UI_DIR, rel);
-    const relative = path.relative(UI_DIR, file);
-    if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
-      res.writeHead(403).end('forbidden');
+    const entry = STATIC_FILES.get(pathname);
+    if (!entry) {
+      res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found');
       return;
     }
+    const [filename, contentType] = entry;
+    const file = path.join(UI_DIR, filename);
     fs.readFile(file, (err, buf) => {
       if (err) {
         res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('not found');
         return;
       }
       res.writeHead(200, {
-        'Content-Type': MIME[path.extname(file)] ?? 'application/octet-stream',
+        'Content-Type': contentType,
         'Cache-Control': 'no-store',
         // 管理 UI を外部ページの iframe に埋め込ませない（クリックジャッキング対策）
         'X-Frame-Options': 'DENY',
