@@ -6,6 +6,7 @@ import { test, mock } from 'node:test';
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { EventEmitter } from 'node:events';
 import { checkMutationRequest, isRejectedDuringShutdown, isLocalHostHeader, createServer } from '../src/daemon/server.js';
 import * as guards from '../src/daemon/server.js';
@@ -14,6 +15,7 @@ import { normalizeConfig } from '../src/daemon/config.js';
 
 const PORT = 7591;
 const TOKEN = 'a'.repeat(64);
+const { SSE_MAX_CLIENTS } = guards;
 
 function check(pathname, headers, caller = { sameUser: true }, method = 'POST') {
   return guards.authorizeRequest({ method, caller, pathname, headers: { host: `127.0.0.1:${PORT}`, ...headers }, port: PORT, token: TOKEN });
@@ -458,6 +460,101 @@ function getQueueEvent(port, onConnected) {
     req.end();
   });
 }
+
+function openSse(port) {
+  return new Promise((resolve, reject) => {
+    const req = http.get({
+      host: '127.0.0.1',
+      port,
+      path: '/api/stream',
+      agent: false,
+      headers: { Host: `127.0.0.1:${port}` },
+    }, (res) => resolve({ req, res }));
+    req.on('error', reject);
+  });
+}
+
+test('SSE 購読者数の上限を守り、切断後に新しい接続を受け入れる', async () => {
+  const { server, port } = await startServer();
+  const connections = [];
+  try {
+    for (let i = 0; i < SSE_MAX_CLIENTS; i++) {
+      const connection = await openSse(port);
+      connections.push(connection);
+      assert.equal(connection.res.statusCode, 200);
+    }
+
+    const rejected = await openSse(port);
+    rejected.res.resume();
+    assert.equal(rejected.res.statusCode, 503);
+    await new Promise((resolve) => rejected.res.on('end', resolve));
+
+    connections[0].res.destroy();
+    connections[0].req.destroy();
+    let replacement;
+    const deadline = Date.now() + 2000;
+    while (!replacement && Date.now() < deadline) {
+      const candidate = await openSse(port);
+      if (candidate.res.statusCode === 200) replacement = candidate;
+      else {
+        candidate.res.resume();
+        await new Promise((resolve) => candidate.res.on('end', resolve));
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    assert.ok(replacement, '切断した購読者の枠が再利用される');
+    connections.push(replacement);
+  } finally {
+    for (const { req, res } of connections) {
+      res.destroy();
+      req.destroy();
+    }
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
+
+test('読まない SSE 購読者だけを送信待ち上限で切断する', async () => {
+  const { server, port, store } = await startServer();
+  const serverSockets = new Map();
+  server.on('connection', (socket) => serverSockets.set(socket.remotePort, socket));
+  // http.get の応答は pause() しても下のソケットが読み続けるので、要求だけ送って読まない生ソケットを使う。
+  const slow = net.connect(port, '127.0.0.1');
+  await new Promise((resolve) => slow.once('connect', resolve));
+  slow.pause();
+  slow.on('error', () => {});
+  slow.write(`GET /api/stream HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`);
+  let reader;
+  try {
+    reader = await openSse(port);
+    let pending = 0;
+    let notifyReader;
+    reader.res.on('data', (chunk) => {
+      pending -= chunk.length;
+      if (pending <= 0) notifyReader?.();
+    });
+    const slowServerSocket = serverSockets.get(slow.localPort);
+    assert.ok(slowServerSocket);
+    const slowClosed = new Promise((resolve) => slowServerSocket.once('close', resolve));
+    let closed = false;
+    slowClosed.then(() => { closed = true; });
+    const frameBytes = 256 * 1024;
+    for (let n = 0; n < 400 && !closed; n++) {
+      const received = new Promise((resolve) => { notifyReader = resolve; });
+      pending += frameBytes;
+      store.emit('change', { pad: 'x'.repeat(frameBytes) }, n, 'boot', null);
+      await Promise.race([received, new Promise((_, reject) => setTimeout(() => reject(new Error('読む購読者がフレームを受け取れない')), 3000))]);
+    }
+    await Promise.race([slowClosed, new Promise((_, reject) => setTimeout(() => reject(new Error('読まない購読者が切られない')), 1000))]);
+    assert.equal(reader.res.destroyed, false);
+  } finally {
+    slow.destroy();
+    reader?.res.destroy();
+    reader?.req.destroy();
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+});
 
 test('状態 API と SSE はキュー本文を要約する', async () => {
   const { server, port, queue } = await startServer();
