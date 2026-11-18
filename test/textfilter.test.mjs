@@ -372,6 +372,44 @@ test('___ 強調で囲まれた定数名も単語に分けて読む（#50）', (
   assert.doesNotMatch(text, /MOVEFILE/);
 });
 
+// URL を本文から分けて扱う 3 箇所（ファイルパス、定数名、Markdown 記号）を、単独でも全部でも通す設定。
+const URL_GUARD_SETTINGS = {
+  'filePath basename だけ': { url: 'read', filePath: 'basename', constantCase: 'read', markdownSymbols: false },
+  'filePath omit だけ': { url: 'read', filePath: 'omit', constantCase: 'read', markdownSymbols: false },
+  'constantCase だけ': { url: 'read', filePath: 'read', constantCase: 'split', markdownSymbols: false },
+  'markdownSymbols だけ': { url: 'read', filePath: 'read', constantCase: 'read', markdownSymbols: true },
+  'すべて': { url: 'read', filePath: 'basename', constantCase: 'split', markdownSymbols: true },
+};
+
+test('本文の §n§ は URL と取り違えずにそのまま残る（#52）', () => {
+  assert.equal(filterText('§0§ と https://example.com/plain', F).text, '§0§ と リンク');
+  for (const [name, settings] of Object.entries(URL_GUARD_SETTINGS)) {
+    const f = { ...F, ...settings };
+    assert.equal(filterText('§0§ と https://example.com/plain', f).text, '§0§ と https://example.com/plain', name);
+    assert.equal(filterText('§999§ と https://example.com/plain', f).text, '§999§ と https://example.com/plain', name);
+    assert.equal(
+      filterText('https://example.com/a §1§ https://example.com/b §0§', f).text,
+      'https://example.com/a §1§ https://example.com/b §0§',
+      name,
+    );
+  }
+});
+
+test('URL が無い本文の §n§ も消えない（#52）', () => {
+  assert.equal(filterText('表の§1§を参照', F).text, '表の§1§を参照');
+  for (const [name, settings] of Object.entries(URL_GUARD_SETTINGS)) {
+    assert.equal(filterText('表の§1§を参照', { ...F, ...settings }).text, '表の§1§を参照', name);
+  }
+});
+
+test('§n§ と並んでもパスの短縮、定数名、強調の除去は従来どおり働く（#52）', () => {
+  const f = { ...F, url: 'read', filePath: 'basename', constantCase: 'split', markdownSymbols: true };
+  assert.equal(
+    filterText('§0§ と C:\\logs\\app.log と FOO_BAR と **https://example.com/A_B** を見る', f).text,
+    '§0§ と app.log と foo bar と https://example.com/A_B を見る',
+  );
+});
+
 test('表の行は落ちる', () => {
   const { text } = filterText('前\n| 項目 | 値 |\n| --- | --- |\n| a | b |\n後', F);
   assert.doesNotMatch(text, /項目/);

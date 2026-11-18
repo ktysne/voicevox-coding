@@ -1,5 +1,5 @@
 // 読み上げテキストの整形。「どの要素を読む / 読まない」の実体。
-// 適用順は依存関係で決まっている。URL を先に退避しないとファイルパス判定が誤爆する、など。
+// 適用順は依存関係で決まっている。URL を本文から分けて扱わないとファイルパス判定が誤爆する、など。
 
 const FENCED_CODE = /```[\s\S]*?```|~~~[\s\S]*?~~~/g;
 const INDENTED_CODE = /^(?: {4}|\t).+$/gm;
@@ -322,7 +322,7 @@ const BOX_DRAWING = /[─-╿▀-▟]/g;
 
 // パス要素から常に除外する文字。区切り文字、Windows のパスに使えない文字
 // （: * ? " < > |）、空白、日本語の句読点、Markdown のバッククォート、
-// URL 退避の目印 § と、日本語文の区切りに使われる ASCII の , ; 。
+// URL の位置に置く URL_SLOT の § と、日本語文の区切りに使われる ASCII の , ; 。
 const PATH_EXCLUDE = String.raw`\\/:*?"<>|\s\x60§,;、。，．！？…`;
 // ひらがな・カタカナ・漢字。相対パスの判定でだけ追加で除外する。
 const JP_EXCLUDE = String.raw`\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Han}ー々〆`;
@@ -443,53 +443,60 @@ function splitOuterBrackets(m) {
   return { lead: m.slice(0, start), core: m.slice(start, end), trail: m.slice(end) };
 }
 
-// URL を一時退避するときの目印。区切り文字も \w も含まないので、
-// パス判定にも Markdown 記号の除去にも巻き込まれない。
-const PARK_OPEN = '§';
-const PARK_CLOSE = '§';
-const PARK_RE = /§(\d+)§/g;
-
 // URL の末尾に付きうる Markdown の強調・装飾記号のひとまとまり
 // （`*` 1〜3 個、`_` 1〜3 個、`~~`、バッククォート）。
 const EMPHASIS_TRAIL = /(\*{1,3}|_{1,3}|~~|`)$/;
 
 /**
- * text 中の URL を §n§ の目印へ一時退避する。復元は unparkUrls で行う。
- * URL 走査 (scanUrlLength) は空白と日本語句読点まで進むため、URL の直後に
- * 隙間なく続く Markdown の装飾記号（`**強調**` の閉じなど）を URL の一部として
- * 巻き込んでしまう。巻き込んだまま退避すると装飾記号が記号除去を免れて本文へ
- * 残るので、装飾記号は退避せず本文側へ置いていく（従来どおり記号除去で消える）。
- * ただし装飾とみなすのは、同じ記号列が URL の直前でも開いている
- * （`**URL**` や `***URL***` のように囲まれている）ときだけ。単独の `URL_` の
- * 末尾 `_` は装飾か URL の一部かを判別できないため、URL の一部として保持する。
- * 既知の限界：`**_URL_**` のように種類の異なる装飾の入れ子は分離できず、
- * URL の一部として読まれる（囲みの内外で記号が対応しないため）。
+ * findUrls の区間から、URL 走査が巻き込んだ装飾記号の閉じ（`**URL**` の後ろの `**`）を外し、本文側の記号除去で消す。
+ * 直前に同じ記号列が開いているときだけ装飾とみなし、単独の `URL_` の `_` は URL の一部として残す。
+ * 既知の限界：`**_URL_**` のように種類の異なる装飾の入れ子は分離できず、URL の一部として読まれる。
  */
-function parkUrls(text) {
-  const parked = [];
-  const matches = findUrls(text);
-  if (!matches.length) return { guarded: text, parked };
-  let out = '';
-  let last = 0;
-  for (const m of matches) {
-    let core = m.text;
-    let trail = (core.match(EMPHASIS_TRAIL) ?? [''])[0];
-    if (trail && core.length > trail.length
-      && m.start >= trail.length && text.slice(m.start - trail.length, m.start) === trail) {
-      core = core.slice(0, -trail.length);
-    } else {
-      trail = '';
-    }
-    parked.push(core);
-    out += text.slice(last, m.start) + PARK_OPEN + (parked.length - 1) + PARK_CLOSE + trail;
-    last = m.end;
-  }
-  return { guarded: out + text.slice(last), parked };
+function findUrlsWithoutEmphasisTrail(text) {
+  return findUrls(text).map((m) => {
+    const trail = (m.text.match(EMPHASIS_TRAIL) ?? [''])[0];
+    if (!trail || m.text.length <= trail.length
+      || m.start < trail.length || text.slice(m.start - trail.length, m.start) !== trail) return m;
+    const end = m.end - trail.length;
+    return { start: m.start, end, text: text.slice(m.start, end) };
+  });
 }
 
-/** parkUrls が置いた目印を元の URL に戻す。 */
-function unparkUrls(text, parked) {
-  return text.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
+/**
+ * text を urls の区間とそれ以外に分け、URL 以外の区間にだけ transform を掛けて繋ぎ直す。
+ * transform には区間ごとに渡すので、区間の端は文字列の端として扱われる。
+ */
+function mapOutsideUrls(text, urls, transform) {
+  if (!urls.length) return transform(text);
+  let out = '';
+  let last = 0;
+  for (const u of urls) {
+    out += transform(text.slice(last, u.start)) + u.text;
+    last = u.end;
+  }
+  return out + transform(text.slice(last));
+}
+
+// ファイルパスの判定で URL の位置に置く 1 文字。PATH_EXCLUDE に含まれるので
+// パスの一致には入らず、位置で追跡して元の URL に戻せる。
+const URL_SLOT = '§';
+
+/**
+ * re（g 付き）の一致を fn の返り値で置き換え、text 上の位置 slots を置換後の位置へ写す。
+ * slots の位置の文字は re の一致に含まれないことを前提にする。
+ */
+function replaceAroundSlots(text, re, fn, slots) {
+  let out = '';
+  let last = 0;
+  let k = 0;
+  const moved = [];
+  for (const m of text.matchAll(re)) {
+    for (; k < slots.length && slots[k] < m.index; k++) moved.push(out.length + slots[k] - last);
+    out += text.slice(last, m.index) + fn(m[0]);
+    last = m.index + m[0].length;
+  }
+  for (; k < slots.length; k++) moved.push(out.length + slots[k] - last);
+  return { text: out + text.slice(last), slots: moved };
 }
 
 const SENTENCE_END = /(?<=[。．.!?！？])\s*/;
@@ -572,16 +579,23 @@ function applyUrls(text, mode, placeholder) {
 
 /**
  * URL をそのまま読む設定のとき、パス判定が URL の後半を食ってしまうため、
- * 一時的に退避してから戻す。
+ * URL を URL_SLOT に置き換えて判定し、その位置へ元の URL を戻す。
+ * 区間で分けずに 1 文字を残すのは、PATH_SPACE の先読みが URL の後ろの本文まで見るため。
  */
 function applyFilePaths(text, mode) {
   if (mode === 'read') return text;
 
-  const parked = [];
-  const guarded = replaceUrls(text, (m) => {
-    parked.push(m);
-    return PARK_OPEN + (parked.length - 1) + PARK_CLOSE;
-  });
+  const urls = findUrls(text);
+  let guarded = '';
+  const slots = [];
+  let cursor = 0;
+  for (const u of urls) {
+    guarded += text.slice(cursor, u.start);
+    slots.push(guarded.length);
+    guarded += URL_SLOT;
+    cursor = u.end;
+  }
+  guarded += text.slice(cursor);
 
   const shorten = (m, requireLikely) => {
     if (requireLikely && pathSegments(m).length < 2) return m;
@@ -600,11 +614,16 @@ function applyFilePaths(text, mode) {
   // 絶対パス（ドライブレターと UNC）を先に処理する。先に相対パスを当てると
   // `C:\a\b` の途中（`a\b`）だけを拾ってしまう。
   // 絶対パス側で拾い切れなかった残りは相対パスとして処理される。
-  const replaced = guarded
-    .replace(ABS_PATH, (m) => shorten(m, false))
-    .replace(REL_PATH, (m) => shorten(m, true));
+  const abs = replaceAroundSlots(guarded, ABS_PATH, (m) => shorten(m, false), slots);
+  const rel = replaceAroundSlots(abs.text, REL_PATH, (m) => shorten(m, true), abs.slots);
 
-  return replaced.replace(PARK_RE, (_m, i) => parked[Number(i)] ?? '');
+  let out = '';
+  let last = 0;
+  rel.slots.forEach((pos, i) => {
+    out += rel.text.slice(last, pos) + urls[i].text;
+    last = pos + URL_SLOT.length;
+  });
+  return out + rel.text.slice(last);
 }
 
 // SCREAMING_SNAKE_CASE の定数名。`_` 連結のトークンだけを対象にする。
@@ -620,20 +639,18 @@ const CONSTANT_CASE = /(?<![0-9A-Za-z_])_{0,3}[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+_{0,3
  * MOVEFILE_REPLACE_EXISTING のような定数名を「movefile replace existing」のように
  * 小文字化・空白区切りへ変換する。1 文字ずつのスペル読みになって聞き取れないのを避ける。
  * URL をそのまま読む設定 (url: 'read') では本文中に URL が残るため、URL パス中の
- * 大文字（https://example.com/API_DOC 等）を巻き込まないよう一時的に退避してから変換する。
+ * 大文字（https://example.com/API_DOC 等）を巻き込まないよう、URL 以外の区間にだけ変換を掛ける。
  */
 function applyConstantCase(text, mode) {
   if (mode !== 'split') return text;
-  const { guarded, parked } = parkUrls(text);
-  const replaced = guarded.replace(CONSTANT_CASE, (m) => {
+  return mapOutsideUrls(text, findUrlsWithoutEmphasisTrail(text), (part) => part.replace(CONSTANT_CASE, (m) => {
     // 語頭・語尾に付いてきた強調記号の `_` は変換の対象から外すが、ここでは消さない。
     // 消すかどうかは「Markdown 記号を外す」(markdownSymbols) の設定に任せる。
     const lead = (m.match(/^_+/) ?? [''])[0];
     const trail = (m.match(/_+$/) ?? [''])[0];
     const core = m.slice(lead.length, m.length - trail.length);
     return lead + core.toLowerCase().replace(/_/g, ' ') + trail;
-  });
-  return unparkUrls(replaced, parked);
+  }));
 }
 
 function applyTables(text, mode) {
@@ -724,15 +741,10 @@ export function filterText(input, f = {}) {
   t = replaceWhitespacePrefixedLines(replaceRuleLines(t, HR, true), BLOCKQUOTE, '');
 
   if (f.markdownSymbols !== false) {
-    // url: 'read' では本文に URL がまだ残っている。退避せずに記号を外すと
+    // url: 'read' では本文に URL がまだ残っている。URL の区間まで記号を外すと
     // URL 中の `_` `*` などを Markdown 記号と誤認して壊してしまう
     // （例: https://example.com/API_DOC が https://example.com/APIDOC になる）。
-    // 他のモードでは URL 自体が既に短縮・置換済みで本文中に残らないため、
-    // ここでの退避は基本的に空振りする（replaceUrls は該当が無ければ即 return する）。
-    const { guarded, parked } = parkUrls(t);
-    t = replaceEmphasis(guarded);
-    t = t.replace(/[*_`~>|#]/g, '');
-    t = unparkUrls(t, parked);
+    t = mapOutsideUrls(t, findUrlsWithoutEmphasisTrail(t), (part) => replaceEmphasis(part).replace(/[*_`~>|#]/g, ''));
   }
 
   if (f.emoji !== false) t = t.replace(EMOJI, ' ');
